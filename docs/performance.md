@@ -313,7 +313,9 @@ uncached page share one GET.
 - **The memory level**, `server.page_cache_bytes`
   ([Configuration](configuration.md#server)), holds the hottest pages. A hit there costs no I/O. The level is split
   into shards, one per worker thread rounded up to a power of two, and
-  each shard evicts within its own share of the budget.
+  each shard evicts within its own share of the budget. A newly cached
+  page that is not asked for again soon leaves before the pages that
+  are, so a pass over many pages once does not push the hot ones out.
 - **The disk level**, `storage.local.page_cache_disk_bytes`, stores the
   pages the memory level evicts, in 4 MiB blocks in the local directory.
   A hit there costs one local read and no GET, and the level persists

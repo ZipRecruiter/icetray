@@ -169,6 +169,27 @@ themselves. So the change moves CPU from the batch to the other table:
 Batches on one table alone did not move (MultiGet 1,000, 1 task: 2.57 →
 2.56 ms; 11 tasks: 23.88 → 23.39 ms).
 
+The shard lock that `0590cd9` spread over more shards was later taken off
+the hit path. foyer's LRU takes a shard's lock exclusively on every hit, to
+move the page; the memory level now evicts by S3-FIFO, whose hit takes the
+lock shared and counts itself on the page. Measured on 2026-10-30 against
+the tree of `4b1487a`, where the exclusive lock was 8.7% of server CPU
+inside the gRPC MultiGet 100 saturation run (one profiled run each, the
+same 28 s window as `0590cd9`):
+
+| | LRU, 16 shards | S3-FIFO, 16 shards |
+|---|--:|--:|
+| foyer, inclusive, % of server CPU | 10.4 | 1.1 |
+| `lock_exclusive_slow` under foyer | 8.7 | 0.0 |
+| MultiGet 100 saturation, profiled run | 3,325 rps | 3,417 rps |
+
+Throughput moved less than the CPU freed, and within the runs' spread. Three
+release runs per variant, alternating, medians: gRPC Get at saturation
+60,486 → 63,304 rps, MultiGet 100 at saturation 3,381 → 3,474 rps, warm
+hits on 11 tasks 503,398 → 523,416/s; 1 task unchanged. The same matrix with
+64 shards moved nothing beyond the spread under either policy, so the
+count stays one per worker.
+
 ## The closing numbers
 
 The final tree is `1c020ab`. The results record it as `5aff4e8`, the same

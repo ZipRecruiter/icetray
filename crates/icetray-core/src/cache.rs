@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use foyer::{
     BlockEngineConfig, Cache, CacheBuilder, Code, DeviceBuilder as _, ErrorKind, FsDeviceBuilder,
-    HybridCache, HybridCacheBuilder, HybridCachePolicy, RecoverMode, Source,
+    HybridCache, HybridCacheBuilder, HybridCachePolicy, RecoverMode, S3FifoConfig, Source,
 };
 use metrics::Counter;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -48,12 +48,22 @@ const ENTRY_OVERHEAD_BYTES: usize = 64;
 /// The shards of the memory level: `shard::count()`, the runtime's worker
 /// threads rounded up to a power of two. foyer splits the memory budget
 /// evenly across its shards and evicts within each, so a page is held only
-/// beside the pages of its own shard, in that shard's share; and a hit
+/// beside the pages of its own shard, in that shard's share; and an insert
 /// takes its shard's lock exclusively, so fewer shards than workers makes
-/// concurrent hits wait on each other. `min_memory_bytes` is computed from
-/// the same count.
+/// concurrent fetches wait on each other. `min_memory_bytes` is computed
+/// from the same count.
 fn memory_shards() -> usize {
     shard::count()
+}
+
+/// The memory level's eviction: S3-FIFO. A page enters a small queue, a
+/// tenth of its shard, and moves to the main queue only when it is hit
+/// again before it reaches the small queue's end, so a pass over many
+/// pages read once displaces those pages and not the ones that keep being
+/// asked for. A hit takes its shard's lock shared, to count itself on the
+/// page; an LRU takes it exclusively on every hit to move the page.
+fn eviction() -> S3FifoConfig {
+    S3FifoConfig::default()
 }
 
 /// The smallest memory budget a page cache of `shards` shards is given:
@@ -1095,23 +1105,26 @@ impl fmt::Debug for Hits {
 }
 
 /// A memory level of `capacity_bytes`, split over `memory_shards()`, each
-/// page weighed as its bytes plus the entry overhead.
+/// page weighed as its bytes plus the entry overhead and evicted by
+/// `eviction()`.
 fn memory_level(capacity_bytes: usize) -> Level {
     Level::Memory(
         CacheBuilder::new(capacity_bytes)
             .with_name(CACHE_NAME)
             .with_shards(memory_shards())
             .with_weighter(weigh)
+            .with_eviction_config(eviction())
             .build(),
     )
 }
 
-/// The hybrid cache over `disk`: memory of `capacity_bytes`, a block engine
-/// on a file device in `disk.dir()` bounded by `disk.capacity_bytes()`,
-/// written on eviction (RFD 017: a page leaves memory for disk, never for
-/// nowhere), and recovered from whatever the directory holds before the
-/// first request is served. Recovery is quiet: a block that does not
-/// decode is skipped, since everything here is rebuilt from object storage.
+/// The hybrid cache over `disk`: memory of `capacity_bytes` evicted by
+/// `eviction()`, and a block engine on a file device in `disk.dir()`
+/// bounded by `disk.capacity_bytes()`, written on eviction (RFD 017: a
+/// page leaves memory for disk, never for nowhere), and recovered from
+/// whatever the directory holds before the first request is served.
+/// Recovery is quiet: a block that does not decode is skipped, since
+/// everything here is rebuilt from object storage.
 /// The block is `PAGE_CACHE_DISK_BLOCK_BYTES`, and `disk.capacity_bytes()`
 /// holds at least one (`Config::parse` checks it), so the engine has a
 /// block to write into.
@@ -1128,6 +1141,7 @@ async fn open_hybrid(
         .memory(capacity_bytes)
         .with_shards(memory_shards())
         .with_weighter(weigh)
+        .with_eviction_config(eviction())
         .storage()
         .with_engine_config(
             BlockEngineConfig::new(device)
@@ -1376,8 +1390,13 @@ mod tests {
     /// far past `FETCH_DEADLINE`, so only a fetch that runs on reaches it.
     const FETCH_GUARD: Duration = Duration::from_secs(10);
     /// Offsets tried to find one whose key shares a shard with an anchor's;
-    /// with foyer's shard count in the single digits, the first few suffice.
+    /// with one shard per worker, the first few dozen suffice.
     const SHARD_SEARCH_OFFSETS: u64 = 1024;
+    /// Pages of `PAGE`'s weight one memory shard holds in the hit-again
+    /// test: enough that the shard's small queue, a tenth of it, holds
+    /// more than one, so a page read once leaves from there and not from
+    /// the main queue.
+    const SHARD_PAGES: usize = 20;
     /// Bytes cut from the end of an encoded key so that its file id ends
     /// one byte short of its length prefix.
     const ONE_ID_BYTE_SHORT: usize = OFFSET_BYTES + 1;
@@ -1512,13 +1531,10 @@ mod tests {
         cache
     }
 
-    /// The first offset after `anchor`'s whose key lands in the same memory
-    /// shard as `anchor`. Eviction is per shard, so a page is displaced by
-    /// a page of its own shard and by nothing else.
-    fn offset_sharing_shard(cache: &HybridCache<PageKey, PageValue>, anchor: &PageKey) -> u64 {
-        let memory = cache.memory();
-        let shards = count(memory.shards());
-        let shard_of = |key: &PageKey| memory.hash(key) % shards;
+    /// The first offset after `anchor`'s whose key `shard_of` places in the
+    /// same memory shard as `anchor`. Eviction is per shard, so a page is
+    /// displaced by a page of its own shard and by nothing else.
+    fn offset_sharing_shard(shard_of: impl Fn(&PageKey) -> u64, anchor: &PageKey) -> u64 {
         (anchor.1 + 1..anchor.1 + 1 + SHARD_SEARCH_OFFSETS)
             .find(|offset| shard_of(&PageKey(Arc::clone(&anchor.0), *offset)) == shard_of(anchor))
             .unwrap()
@@ -1560,8 +1576,12 @@ mod tests {
             })
             .await
             .unwrap();
-        let displacing =
-            offset_sharing_shard(hybrid(cache), &PageKey(Arc::from(FILE_ID), FIRST_OFFSET));
+        let memory = hybrid(cache).memory();
+        let shards = count(memory.shards());
+        let displacing = offset_sharing_shard(
+            |key| memory.hash(key) % shards,
+            &PageKey(Arc::from(FILE_ID), FIRST_OFFSET),
+        );
         cache
             .get_or_fetch(key(displacing), Issue::default(), || {
                 answering(OTHER_PAGE, runs)
@@ -2324,6 +2344,52 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         assert_eq!(cache.fetches(), 1);
         assert_eq!(cache.hits(), 1);
+    }
+
+    /// A page hit again soon after it was cached outlives any number of
+    /// pages read once into its shard after it: a pass over many pages, as
+    /// a large `MultiGet` makes, does not push out a page that keeps being
+    /// asked for, while the pages it read once do leave.
+    #[tokio::test]
+    async fn test_page_hit_again_outlives_pages_read_once() {
+        let first = PageKey(Arc::from(FILE_ID), FIRST_OFFSET);
+        let weight = weigh(&first, &PageValue(Bytes::from_static(PAGE)));
+        let cache = PageCache::new(memory_shards() * SHARD_PAGES * weight, None)
+            .await
+            .unwrap();
+        let Level::Memory(memory) = cache.level.as_ref() else {
+            panic!("a cache without a disk level is memory only");
+        };
+        let shards = count(memory.shards());
+        let runs = Arc::new(AtomicU64::new(0));
+        cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                answering(PAGE, &runs)
+            })
+            .await
+            .unwrap();
+        cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
+        let mut read_once = Vec::new();
+        let mut offset = FIRST_OFFSET;
+        for _ in 0..2 * SHARD_PAGES {
+            offset = offset_sharing_shard(
+                |key| memory.hash(key) % shards,
+                &PageKey(Arc::from(FILE_ID), offset),
+            );
+            cache
+                .get_or_fetch(key(offset), Issue::default(), || answering(PAGE, &runs))
+                .await
+                .unwrap();
+            read_once.push(offset);
+        }
+        assert!(memory.contains(&first), "the page hit again was evicted");
+        assert!(
+            !memory.contains(&PageKey(Arc::from(FILE_ID), read_once[0])),
+            "the shard held every page read once, so nothing was displaced"
+        );
     }
 
     #[tokio::test]
