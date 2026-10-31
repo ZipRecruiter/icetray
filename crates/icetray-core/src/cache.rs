@@ -3123,7 +3123,7 @@ mod tests {
     /// held, and nothing is counted or read; once a span read has brought
     /// the pages into memory it is held, with no local read of its own.
     #[tokio::test]
-    async fn test_held_span_still_reads_memory_alone() {
+    async fn test_held_span_reads_memory_alone() {
         let dir = tempfile::tempdir().unwrap();
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
