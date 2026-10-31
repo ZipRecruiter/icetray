@@ -10,6 +10,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path};
 
+use crate::index::saturating_sum;
 use crate::local::{page_bytes, sysconf_count};
 
 /// Where the cgroup filesystem is mounted, under the root.
@@ -186,21 +187,29 @@ pub fn shortfall(needed: u64, limit: u64, rss: u64) -> Option<u64> {
     (needed > room).then(|| needed - room)
 }
 
-/// The bytes by which the cache `budget` and the resident indexes of the
-/// tables served, `indexes` one entry per table, overrun `limit` (RFD
-/// 028), RFD 012's sizing rule in reverse: the indexes, the largest once
-/// more since a refresh that rewrites a table wholesale loads its next
-/// generation beside it, and the budget, plus a third of that sum for the
-/// process, requests in flight, and the allocator. `None` when they fit.
-pub fn budget_shortfall(indexes: &[u64], budget: u64, limit: u64) -> Option<u64> {
+/// The memory the cache `budget` and the resident indexes of the tables
+/// served, `indexes` one entry per table, need (RFD 028), RFD 012's sizing
+/// rule in reverse: the indexes, the largest once more since a refresh that
+/// rewrites a table wholesale loads its next generation beside it, and the
+/// budget, plus a third of that sum for the process, requests in flight,
+/// and the allocator (`with_process_share`).
+pub fn budget_needed(indexes: &[u64], budget: u64) -> u64 {
     let largest = indexes.iter().copied().max().unwrap_or(0);
-    let held = indexes
-        .iter()
-        .fold(budget.saturating_add(largest), |sum, &bytes| {
-            sum.saturating_add(bytes)
-        });
-    let needed = held.saturating_add(held / PROCESS_SHARE_DENOMINATOR);
-    needed.checked_sub(limit).filter(|&missing| missing > 0)
+    with_process_share(saturating_sum(
+        indexes.iter().copied().chain([largest, budget]),
+    ))
+}
+
+/// `held` bytes and the process's own share beside them, a third of
+/// `held` (`PROCESS_SHARE_DENOMINATOR`): what a process holding them needs.
+pub fn with_process_share(held: u64) -> u64 {
+    held.saturating_add(held / PROCESS_SHARE_DENOMINATOR)
+}
+
+/// The bytes by which `budget_needed` overruns `limit`; `None` when it
+/// fits.
+pub fn budget_shortfall(indexes: &[u64], budget: u64, limit: u64) -> Option<u64> {
+    shortfall(budget_needed(indexes, budget), limit, 0)
 }
 
 #[cfg(test)]

@@ -51,7 +51,7 @@ impl Shortfall {
     }
 
     /// The bytes the last check found missing.
-    pub fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
 

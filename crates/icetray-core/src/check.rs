@@ -1032,9 +1032,7 @@ pub fn diagnose(
             level: cost.level,
             gets_per_hit: cost.gets_per_hit,
             files_predating_column: predating_column(g, at),
-            value_bytes: facts.iter().fold(0, |sum, file| {
-                u64::saturating_add(sum, file.column_bytes[at])
-            }),
+            value_bytes: saturating_sum(facts.iter().map(|file| file.column_bytes[at])),
         })
         .collect();
     let buckets = by_bucket(&facts);
@@ -1573,9 +1571,6 @@ struct OrderAdviceFacts {
     /// The rows of the file's longest run of one key, as the load counted
     /// them (`OrderFacts::longest_run`).
     longest_run: u64,
-    /// The uncompressed bytes of the configured value columns the file
-    /// holds, from its footer.
-    value_bytes: u64,
 }
 
 /// The key column's bloom filter sizing at the row groups that size it
@@ -1699,9 +1694,6 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             }
         })
         .collect();
-    let value_bytes = column_bytes
-        .iter()
-        .fold(0, |sum, bytes| u64::saturating_add(sum, *bytes));
     FileFacts {
         column_bytes,
         report: FileReport {
@@ -1737,7 +1729,6 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
         ),
         order: order_facts.map(|facts| OrderAdviceFacts {
             longest_run: facts.longest_run,
-            value_bytes,
         }),
     }
 }
@@ -2067,7 +2058,8 @@ fn file_layout_advice(
         value_page_advice(&report.path, column, findings);
     }
     if let Some(order) = &facts.order {
-        order_advice(&report.path, order, facts.rows, scan, findings);
+        let value_bytes = saturating_sum(facts.column_bytes.iter().copied());
+        order_advice(&report.path, order, facts.rows, value_bytes, scan, findings);
     }
     if report.max_key_bytes > contract::KEY_BYTES_ADVICE {
         findings.push(Finding::advice(
@@ -2102,13 +2094,14 @@ fn file_layout_advice(
 /// `long_runs` where a run is longer than `thresholds::RUN_ROWS_ADVICE`;
 /// and, where the table's `scan` limits are known, `large_runs` where
 /// `max_scan_rows` rows of the configured value columns, at the footer's
-/// uncompressed bytes per row over the file's `rows`, are more than
-/// `max_scan_bytes`, so a Scan at the full limit would be refused, compared
-/// in integers.
+/// uncompressed bytes per row, `value_bytes` over the file's `rows`, are
+/// more than `max_scan_bytes`, so a Scan at the full limit would be
+/// refused, compared in integers.
 fn order_advice(
     path: &str,
     order: &OrderAdviceFacts,
     rows: u64,
+    value_bytes: u64,
     scan: Option<ScanLimits>,
     findings: &mut Vec<Finding>,
 ) {
@@ -2129,7 +2122,7 @@ fn order_advice(
     };
     let scan_rows = u64::from(limits.max_scan_rows);
     let bound = approx::count(limits.max_scan_bytes);
-    let scan_bytes = order.value_bytes.saturating_mul(scan_rows);
+    let scan_bytes = value_bytes.saturating_mul(scan_rows);
     if rows > 0 && scan_bytes > bound.saturating_mul(rows) {
         findings.push(Finding::advice(
             FindingCode::LargeRuns,
@@ -2137,7 +2130,7 @@ fn order_advice(
             format!(
                 "{scan_rows} rows of the configured value columns come to {bytes} uncompressed bytes at this file's {per_row} bytes per row, above server.max_scan_bytes {bound}, so a Scan at max_scan_rows {scan_rows} is refused as FAILED_PRECONDITION; the figure counts the value columns alone, so a table a little under the bound can still be refused, since each row also carries its order value and framing (lower max_scan_rows, have callers request fewer rows or columns, or raise server.max_scan_bytes where every client accepts larger messages)",
                 bytes = scan_bytes / rows,
-                per_row = order.value_bytes / rows,
+                per_row = value_bytes / rows,
             ),
             None,
         ));

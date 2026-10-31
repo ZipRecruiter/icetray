@@ -229,7 +229,9 @@ pub struct LocalDir {
     index_dir: PathBuf,
     cache_dir: PathBuf,
     index_budget: Option<u64>,
-    page_cache_disk_bytes: u64,
+    /// The page cache's disk level's size bound, when it has one
+    /// (`LocalConfig::has_page_cache_level`).
+    page_cache_disk_bytes: Option<u64>,
     stats: Arc<IoStats>,
     /// The temporary files `write_chunks` calls in this process have open.
     /// `retain` keeps these and deletes every other temporary file, so a
@@ -255,7 +257,9 @@ impl LocalDir {
             index_dir,
             cache_dir,
             index_budget: config.index_budget_bytes,
-            page_cache_disk_bytes: config.page_cache_disk_bytes,
+            page_cache_disk_bytes: config
+                .has_page_cache_level()
+                .then_some(config.page_cache_disk_bytes),
             stats,
             in_flight: Mutex::new(HashSet::new()),
             next_temp: AtomicU64::new(0),
@@ -435,9 +439,9 @@ impl LocalDir {
     /// which `Config::parse` checks: below that the level has no block to
     /// write into and would hold nothing.
     pub fn page_cache_level(&self) -> Option<DiskLevel> {
-        (self.page_cache_disk_bytes > 0).then(|| DiskLevel {
+        self.page_cache_disk_bytes.map(|capacity_bytes| DiskLevel {
             dir: self.cache_dir.clone(),
-            capacity_bytes: self.page_cache_disk_bytes,
+            capacity_bytes,
             stats: Arc::clone(&self.stats),
         })
     }

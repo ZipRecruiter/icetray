@@ -1168,7 +1168,7 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
         )?;
     }
     if let Some(local) = &config.storage.local
-        && local.page_cache_disk_bytes > 0
+        && local.has_page_cache_level()
         && local.page_cache_disk_bytes < PAGE_CACHE_DISK_BLOCK_BYTES
     {
         return Err(ConfigViolation::PageCacheDiskTooSmall {
@@ -1198,7 +1198,7 @@ fn validate_split(config: &Config) -> std::result::Result<(), ConfigViolation> {
         .storage
         .local
         .as_ref()
-        .is_some_and(|local| local.page_cache_disk_bytes > 0);
+        .is_some_and(LocalConfig::has_page_cache_level);
     if disk_level || config.server.row_cache_share.is_some() || !config.reads_rows() {
         return Ok(());
     }
@@ -1861,6 +1861,15 @@ pub struct LocalConfig {
     /// level, anything else at least `contract::PAGE_CACHE_DISK_BLOCK_BYTES`,
     /// the level's one block.
     pub page_cache_disk_bytes: u64,
+}
+
+impl LocalConfig {
+    /// Whether the page cache has a disk level here: `page_cache_disk_bytes`
+    /// is above zero.
+    #[must_use]
+    pub fn has_page_cache_level(&self) -> bool {
+        self.page_cache_disk_bytes > 0
+    }
 }
 
 /// Object storage, hedging, the local directory, and the bounds on every

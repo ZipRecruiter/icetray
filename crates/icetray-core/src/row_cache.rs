@@ -33,10 +33,14 @@ pub(crate) const ROW_CACHE_MAX_VALUE_BYTES: u64 = VALUE_PAGE_BYTES;
 /// it is charged this much.
 const ROW_SLOT_BYTES: u64 = 128;
 
-/// Bytes of the shared header (24, in a 32-byte jemalloc size class) that
-/// the first clone of a cached `Bytes` allocates, which every entry that is
-/// read pays.
-const SHARED_HEADER_BYTES: u64 = 32;
+/// Bytes of the shared header the first clone of a cached `Bytes`
+/// allocates, which every entry that is read pays: `bytes`' `Shared`, a
+/// buffer pointer, its capacity, and a reference count.
+const SHARED_HEADER_LEN: usize = 24;
+
+/// What the shared header takes in jemalloc's size class
+/// (`SHARED_HEADER_LEN`).
+const SHARED_HEADER_BYTES: u64 = approx::count(size_class(SHARED_HEADER_LEN));
 
 /// Bytes charged per entry on top of the value's allocation: its slot
 /// (`ROW_SLOT_BYTES`) and the shared header a read allocates
@@ -44,10 +48,12 @@ const SHARED_HEADER_BYTES: u64 = 32;
 pub(crate) const ROW_ENTRY_OVERHEAD_BYTES: u64 = ROW_SLOT_BYTES + SHARED_HEADER_BYTES;
 
 /// The weight of an average entry, which `quick_cache` divides the budget by
-/// to choose how many shards to split into: a value of about a hundred
-/// bytes in its size class plus `ROW_ENTRY_OVERHEAD_BYTES`. It sets the
-/// shard count only; the budget is enforced by weight.
-const ESTIMATED_ENTRY_BYTES: u64 = 256;
+/// to choose how many shards to split into: what a value of about a
+/// hundred bytes weighs (`weigh`), rounded down to twice `ROW_SLOT_BYTES`,
+/// so the ghost list's reserve is a sixteenth of the budget
+/// (`GHOST_ITEMS_DIVISOR`). It sets the shard count and the reserve only;
+/// the budget is enforced by weight.
+const ESTIMATED_ENTRY_BYTES: u64 = 2 * ROW_SLOT_BYTES;
 
 /// The ghost list's share of the entries `quick_cache` is told to expect
 /// (`ESTIMATED_ENTRY_BYTES`), as the divisor of one: an eighth. A ghost is
@@ -125,16 +131,21 @@ const SIZE_CLASS_BITS: u32 = 2;
 /// The bytes jemalloc allocates for a request of `len` bytes: `len` rounded
 /// up to its size class, a multiple of `MIN_SIZE_CLASS_BYTES` for small
 /// sizes and of a quarter of the size's power of two above them. Nothing is
-/// allocated for no bytes.
-fn size_class(len: usize) -> usize {
+/// allocated for no bytes. A `const fn`, so a constant's size class is
+/// derived from its length.
+const fn size_class(len: usize) -> usize {
     if len == 0 {
         return 0;
     }
     if len <= MIN_SIZE_CLASS_BYTES {
         return MIN_SIZE_CLASS_BYTES;
     }
-    let spacing =
-        (1_usize << (len - 1).ilog2().saturating_sub(SIZE_CLASS_BITS)).max(MIN_SIZE_CLASS_BYTES);
+    let spacing = 1_usize << (len - 1).ilog2().saturating_sub(SIZE_CLASS_BITS);
+    let spacing = if spacing < MIN_SIZE_CLASS_BYTES {
+        MIN_SIZE_CLASS_BYTES
+    } else {
+        spacing
+    };
     len.next_multiple_of(spacing)
 }
 
@@ -319,7 +330,7 @@ impl RowCache {
     /// a ghost list ever again, so growing it from zero builds the cache
     /// `new` would for `capacity_bytes` in its place instead, which every
     /// clone reads from its next call on.
-    pub fn resize(&self, capacity_bytes: u64) {
+    pub(crate) fn resize(&self, capacity_bytes: u64) {
         let built = self.0.built.load();
         if built.cache.capacity() > 0 {
             built.set_capacity(capacity_bytes);

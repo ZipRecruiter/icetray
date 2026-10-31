@@ -908,7 +908,7 @@ impl PageCache {
     /// `min_memory_bytes` first; a smaller one given here directly is taken
     /// as it is. A failure of the level is
     /// `CacheError::Backend`.
-    pub fn resize_memory(&self, bytes: u64) -> Result<()> {
+    pub(crate) fn resize_memory(&self, bytes: u64) -> Result<()> {
         let bytes = approx::length(bytes);
         match self.level.as_ref() {
             Level::Memory(cache) => cache.resize(bytes),
