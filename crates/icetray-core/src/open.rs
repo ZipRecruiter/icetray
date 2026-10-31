@@ -651,6 +651,8 @@ mod tests {
     use crate::level::Level;
     use crate::manifest::ColumnRead;
     use crate::manifest::testing::{Partition, VALUE_COLUMN, whole};
+    use crate::metric;
+    use crate::metric::testing::recorded;
     use crate::order::{Direction, ScanBounds};
     use crate::snapshot::SnapshotId;
     use crate::storage::FILE_PREFIX;
@@ -891,6 +893,45 @@ mod tests {
         );
         assert!(opened.budget().row_bytes > opened.budget().page_bytes);
         assert!(opened.handles.row_cache.is_some());
+    }
+
+    /// The row cache's counts and what it holds after a server whose
+    /// `row_cache_share` is `share` serves one Get of a present key from a
+    /// key-value table reading through it: (hits, misses, usage).
+    fn row_cache_after_one_get(share: Option<f64>) -> (u64, u64, u64) {
+        let (usage, series) = recorded(async {
+            let (fixture, all) = two_bucket_table().await;
+            let mut config = config(vec![lenient(FIRST_TABLE, &fixture)]);
+            config.server.row_cache_share = share;
+            let opened = loaded(&config).await;
+            let table = table_named(&opened, FIRST_TABLE).unwrap();
+            assert!(table.config().row_cache(), "the table reads rows");
+            let lookup = table
+                .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
+                .await
+                .unwrap();
+            assert!(matches!(lookup.row, crate::Row::Present(_)));
+            opened.row_cache.publish();
+            opened.row_cache.usage()
+        });
+        (
+            series.counter(metric::ROW_CACHE_HITS_TOTAL, &[]),
+            series.counter(metric::ROW_CACHE_MISSES_TOTAL, &[]),
+            usage,
+        )
+    }
+
+    /// A `row_cache_share` of zero turns the row cache off for every
+    /// table: a Get from a table reading through it counts no hit and no
+    /// miss there and caches nothing, where at the default share the same
+    /// Get misses once and caches its value.
+    #[test]
+    fn test_a_zero_row_share_skips_the_row_cache() {
+        let (hits, misses, usage) = row_cache_after_one_get(Some(0.0));
+        assert_eq!((hits, misses, usage), (0, 0, 0));
+        let (hits, misses, usage) = row_cache_after_one_get(None);
+        assert_eq!((hits, misses), (0, 1));
+        assert!(usage > 0, "the value is cached at the default share");
     }
 
     /// A whole budget whose page part, at the default row share, holds

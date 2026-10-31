@@ -541,7 +541,8 @@ impl Generation {
     /// answers with a row its file's deletes do not remove gives the row,
     /// checked against the deletes once whatever the columns (RFD 021); a
     /// deleted row is passed over with no value page read. Then each column
-    /// named is read from `rows`, the row cache, when given (RFD 026), at
+    /// named is read from `rows`, the row cache, when given and not off
+    /// (`RowCache::is_off`, a budget of zero) as the lookup starts (RFD 026), at
     /// the key of the file, the row, and the column's leaf there
     /// (`FileIndex::row_key`), so the index has chosen the file and row,
     /// and the deletes have spoken, before the cache is asked: a row
@@ -578,6 +579,7 @@ impl Generation {
         fan_out: Option<&Arc<Semaphore>>,
         value_gets: &[Counter],
     ) -> Result<(Row, LookupResult)> {
+        let rows = rows.filter(|rows| !rows.is_off());
         let key_page = Issue {
             fan_out,
             counted: None,

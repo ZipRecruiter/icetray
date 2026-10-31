@@ -269,6 +269,14 @@ impl RowCache {
         }))
     }
 
+    /// Whether the cache holds nothing now and can hold nothing: its
+    /// entries' capacity is zero, as at a budget of zero, whether `new` was
+    /// given it or a resize set it. A lookup asks this once and then skips
+    /// the cache, so it counts no miss and copies no value it cannot keep.
+    pub(crate) fn is_off(&self) -> bool {
+        self.0.built.load().cache.capacity() == 0
+    }
+
     /// What the cache holds at `key`. Counts a hit, for a null as for a
     /// value, or a miss on the calling thread's shard.
     pub(crate) fn get(&self, key: &RowKey) -> Cached {
@@ -564,6 +572,19 @@ mod tests {
         assert_eq!(cache.get(&key(1, 0)), Cached::Absent);
         assert_eq!(cache.get(&key(2, 0)), Cached::Absent);
         assert_eq!(cache.usage(), 0);
+    }
+
+    /// The cache is off while its budget is zero, whether built at zero or
+    /// resized to it, and on again once a resize gives it a budget.
+    #[test]
+    fn test_is_off_follows_the_budget_now() {
+        let cache = RowCache::new(0);
+        assert!(cache.is_off(), "built at zero");
+        cache.resize(ROOMY_BYTES);
+        assert!(!cache.is_off(), "grown from zero");
+        cache.resize(0);
+        assert!(cache.is_off(), "shrunk to zero");
+        assert!(!RowCache::new(ROOMY_BYTES).is_off());
     }
 
     /// A large cache shrunk to zero empties and caches nothing, and grown
