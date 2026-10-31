@@ -236,7 +236,7 @@ impl Opened {
     /// The resident set holds only what they have filled, so a check of
     /// memory room adds this to what it needs (RFD 028).
     pub fn unfilled_cache_bytes(&self) -> u64 {
-        let filled = approx::count(self.cache.usage()).saturating_add(self.row_cache.usage());
+        let filled = self.cache.usage().saturating_add(self.row_cache.usage());
         self.budget().whole().saturating_sub(filled)
     }
 
@@ -543,7 +543,7 @@ pub async fn open_with(
         None => None,
     };
     let cache = PageCache::new(
-        approx::length(budget.page_bytes),
+        budget.page_bytes,
         local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;
@@ -950,7 +950,7 @@ mod tests {
             }
         );
         fill_pages(&opened).await;
-        let held = approx::count(opened.cache.usage());
+        let held = opened.cache.usage();
         assert!(held > before.page_bytes, "{held} within the part pages had");
         assert!(held <= tight_budget(), "{held} over the whole budget");
         assert_eq!(opened.row_cache.usage(), 0);
@@ -979,7 +979,7 @@ mod tests {
         );
         assert!(row_cache_keeps_a_value(&opened));
         fill_pages(&opened).await;
-        let held = approx::count(opened.cache.usage());
+        let held = opened.cache.usage();
         assert!(
             held <= opened.budget().page_bytes,
             "{held} over the page part"

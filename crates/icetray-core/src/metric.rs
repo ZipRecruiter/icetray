@@ -652,6 +652,130 @@ impl fmt::Display for Temperature {
     }
 }
 
+/// The test helpers that read what a debugging recorder captured.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::future::Future;
+
+    use metrics::{Key as MetricKey, SharedString, Unit};
+    use metrics_util::CompositeKey;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+    /// The series a debugging recorder captured, looked up by name and
+    /// exact label set.
+    pub(crate) struct Series(
+        pub(crate) Vec<(CompositeKey, Option<Unit>, Option<SharedString>, DebugValue)>,
+    );
+
+    impl Series {
+        /// What `snapshotter` holds now. A snapshot zeroes every series it
+        /// reads, so a later one holds only what was written after it.
+        pub(crate) fn of(snapshotter: &Snapshotter) -> Self {
+            Self(snapshotter.snapshot().into_vec())
+        }
+
+        pub(crate) fn find(&self, name: &str, labels: &[(&str, String)]) -> &DebugValue {
+            let found: Vec<&DebugValue> = self
+                .0
+                .iter()
+                .filter(|(key, ..)| labeled(key.key(), name, labels))
+                .map(|(.., value)| value)
+                .collect();
+            assert_eq!(found.len(), 1, "{name} {labels:?}");
+            found[0]
+        }
+
+        pub(crate) fn counter(&self, name: &str, labels: &[(&str, String)]) -> u64 {
+            match self.find(name, labels) {
+                DebugValue::Counter(value) => *value,
+                DebugValue::Gauge(_) | DebugValue::Histogram(_) => panic!("{name} is a counter"),
+            }
+        }
+
+        pub(crate) fn gauge(&self, name: &str, labels: &[(&str, String)]) -> f64 {
+            match self.find(name, labels) {
+                DebugValue::Gauge(value) => value.into_inner(),
+                DebugValue::Counter(_) | DebugValue::Histogram(_) => panic!("{name} is a gauge"),
+            }
+        }
+
+        /// The samples a histogram recorded, in order.
+        pub(crate) fn histogram(&self, name: &str, labels: &[(&str, String)]) -> Vec<f64> {
+            match self.find(name, labels) {
+                DebugValue::Histogram(samples) => {
+                    samples.iter().map(|sample| sample.into_inner()).collect()
+                }
+                DebugValue::Counter(_) | DebugValue::Gauge(_) => {
+                    panic!("{name} is a histogram")
+                }
+            }
+        }
+
+        /// The series named `name`, of any labels.
+        pub(crate) fn named(&self, name: &str) -> usize {
+            self.0
+                .iter()
+                .filter(|(key, ..)| key.key().name() == name)
+                .count()
+        }
+
+        /// The series, of any name, that carry `label`.
+        pub(crate) fn labeled_with(&self, label: &str) -> usize {
+            self.0
+                .iter()
+                .filter(|(key, ..)| key.key().labels().any(|have| have.key() == label))
+                .count()
+        }
+
+        pub(crate) fn samples(&self, name: &str, labels: &[(&str, String)]) -> usize {
+            match self.find(name, labels) {
+                DebugValue::Histogram(values) => values.len(),
+                DebugValue::Counter(_) | DebugValue::Gauge(_) => panic!("{name} is a histogram"),
+            }
+        }
+    }
+
+    /// Whether `key` is `name` with exactly `labels`.
+    pub(crate) fn labeled(key: &MetricKey, name: &str, labels: &[(&str, String)]) -> bool {
+        key.name() == name
+            && key.labels().count() == labels.len()
+            && labels.iter().all(|(label, value)| {
+                key.labels()
+                    .any(|have| have.key() == *label && have.value() == value)
+            })
+    }
+
+    /// A debugging recorder's snapshot of what `body` emitted, run on a
+    /// current-thread runtime, since the local recorder is thread-local.
+    pub(crate) fn recorded<T>(body: impl Future<Output = T>) -> (T, Series) {
+        recorded_with(|_| body)
+    }
+
+    /// `recorded`, with `body` given a snapshotter of the same recorder, to
+    /// read the series while it runs. A snapshot zeroes every series it
+    /// reads, so a later one holds only what was written after it.
+    pub(crate) fn recorded_with<T, F: Future<Output = T>>(
+        body: impl FnOnce(Snapshotter) -> F,
+    ) -> (T, Series) {
+        recorded_on(tokio::runtime::Builder::new_current_thread(), body)
+    }
+
+    /// `body` run on the runtime `runtime` builds, under a debugging
+    /// recorder, and a snapshot of what it emitted.
+    pub(crate) fn recorded_on<T, F: Future<Output = T>>(
+        mut runtime: tokio::runtime::Builder,
+        body: impl FnOnce(Snapshotter) -> F,
+    ) -> (T, Series) {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = runtime.enable_all().build().unwrap();
+        let out = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(body(recorder.snapshotter()))
+        });
+        (out, Series::of(&snapshotter))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;

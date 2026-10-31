@@ -122,11 +122,10 @@ fn share_of(whole: u64, share: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approx::units::{GIB, MIB};
     use crate::cache::min_memory_bytes;
     use crate::memory::LimitSource;
 
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * MIB;
     /// The shards the tests' caches split into, as on a 16-worker host.
     const SHARDS: usize = 16;
     /// The limit the tests derive from: 8 GiB, half of it the budget.

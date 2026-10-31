@@ -70,6 +70,17 @@ pub(crate) fn measured(value: impl Into<i64>) -> u64 {
     u64::try_from(value.into()).unwrap_or(0)
 }
 
+/// Byte units for the tests' budgets and limits.
+#[cfg(test)]
+pub(crate) mod units {
+    /// A kibibyte.
+    pub(crate) const KIB: u64 = 1 << 10;
+    /// A mebibyte.
+    pub(crate) const MIB: u64 = 1 << 20;
+    /// A gibibyte.
+    pub(crate) const GIB: u64 = 1 << 30;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

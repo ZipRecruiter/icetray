@@ -2448,9 +2448,10 @@ pub(crate) mod testing {
 
     /// The table every fixture is named.
     pub(crate) const TABLE: &str = "kv";
-    /// The memory budget of a test page cache: every page a test touches
-    /// fits, so no test sees an eviction it did not ask for.
-    pub(crate) const CACHE_BYTES: usize = 64 * 1024 * 1024;
+    /// The memory budget of a test page cache or row cache: every page or
+    /// value a test touches fits, so no test sees an eviction it did not
+    /// ask for.
+    pub(crate) const CACHE_BYTES: u64 = 64 * 1024 * 1024;
     /// The branch the fixture tables are followed on.
     pub(crate) const MAIN: &str = iceberg::spec::MAIN_BRANCH;
     /// The step between written long keys, so the key after any written key

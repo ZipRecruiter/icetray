@@ -418,7 +418,8 @@ impl PageCache {
     /// why this is async and can fail: running out of descriptors is
     /// `CacheError::DescriptorLimit`, any other failure
     /// `CacheError::Backend`.
-    pub async fn new(capacity_bytes: usize, disk: Option<DiskLevel>) -> Result<Self> {
+    pub async fn new(capacity_bytes: u64, disk: Option<DiskLevel>) -> Result<Self> {
+        let capacity_bytes = approx::length(capacity_bytes);
         let level = match disk {
             None => memory_level(capacity_bytes),
             Some(disk) => Level::Hybrid {
@@ -886,16 +887,16 @@ impl PageCache {
     /// (`usage`); a scrape calls this, so the gauge reads evictions as well
     /// as inserts.
     pub fn publish_usage(&self) {
-        metrics::gauge!(metric::PAGE_CACHE_BYTES).set(approx::gauge_len(self.usage()));
+        metrics::gauge!(metric::PAGE_CACHE_BYTES).set(approx::gauge(self.usage()));
     }
 
     /// Bytes charged against the memory budget: each page in memory at its
     /// length plus the per-entry overhead. The disk level is not counted.
-    pub(crate) fn usage(&self) -> usize {
-        match self.level.as_ref() {
+    pub(crate) fn usage(&self) -> u64 {
+        approx::count(match self.level.as_ref() {
             Level::Memory(cache) => cache.usage(),
             Level::Hybrid { cache, .. } => cache.memory().usage(),
-        }
+        })
     }
 
     /// Sets the memory level's budget to `bytes`, split evenly over its
@@ -1395,7 +1396,6 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use futures::future::{join, join_all};
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use tokio::sync::Notify;
 
     use super::*;
@@ -1403,13 +1403,14 @@ mod tests {
     use crate::config::LocalConfig;
     use crate::generation::testing::TABLE;
     use crate::local::LocalDir;
+    use crate::metric::testing::{Series, recorded, recorded_on, recorded_with};
 
     /// A memory budget with room for every page a test inserts.
-    const ROOMY_BYTES: usize = 1024 * 1024;
+    const ROOMY_BYTES: u64 = 1024 * 1024;
     /// A memory budget below one page's weight: an insert evicts whatever
     /// its shard held, so a page leaves memory as soon as the next page
     /// lands in its shard.
-    const TINY_BYTES: usize = 1;
+    const TINY_BYTES: u64 = 1;
     /// A disk level of sixteen blocks: room for every page the disk tests
     /// evict into it, so a page that left memory is on disk when read back.
     const DISK_BYTES: u64 = 16 * PAGE_CACHE_DISK_BLOCK_BYTES;
@@ -1735,51 +1736,35 @@ mod tests {
     /// runs; `publish_usage` sets `page_cache_bytes` to what memory holds.
     #[test]
     fn test_new_registers_the_counters_and_publish_usage_sets_the_bytes() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let value = |name: &str| {
-            snapshotter
-                .snapshot()
-                .into_vec()
-                .into_iter()
-                .find(|(key, ..)| key.key().name() == name)
-                .map(|(.., value)| value)
-        };
-        metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(async {
-                let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
-                for name in [
-                    metric::PAGE_CACHE_HITS_TOTAL,
-                    metric::PAGE_CACHE_FETCHES_TOTAL,
-                ] {
-                    assert_eq!(value(name), Some(DebugValue::Counter(0)), "{name}");
-                }
-                assert_eq!(value(metric::PAGE_CACHE_BYTES), None, "set by a scrape");
-                let runs = Arc::new(AtomicU64::new(0));
-                cache
-                    .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
-                        answering(PAGE, &runs)
-                    })
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    value(metric::PAGE_CACHE_FETCHES_TOTAL),
-                    Some(DebugValue::Counter(1))
-                );
-                cache.publish_usage();
-                let Some(DebugValue::Gauge(bytes)) = value(metric::PAGE_CACHE_BYTES) else {
-                    panic!("page_cache_bytes is a gauge");
-                };
-                assert_eq!(
-                    bytes.into_inner().to_bits(),
-                    approx::gauge_len(cache.usage()).to_bits()
-                );
-                assert!(cache.usage() > 0, "the fetched page is held");
-            });
+        recorded_with(|snapshotter| async move {
+            let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
+            let registered = Series::of(&snapshotter);
+            for name in [
+                metric::PAGE_CACHE_HITS_TOTAL,
+                metric::PAGE_CACHE_FETCHES_TOTAL,
+            ] {
+                assert_eq!(registered.counter(name, &[]), 0, "{name}");
+            }
+            assert_eq!(
+                registered.named(metric::PAGE_CACHE_BYTES),
+                0,
+                "set by a scrape"
+            );
+            let runs = Arc::new(AtomicU64::new(0));
+            cache
+                .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                    answering(PAGE, &runs)
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                Series::of(&snapshotter).counter(metric::PAGE_CACHE_FETCHES_TOTAL, &[]),
+                1
+            );
+            cache.publish_usage();
+            let bytes = Series::of(&snapshotter).gauge(metric::PAGE_CACHE_BYTES, &[]);
+            assert_eq!(bytes.to_bits(), approx::gauge(cache.usage()).to_bits());
+            assert!(cache.usage() > 0, "the fetched page is held");
         });
     }
 
@@ -2222,44 +2207,27 @@ mod tests {
     /// `publish_usage` sets the one unlabeled `page_cache_bytes`.
     #[test]
     fn test_the_page_cache_series_carry_no_label() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let series = metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(async {
-                let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
-                let runs = Arc::new(AtomicU64::new(0));
-                cache
-                    .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
-                        answering(PAGE, &runs)
-                    })
-                    .await
-                    .unwrap();
-                cache.publish_usage();
-                snapshotter.snapshot().into_vec()
-            })
+        let ((), series) = recorded(async {
+            let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
+            let runs = Arc::new(AtomicU64::new(0));
+            cache
+                .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                    answering(PAGE, &runs)
+                })
+                .await
+                .unwrap();
+            cache.publish_usage();
         });
-        let names = [
+        assert_eq!(series.counter(metric::PAGE_CACHE_HITS_TOTAL, &[]), 0);
+        assert_eq!(series.counter(metric::PAGE_CACHE_FETCHES_TOTAL, &[]), 1);
+        assert!(series.gauge(metric::PAGE_CACHE_BYTES, &[]) > 0.0);
+        for name in [
             metric::PAGE_CACHE_HITS_TOTAL,
             metric::PAGE_CACHE_FETCHES_TOTAL,
             metric::PAGE_CACHE_BYTES,
-        ];
-        for name in names {
-            let found: Vec<_> = series
-                .iter()
-                .filter(|(key, ..)| key.key().name() == name)
-                .collect();
-            assert_eq!(found.len(), 1, "one {name} series");
-            assert_eq!(found[0].0.key().labels().count(), 0, "{name} has no label");
+        ] {
+            assert_eq!(series.named(name), 1, "one {name} series");
         }
-        let fetched = series
-            .iter()
-            .find(|(key, ..)| key.key().name() == metric::PAGE_CACHE_FETCHES_TOTAL)
-            .map(|(.., value)| value);
-        assert_eq!(fetched, Some(&DebugValue::Counter(1)));
     }
 
     /// Hits spread over a multi-thread runtime's workers reach
@@ -2272,69 +2240,50 @@ mod tests {
     fn test_publish_hit_counts_moves_every_thread_count_once() {
         let workers = 4;
         let hits_per_task = 8;
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers)
-            .enable_all()
-            .build()
-            .unwrap();
-        let published = || {
-            snapshotter
-                .snapshot()
-                .into_vec()
-                .into_iter()
-                .find(|(key, ..)| key.key().name() == metric::PAGE_CACHE_HITS_TOTAL)
-                .map_or(0, |(.., value)| match value {
-                    DebugValue::Counter(value) => value,
-                    other @ (DebugValue::Gauge(_) | DebugValue::Histogram(_)) => {
-                        panic!("hits are a counter, got {other:?}")
-                    }
+        let mut runtime = tokio::runtime::Builder::new_multi_thread();
+        runtime.worker_threads(workers);
+        recorded_on(runtime, |snapshotter| async move {
+            let published = || Series::of(&snapshotter).counter(metric::PAGE_CACHE_HITS_TOTAL, &[]);
+            let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
+            let runs = Arc::new(AtomicU64::new(0));
+            cache
+                .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                    answering(PAGE, &runs)
                 })
-        };
-        metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(async {
-                let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
-                let runs = Arc::new(AtomicU64::new(0));
-                cache
-                    .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
-                        answering(PAGE, &runs)
+                .await
+                .unwrap();
+            let tasks: Vec<_> = (0..workers)
+                .map(|_| {
+                    let cache = cache.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..hits_per_task {
+                            cache
+                                .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+                                .await
+                                .unwrap();
+                        }
                     })
-                    .await
-                    .unwrap();
-                let tasks: Vec<_> = (0..workers)
-                    .map(|_| {
-                        let cache = cache.clone();
-                        tokio::spawn(async move {
-                            for _ in 0..hits_per_task {
-                                cache
-                                    .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
-                                    .await
-                                    .unwrap();
-                            }
-                        })
-                    })
-                    .collect();
-                for task in tasks {
-                    task.await.unwrap();
-                }
-                let hit = count(workers * hits_per_task);
-                assert_eq!(cache.hits(), hit);
-                assert_eq!(published(), 0, "counted on the shards until published");
-                cache.publish_hit_counts();
-                assert_eq!(published(), hit);
-                cache.publish_hit_counts();
-                assert_eq!(published(), 0, "nothing is published twice");
-                cache
-                    .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
-                    .await
-                    .unwrap();
-                let clone = cache.clone();
-                drop(cache);
-                assert_eq!(published(), 0, "a clone still holds the counts");
-                drop(clone);
-                assert_eq!(published(), 1, "the last clone dropped publishes the rest");
-            });
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let hit = count(workers * hits_per_task);
+            assert_eq!(cache.hits(), hit);
+            assert_eq!(published(), 0, "counted on the shards until published");
+            cache.publish_hit_counts();
+            assert_eq!(published(), hit);
+            cache.publish_hit_counts();
+            assert_eq!(published(), 0, "nothing is published twice");
+            cache
+                .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+                .await
+                .unwrap();
+            let clone = cache.clone();
+            drop(cache);
+            assert_eq!(published(), 0, "a clone still holds the counts");
+            drop(clone);
+            assert_eq!(published(), 1, "the last clone dropped publishes the rest");
         });
     }
 
@@ -2371,7 +2320,7 @@ mod tests {
     async fn test_resize_memory_bounds_what_memory_holds() {
         let large = ROOMY_BYTES;
         let small = ROOMY_BYTES / 8;
-        let pages_past_large = 2 * count(large) / page_bytes(KIB_PAGE);
+        let pages_past_large = 2 * large / page_bytes(KIB_PAGE);
         let dir = tempfile::tempdir().unwrap();
         for disk in [None, Some(disk_level(dir.path()).0)] {
             let hybrid = disk.is_some();
@@ -2382,7 +2331,7 @@ mod tests {
             assert!(cache.usage() > small, "hybrid {hybrid}: filled past small");
             assert!(cache.usage() <= large, "hybrid {hybrid}");
 
-            cache.resize_memory(count(small)).unwrap();
+            cache.resize_memory(small).unwrap();
             assert!(cache.usage() <= small, "hybrid {hybrid}: {}", cache.usage());
             cache
                 .fill(
@@ -2393,7 +2342,7 @@ mod tests {
                 .await;
             assert!(cache.usage() <= small, "hybrid {hybrid}: {}", cache.usage());
 
-            cache.resize_memory(count(large)).unwrap();
+            cache.resize_memory(large).unwrap();
             cache
                 .fill(
                     2 * pages_past_large,
@@ -2439,7 +2388,7 @@ mod tests {
     async fn test_page_hit_again_outlives_pages_read_once() {
         let first = PageKey(Arc::from(FILE_ID), FIRST_OFFSET);
         let weight = weigh(&first, &PageValue(Bytes::from_static(PAGE)));
-        let cache = PageCache::new(memory_shards() * SHARD_PAGES * weight, None)
+        let cache = PageCache::new(count(memory_shards() * SHARD_PAGES * weight), None)
             .await
             .unwrap();
         let Level::Memory(memory) = cache.level.as_ref() else {
@@ -2694,7 +2643,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(cache.usage(), PAGE.len() + ENTRY_OVERHEAD_BYTES);
+        assert_eq!(cache.usage(), count(PAGE.len() + ENTRY_OVERHEAD_BYTES));
         cache
             .get_or_fetch(key(SECOND_OFFSET), Issue::default(), || {
                 answering(OTHER_PAGE, &runs)
@@ -2703,7 +2652,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cache.usage(),
-            PAGE.len() + OTHER_PAGE.len() + 2 * ENTRY_OVERHEAD_BYTES
+            count(PAGE.len() + OTHER_PAGE.len() + 2 * ENTRY_OVERHEAD_BYTES)
         );
     }
 

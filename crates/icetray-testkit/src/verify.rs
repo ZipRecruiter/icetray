@@ -128,7 +128,7 @@ async fn build_with(
     row_cache: Option<RowCache>,
 ) -> Result<Served> {
     let cache = PageCache::new(
-        cache_bytes,
+        count(cache_bytes),
         local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;

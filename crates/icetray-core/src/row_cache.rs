@@ -372,20 +372,19 @@ impl fmt::Debug for RowCache {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     use super::*;
+    use crate::approx::units::KIB;
     use crate::index::RowPosition;
+    use crate::metric::testing::{Series, recorded_with};
 
     const FILE: &str = "s3://bucket/data/a.parquet";
     /// A budget that holds every entry a test makes, in each of the shards
     /// it splits into.
     const ROOMY_BYTES: u64 = 1 << 30;
-    const KIB: usize = 1024;
     /// Entries of 1 KiB values a cache sized to hold this many rows of
     /// them is told to expect, so it splits into several shards.
     const SHARD_ROWS_ESTIMATE: u64 = 4096;
@@ -415,14 +414,14 @@ mod tests {
             Self {
                 cache,
                 shard: built.cache.shard_index(&key(0, 0)),
-                rows: built.cache.shard_capacity() / weigh(Some(KIB)),
+                rows: built.cache.shard_capacity() / weigh(Some(approx::length(KIB))),
                 next_position: 0,
             }
         }
 
         /// Inserts `rows` new rows into the shard and returns their keys.
         fn insert(&mut self, rows: u64) -> Vec<RowKey> {
-            let value = [0_u8; KIB];
+            let value = vec![0_u8; approx::length(KIB)];
             let mut inserted = Vec::new();
             while approx::count(inserted.len()) < rows {
                 self.next_position += 1;
@@ -491,10 +490,10 @@ mod tests {
 
     #[test]
     fn test_the_cache_holds_its_budget() {
-        let capacity = 64 * weigh(Some(KIB));
+        let capacity = 64 * weigh(Some(approx::length(KIB)));
         let cache = RowCache::new(capacity);
-        let value = vec![0_u8; KIB];
-        for position in 0..10 * capacity / approx::count(KIB) {
+        let value = vec![0_u8; approx::length(KIB)];
+        for position in 0..10 * capacity / KIB {
             cache.insert(key(position, 0), Some(&value));
         }
         assert!(cache.usage() > 0, "the cache holds something");
@@ -518,7 +517,7 @@ mod tests {
     /// makes, does not push out a row that keeps being asked for.
     #[test]
     fn test_a_row_read_again_outlives_rows_read_once() {
-        let cache = RowCache::new(SHARD_ROWS_ESTIMATE * weigh(Some(KIB)));
+        let cache = RowCache::new(SHARD_ROWS_ESTIMATE * weigh(Some(approx::length(KIB))));
         let mut shard = OneShard::of(&cache);
         let shard_rows = shard.rows;
         shard.insert(shard_rows);
@@ -542,10 +541,10 @@ mod tests {
 
     #[test]
     fn test_resize_shrinks_usage_to_the_new_capacity() {
-        let capacity = 256 * weigh(Some(KIB));
+        let capacity = 256 * weigh(Some(approx::length(KIB)));
         let cache = RowCache::new(capacity);
-        let value = vec![0_u8; KIB];
-        for position in 0..capacity / approx::count(KIB) {
+        let value = vec![0_u8; approx::length(KIB)];
+        for position in 0..capacity / KIB {
             cache.insert(key(position, 0), Some(&value));
         }
         let full = cache.usage();
@@ -659,7 +658,7 @@ mod tests {
             shard.insert(1);
             pushed += 1;
         }
-        cache.insert(evicted.clone(), Some(&[0_u8; KIB]));
+        cache.insert(evicted.clone(), Some(&vec![0_u8; approx::length(KIB)]));
         shard.insert(2 * shard_rows);
         cache.0.built.load().cache.contains_key(&evicted)
     }
@@ -671,7 +670,7 @@ mod tests {
     /// shrunk to zero from a budget of its own.
     #[test]
     fn test_resize_from_zero_builds_the_cache_new_builds() {
-        let budget = SHARD_ROWS_ESTIMATE * weigh(Some(KIB));
+        let budget = SHARD_ROWS_ESTIMATE * weigh(Some(approx::length(KIB)));
         let fresh = RowCache::new(budget);
         assert!(
             readmits_a_ghost_as_hot(&fresh),
@@ -692,52 +691,31 @@ mod tests {
     /// `row_cache_bytes` to `usage`.
     #[test]
     fn test_publish_moves_the_counts_into_the_series() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        // A snapshot takes the counters it reads, so each test step reads
-        // every series from one.
-        let series = || -> HashMap<String, DebugValue> {
-            snapshotter
-                .snapshot()
-                .into_vec()
-                .into_iter()
-                .map(|(key, .., value)| (key.key().name().to_owned(), value))
-                .collect()
-        };
-        metrics::with_local_recorder(&recorder, || {
+        let hits = 2;
+        let ((), published) = recorded_with(|snapshotter| async move {
             let cache = RowCache::new(ROOMY_BYTES);
-            let registered = series();
+            let registered = Series::of(&snapshotter);
             for name in [metric::ROW_CACHE_HITS_TOTAL, metric::ROW_CACHE_MISSES_TOTAL] {
-                assert_eq!(registered[name], DebugValue::Counter(0), "{name}");
+                assert_eq!(registered.counter(name, &[]), 0, "{name}");
             }
-            assert!(
-                !registered.contains_key(metric::ROW_CACHE_BYTES),
+            assert_eq!(
+                registered.named(metric::ROW_CACHE_BYTES),
+                0,
                 "set by a scrape"
             );
             assert_eq!(cache.get(&key(1, 0)), Cached::Absent);
             cache.insert(key(1, 0), None);
-            let hits = 2;
             for _ in 0..hits {
                 assert_eq!(cache.get(&key(1, 0)), Cached::Null);
             }
             cache.publish();
             cache.publish();
-            let published = series();
-            assert_eq!(
-                published[metric::ROW_CACHE_HITS_TOTAL],
-                DebugValue::Counter(hits)
-            );
-            assert_eq!(
-                published[metric::ROW_CACHE_MISSES_TOTAL],
-                DebugValue::Counter(1)
-            );
-            let DebugValue::Gauge(bytes) = published[metric::ROW_CACHE_BYTES] else {
-                panic!("row_cache_bytes is a gauge");
-            };
-            assert_eq!(
-                bytes.into_inner().to_bits(),
-                approx::gauge(weigh(None)).to_bits()
-            );
         });
+        assert_eq!(published.counter(metric::ROW_CACHE_HITS_TOTAL, &[]), hits);
+        assert_eq!(published.counter(metric::ROW_CACHE_MISSES_TOTAL, &[]), 1);
+        assert_eq!(
+            published.gauge(metric::ROW_CACHE_BYTES, &[]).to_bits(),
+            approx::gauge(weigh(None)).to_bits()
+        );
     }
 }

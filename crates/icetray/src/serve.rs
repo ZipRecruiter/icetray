@@ -1219,9 +1219,7 @@ mod tests {
         };
         let handles = TableHandles {
             storage: Arc::new(Storage::new(StorageConfig::default())),
-            cache: PageCache::new(approx::length(budget.page_bytes), None)
-                .await
-                .unwrap(),
+            cache: PageCache::new(budget.page_bytes, None).await.unwrap(),
             row_cache: Some(RowCache::new(budget.row_bytes)),
             local: None,
             calls: CallsInFlight::new(),

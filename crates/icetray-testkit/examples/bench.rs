@@ -1912,7 +1912,7 @@ async fn stack(
     let budget = budget::resolve(&server, None, rows_read, BUDGET_SHARDS)?;
     let handles = TableHandles {
         storage: Arc::clone(storage),
-        cache: PageCache::new(approx::length(budget.page_bytes), None).await?,
+        cache: PageCache::new(budget.page_bytes, None).await?,
         row_cache: Some(RowCache::new(budget.row_bytes)),
         local: local.clone(),
         calls: CallsInFlight::new(),

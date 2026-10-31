@@ -206,13 +206,13 @@ pub fn budget_shortfall(indexes: &[u64], budget: u64, limit: u64) -> Option<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approx::units::GIB;
 
     /// A host large enough that every cgroup limit the tests write is
     /// below it.
     const HOST: u64 = 1 << 40;
-    /// The limits the tests write, a gibibyte and two.
-    const GIB: u64 = 1 << 30;
-    const TWO_GIB: u64 = 2 << 30;
+    /// The larger of the limits the tests write.
+    const TWO_GIB: u64 = 2 * GIB;
     /// What cgroup v1 holds for a group with no limit: `i64::MAX` rounded
     /// down to a 4 KiB page.
     const V1_UNLIMITED: u64 = 0x7FFF_FFFF_FFFF_F000;

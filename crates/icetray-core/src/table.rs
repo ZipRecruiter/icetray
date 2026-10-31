@@ -2842,9 +2842,7 @@ mod tests {
 
     use bytes::Bytes;
     use iceberg::io::FileIO;
-    use metrics::{Key as MetricKey, SharedString, Unit};
-    use metrics_util::CompositeKey;
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+    use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
 
     use object_store::local::LocalFileSystem;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
@@ -2877,6 +2875,7 @@ mod tests {
     use crate::manifest::ColumnRequestFault;
     use crate::manifest::testing::{self as manifest_testing, Partition, VALUE_COLUMN, whole};
     use crate::metric::LookupResult;
+    use crate::metric::testing::{Series, recorded, recorded_on, recorded_with};
     use crate::order::{Direction, OrderValue, OrderVariant};
     use crate::projection::MAX_FIELD_NUMBER;
     use crate::row_cache::weigh;
@@ -5481,82 +5480,6 @@ mod tests {
         );
     }
 
-    /// The series a debugging recorder captured, looked up by name and
-    /// exact label set.
-    struct Series(Vec<(CompositeKey, Option<Unit>, Option<SharedString>, DebugValue)>);
-
-    impl Series {
-        fn find(&self, name: &str, labels: &[(&str, String)]) -> &DebugValue {
-            let found: Vec<&DebugValue> = self
-                .0
-                .iter()
-                .filter(|(key, ..)| labeled(key.key(), name, labels))
-                .map(|(.., value)| value)
-                .collect();
-            assert_eq!(found.len(), 1, "{name} {labels:?}");
-            found[0]
-        }
-
-        fn counter(&self, name: &str, labels: &[(&str, String)]) -> u64 {
-            match self.find(name, labels) {
-                DebugValue::Counter(value) => *value,
-                DebugValue::Gauge(_) | DebugValue::Histogram(_) => panic!("{name} is a counter"),
-            }
-        }
-
-        fn gauge(&self, name: &str, labels: &[(&str, String)]) -> f64 {
-            match self.find(name, labels) {
-                DebugValue::Gauge(value) => value.into_inner(),
-                DebugValue::Counter(_) | DebugValue::Histogram(_) => panic!("{name} is a gauge"),
-            }
-        }
-
-        /// The samples a histogram recorded, in order.
-        fn histogram(&self, name: &str, labels: &[(&str, String)]) -> Vec<f64> {
-            match self.find(name, labels) {
-                DebugValue::Histogram(samples) => {
-                    samples.iter().map(|sample| sample.into_inner()).collect()
-                }
-                DebugValue::Counter(_) | DebugValue::Gauge(_) => {
-                    panic!("{name} is a histogram")
-                }
-            }
-        }
-
-        /// The series named `name`, of any labels.
-        fn named(&self, name: &str) -> usize {
-            self.0
-                .iter()
-                .filter(|(key, ..)| key.key().name() == name)
-                .count()
-        }
-
-        /// The series, of any name, that carry `label`.
-        fn labeled_with(&self, label: &str) -> usize {
-            self.0
-                .iter()
-                .filter(|(key, ..)| key.key().labels().any(|have| have.key() == label))
-                .count()
-        }
-
-        fn samples(&self, name: &str, labels: &[(&str, String)]) -> usize {
-            match self.find(name, labels) {
-                DebugValue::Histogram(values) => values.len(),
-                DebugValue::Counter(_) | DebugValue::Gauge(_) => panic!("{name} is a histogram"),
-            }
-        }
-    }
-
-    /// Whether `key` is `name` with exactly `labels`.
-    fn labeled(key: &MetricKey, name: &str, labels: &[(&str, String)]) -> bool {
-        key.name() == name
-            && key.labels().count() == labels.len()
-            && labels.iter().all(|(label, value)| {
-                key.labels()
-                    .any(|have| have.key() == *label && have.value() == value)
-            })
-    }
-
     fn table_label() -> (&'static str, String) {
         (metric::LABEL_TABLE, TABLE.to_string())
     }
@@ -5736,7 +5659,7 @@ mod tests {
         fixture: &Fixture,
         config: TableConfig,
     ) -> (Table, RowCache, PageCache) {
-        let rows = RowCache::new(approx::count(testing::CACHE_BYTES));
+        let rows = RowCache::new(testing::CACHE_BYTES);
         let handles = TableHandles {
             row_cache: Some(rows.clone()),
             ..handles_over(fixture).await
@@ -5839,7 +5762,7 @@ mod tests {
     async fn test_tables_listing_columns_in_another_order_read_their_own_columns() {
         const VALUE_ALONE_TABLE: &str = "value_alone";
         let (fixture, all, _gauged) = two_column_fixture(FILE_KEYS, WriterLayout::contract()).await;
-        let rows = RowCache::new(approx::count(testing::CACHE_BYTES));
+        let rows = RowCache::new(testing::CACHE_BYTES);
         let handles = TableHandles {
             row_cache: Some(rows.clone()),
             ..handles_over(&fixture).await
@@ -5992,7 +5915,7 @@ mod tests {
             (metric::LABEL_COLUMN, VALUE_COLUMN.to_string()),
         ];
         let published = || {
-            let series = Series(snapshotter.snapshot().into_vec());
+            let series = Series::of(&snapshotter);
             let counter = |name, labels: &[(&str, String)]| series.counter(name, labels);
             (
                 counter(metric::LOOKUPS_TOTAL, &result(LookupResult::Miss)),
@@ -6061,19 +5984,6 @@ mod tests {
         });
     }
 
-    /// A debugging recorder's snapshot of what `body` emitted, run on a
-    /// current-thread runtime, since the local recorder is thread-local.
-    fn recorded<T>(body: impl Future<Output = T>) -> (T, Series) {
-        recorded_with(|_| body)
-    }
-
-    /// `recorded`, with `body` given a snapshotter of the same recorder, to
-    /// read the series while it runs. A snapshot zeroes every series it
-    /// reads, so a later one holds only what was written after it.
-    fn recorded_with<T, F: Future<Output = T>>(body: impl FnOnce(Snapshotter) -> F) -> (T, Series) {
-        recorded_on(tokio::runtime::Builder::new_current_thread(), body)
-    }
-
     /// `recorded_with` on a runtime of `SPLIT_WORKERS` worker threads, where
     /// a batch of enough keys spreads over spawned runs. `body` runs on the
     /// thread the local recorder is set on, so a table it builds registers
@@ -6084,21 +5994,6 @@ mod tests {
         let mut runtime = tokio::runtime::Builder::new_multi_thread();
         runtime.worker_threads(SPLIT_WORKERS);
         recorded_on(runtime, body)
-    }
-
-    /// `body` run on the runtime `runtime` builds, under a debugging
-    /// recorder, and a snapshot of what it emitted.
-    fn recorded_on<T, F: Future<Output = T>>(
-        mut runtime: tokio::runtime::Builder,
-        body: impl FnOnce(Snapshotter) -> F,
-    ) -> (T, Series) {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let runtime = runtime.enable_all().build().unwrap();
-        let out = metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(body(recorder.snapshotter()))
-        });
-        (out, Series(snapshotter.snapshot().into_vec()))
     }
 
     /// The `table_state` gauge of `name` for the table `table`.
@@ -6223,7 +6118,7 @@ mod tests {
             let table = table_over(&fixture, lenient(&fixture)).await;
             table.load().await.unwrap();
             assert_eq!(table.current().unwrap().lookup_cost, CONTRACT_COST);
-            let first = Series(snapshotter.snapshot().into_vec());
+            let first = Series::of(&snapshotter);
             append_dictionary_overlap(&mut fixture).await;
             assert!(table.refresh().await.unwrap());
             assert_eq!(
@@ -6365,7 +6260,7 @@ mod tests {
             let generation = table.current().unwrap();
             assert_eq!(generation.delete_summary(), DeleteSummary::default());
             assert_eq!(generation.oldest_delete_committed, None);
-            let first = Series(snapshotter.snapshot().into_vec());
+            let first = Series::of(&snapshotter);
             commit_deletes(&mut fixture).await;
             assert!(table.refresh().await.unwrap());
             let summary = assert_commit_deletes_applied(&table.current().unwrap());
@@ -6517,7 +6412,7 @@ mod tests {
             let (table, _scratch) = disk_table(&fixture, lenient(&fixture)).await;
             table.load().await.unwrap();
             observe(&table, &Ok(short_sample()));
-            let short = Series(snapshotter.snapshot().into_vec());
+            let short = Series::of(&snapshotter);
             observe(&table, &Ok(sample_at(PER_MILLE)));
             assert_eq!(table.current().unwrap().level, Level::Optimal);
             short
@@ -6571,7 +6466,7 @@ mod tests {
             append_second(&mut fixture, &all, "f2", WriterLayout::contract()).await;
             assert!(table.refresh().await.unwrap());
             assert_eq!(serving_id(&table), SnapshotId(SECOND_SNAPSHOT));
-            let swapped = Series(snapshotter.snapshot().into_vec());
+            let swapped = Series::of(&snapshotter);
             let serialized = table.serialized().await;
             table.retune(
                 TableConfig {
@@ -6626,7 +6521,7 @@ mod tests {
             let (table, _scratch) = disk_table(&fixture, lenient(&fixture)).await;
             table.load().await.unwrap();
             observe(&table, &Ok(short_sample()));
-            let short = Series(snapshotter.snapshot().into_vec());
+            let short = Series::of(&snapshotter);
             let unobserved = Err(Unobserved {
                 path: std::path::PathBuf::from("chunk"),
                 why: std::io::Error::from(std::io::ErrorKind::PermissionDenied).into(),
@@ -6696,7 +6591,7 @@ mod tests {
                 evict(path);
             }
             sample_page_cache(&[&table]).await;
-            let evicted = Series(snapshotter.snapshot().into_vec());
+            let evicted = Series::of(&snapshotter);
             for path in &paths {
                 std::fs::read(path).unwrap();
             }
@@ -6729,7 +6624,7 @@ mod tests {
             .await;
             let table = table_over(&fixture, lenient(&fixture)).await;
             table.load().await.unwrap();
-            let before = Series(snapshotter.snapshot().into_vec());
+            let before = Series::of(&snapshotter);
             let serialized = table.serialized().await;
             table.retune(
                 TableConfig {
@@ -6772,7 +6667,7 @@ mod tests {
                 table.retune(lenient(&fixture), &serialized);
             }
             assert_eq!(serving_id(&table), SnapshotId(FIRST_SNAPSHOT));
-            let during = Series(snapshotter.snapshot().into_vec());
+            let during = Series::of(&snapshotter);
 
             fixture.restore_hint(FIRST_VERSION).await;
             assert!(!table.refresh().await.unwrap());
