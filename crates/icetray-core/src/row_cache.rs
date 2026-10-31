@@ -25,12 +25,23 @@ use crate::shard::Tally;
 /// displace thousands of narrow ones.
 pub(crate) const ROW_CACHE_MAX_VALUE_BYTES: u64 = VALUE_PAGE_BYTES;
 
-/// Bytes charged per entry on top of the value's allocation: `quick_cache`'s
-/// slot (key, hash, links, `Bytes` handle) and the key's `Arc<str>`
-/// pointer, measured at about 120 bytes for rows of 100 bytes once the
-/// allocator's rounding of the value is taken out. The file id's own bytes
-/// are shared by every entry of the file and are not charged per entry.
-pub(crate) const ROW_ENTRY_OVERHEAD_BYTES: u64 = 128;
+/// Bytes of a `quick_cache` slot: its key, hash, links, and `Bytes`
+/// handle, and the key's `Arc<str>` pointer, measured at about 120 bytes
+/// for rows of 100 bytes once the allocator's rounding of the value is
+/// taken out. The file id's own bytes are shared by every entry of the file
+/// and are not charged per entry. A ghost keeps its slot and no value, so
+/// it is charged this much.
+const ROW_SLOT_BYTES: u64 = 128;
+
+/// Bytes of the shared header (24, in a 32-byte jemalloc size class) that
+/// the first clone of a cached `Bytes` allocates, which every entry that is
+/// read pays.
+const SHARED_HEADER_BYTES: u64 = 32;
+
+/// Bytes charged per entry on top of the value's allocation: its slot
+/// (`ROW_SLOT_BYTES`) and the shared header a read allocates
+/// (`SHARED_HEADER_BYTES`).
+pub(crate) const ROW_ENTRY_OVERHEAD_BYTES: u64 = ROW_SLOT_BYTES + SHARED_HEADER_BYTES;
 
 /// The weight of an average entry, which `quick_cache` divides the budget by
 /// to choose how many shards to split into: a value of about a hundred
@@ -54,7 +65,7 @@ const GHOST_ITEMS_DIVISOR: u64 = 8;
 /// `quick_cache` keeps at most the shard's share of the expected entries,
 /// rounded up, times the ghost share, and a resize scales that count with
 /// the entries' capacity. So `Built::new` holds back that many ghosts at
-/// `ROW_ENTRY_OVERHEAD_BYTES` each, since a ghost keeps its entry's slot
+/// `ROW_SLOT_BYTES` each, since a ghost keeps its entry's slot
 /// and hash while dropping its key and value, and every resize keeps the
 /// bytes held back in that ratio to the entries' capacity.
 #[derive(Clone, Copy, Debug)]
@@ -75,7 +86,7 @@ impl GhostReserve {
         };
         Self {
             budget,
-            bytes: ghosts * ROW_ENTRY_OVERHEAD_BYTES,
+            bytes: ghosts * ROW_SLOT_BYTES,
         }
     }
 
@@ -496,9 +507,9 @@ mod tests {
 
     #[test]
     fn test_weigh_rounds_to_jemalloc_size_classes() {
-        assert_eq!(weigh(Some(100)), 112 + 128);
-        assert_eq!(weigh(Some(1029)), 1280 + 128);
-        assert_eq!(weigh(None), 128);
+        assert_eq!(weigh(Some(100)), 112 + 160);
+        assert_eq!(weigh(Some(1029)), 1280 + 160);
+        assert_eq!(weigh(None), 160);
     }
 
     /// A row hit again after it was cached outlives any number of rows read
@@ -604,10 +615,7 @@ mod tests {
         let cache = RowCache::new(ROOMY_BYTES);
         let shards = approx::count(cache.0.built.load().cache.num_shards());
         let ghosts = (ROOMY_BYTES / ESTIMATED_ENTRY_BYTES + shards).div_ceil(GHOST_ITEMS_DIVISOR);
-        assert_eq!(
-            cache.0.built.load().ghosts.bytes,
-            ghosts * ROW_ENTRY_OVERHEAD_BYTES
-        );
+        assert_eq!(cache.0.built.load().ghosts.bytes, ghosts * ROW_SLOT_BYTES);
         let under_a_fifteenth = 15;
         assert!(
             cache.0.built.load().ghosts.bytes * under_a_fifteenth < ROOMY_BYTES,

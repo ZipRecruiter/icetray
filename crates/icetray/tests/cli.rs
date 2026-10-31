@@ -673,7 +673,8 @@ fn ordered_config(dir: &Path, stem: &str, fixture: &Fixture) -> Result<String, B
 /// the row cache, beside an ordered table, with no page-cache disk level,
 /// through the checks `serve` does, and refuses it before reading any
 /// table (RFD 028): exit 1, the refusal on stderr, and no report. The same
-/// file setting `row_cache_share` is reported.
+/// file setting `row_cache_share`, and each table alone, are reported, so
+/// only the mixed-server rule explains the refusal.
 #[tokio::test]
 async fn test_doctor_reports_the_mixed_server_refusal() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -690,20 +691,37 @@ async fn test_doctor_reports_the_mixed_server_refusal() -> TestResult {
     assert!(output.stdout.is_empty(), "{}", stderr(&output));
     assert_plain_error(&output);
 
-    let shared = write_file(
-        dir.path(),
-        "shared.toml",
-        &format!("[server]\nrow_cache_share = 0.5\n\n{tables}"),
-    )?;
-    let output = run(&["doctor", "--config", &shared], &[]);
-    let report = lines(&output.stdout);
-    for name in [TABLE_A, TABLE_B] {
+    // The refusal is plain text, so the file's own variants pin its cause:
+    // each differs from the refused file in one thing only, and each is
+    // reported. Only the mixed-server rule explains the refusal.
+    let kv_only = toml_table(TABLE_A, &kv);
+    let events_only = toml_ordered_table(TABLE_B, &events, None);
+    let variants = [
+        (
+            "shared",
+            format!("[server]\nrow_cache_share = 0.5\n\n{tables}"),
+            vec![TABLE_A, TABLE_B],
+        ),
+        ("kv_only", kv_only, vec![TABLE_A]),
+        ("events_only", events_only, vec![TABLE_B]),
+    ];
+    for (label, text, served) in variants {
+        let config = write_file(dir.path(), &format!("{label}.toml"), &text)?;
+        let output = run(&["doctor", "--config", &config], &[]);
+        assert_exit(&output, EXIT_OK);
+        let report = lines(&output.stdout);
+        for name in served {
+            assert!(
+                report
+                    .iter()
+                    .any(|line| line["kind"] == "table" && line["table"] == name),
+                "{label}, {name}: {}",
+                stderr(&output)
+            );
+        }
         assert!(
-            report
-                .iter()
-                .any(|line| line["kind"] == "table" && line["table"] == name),
-            "{name}: {}",
-            stderr(&output)
+            report.iter().all(|line| line["kind"] != "refusal"),
+            "{label}"
         );
     }
     Ok(())

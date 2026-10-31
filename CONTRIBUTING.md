@@ -59,8 +59,11 @@ CI runs clippy with `-D warnings` on all targets, so a warning is a failure.
   with one exception: code whose first reader lands later in the same
   series may carry `#[expect(dead_code, reason = "read by <what>")]`.
   When the reader arrives the expectation goes unmet and clippy fails, so
-  that commit removes the marker. `dev/ci-checks.sh` refuses any tree that
-  still carries one, so a marker never reaches a push or a merge.
+  that commit removes the marker. Code that only a test reads yet carries
+  the same marker inside `cfg_attr(not(test), expect(dead_code, reason =
+  "..."))`, and the reader's commit removes that one too.
+  `dev/ci-checks.sh` refuses any tree that still carries either form, so a
+  marker never reaches a push or a merge.
 - `unwrap()` in production code never. `expect("reason")` marks a case that
   cannot happen and says why. `?` handles everything else. Tests may
   `unwrap()`; `clippy.toml` exempts them.

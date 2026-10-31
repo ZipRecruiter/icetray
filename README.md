@@ -22,8 +22,9 @@ files:
   ordered table's order column and scan limits.
 
 It suits data that is computed in batch and read by key, and is ideal for a
-table with a hot working set and a long, rarely read tail: hot pages are
-served from icetray's page cache, and a cold page costs one range GET.
+table with a hot working set and a long, rarely read tail: hot rows are
+served from icetray's row cache and hot pages from its page cache, and a
+cold page costs one range GET.
 
 ## Why icetray
 
@@ -183,9 +184,9 @@ Each table sets a **residency**, where its key chunks are stored:
 | `disk` | in local files | a fraction of a byte | 1 GET and 1 local read | 1 local read |
 | `bloom` | only the writer's Bloom filters in memory; key pages read from object storage | the Bloom filter | 2 GETs | none, or 1 GET for a false positive |
 
-A hit served from the page cache takes microseconds, and a cold hit's GET
-to object storage takes tens of milliseconds. Resident memory is
-proportional to the key count and independent of value size.
+A hit served from the row cache or the page cache takes microseconds, and
+a cold hit's GET to object storage takes tens of milliseconds. Resident
+memory is proportional to the key count and independent of value size.
 
 Each table also sets a **lookup level**, `lookups`, the cost per lookup
 its owner accepts:

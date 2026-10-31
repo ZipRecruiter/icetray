@@ -117,8 +117,9 @@ key-value table, which holds at most one row per key and which `Get` and
 
 **Projection.** The trimming of a value in a column declared protobuf to
 the top-level field numbers a request lists, which icetray performs after
-the page cache. It saves the bytes on the wire and the caller's decode,
-and makes the same GETs as reading the whole value. See
+the row cache (see [RFD 026](rfd/026-row-cache.md)) and the page cache, so
+the caches hold whole values. It saves the bytes on the wire and the
+caller's decode, and makes the same GETs as reading the whole value. See
 [Protobuf columns](table-layout.md#protobuf-columns).
 
 **Refused.** The outcome for a snapshot icetray will not serve, for a

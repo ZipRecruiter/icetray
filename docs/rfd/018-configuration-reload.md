@@ -155,9 +155,11 @@ missing from a running server is the silent failure that RFD 005 refuses
 at start.
 
 **Reloading server and storage settings as well.** This is left out for
-now. Each setting is its own problem (rebinding a listener, resizing a
-page cache in use, replacing the storage client under loads in flight),
-and a restart applies them.
+now. Each setting is its own problem (rebinding a listener, changing the
+cache budget `server.cache_bytes` that the row cache and the page cache
+share, replacing the storage client under loads in flight), and a restart
+applies them. A reload does resize the two caches within that budget when
+whether any table reads rows changes (see the 2026-10-30 note above).
 
 ## Consequences
 

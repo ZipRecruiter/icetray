@@ -327,7 +327,7 @@ The same memory holds many more hot rows than pages: a value page holds a
 hot row beside every row stored next to it, so where hot keys are
 scattered through the key order, as hashed or arbitrarily assigned keys
 are, most of a cached page is rows nobody asked for. Each entry is charged
-its value at its allocation size plus 128 bytes of overhead, so rows of a
+its value at its allocation size plus 160 bytes of overhead, so rows of a
 few hundred bytes or more spend most of the budget on values. A value
 larger than one 64 KiB value page is not cached, and a row read once
 leaves before rows that keep being read.
