@@ -174,12 +174,16 @@ for ((i = 1; i < MULTI_GET_KEYS; i++)); do
 done
 MULTI_DATA="{\"table\":\"long\",\"keys\":[$MULTI_KEYS],\"columns\":[{\"name\":\"value\"}]}"
 
+# --duration-stop wait: ghz's default, close, ends a run by closing its
+# connections with calls still in flight and reports each as Unavailable,
+# and the server sees those calls abandoned; waiting lets them finish, so
+# every call a run sends is answered and counted on both sides.
 ghz_run() {
   local name="$1"
   shift
   log "ghz $name"
-  ghz --insecure --proto "$PROTO" --format json --output "$OUT_DIR/$name.json" \
-    "$@" "127.0.0.1:$GRPC_PORT"
+  ghz --duration-stop wait --insecure --proto "$PROTO" --format json \
+    --output "$OUT_DIR/$name.json" "$@" "127.0.0.1:$GRPC_PORT"
 }
 
 ghz_run warmup --call icetray.v1.Icetray.Get --data "$GET_DATA" \
