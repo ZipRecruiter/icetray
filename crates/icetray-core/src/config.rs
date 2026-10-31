@@ -16,7 +16,6 @@ use serde_json::error::Category;
 use crate::approx;
 use crate::aws_catalog;
 use crate::budget;
-use crate::cache::check_capacity;
 use crate::check::ScanLimits;
 use crate::column;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
@@ -24,7 +23,6 @@ use crate::error::{Error, Result};
 use crate::level::Level;
 use crate::manifest::{self, ColumnRead, ValueType};
 use crate::memory::MemoryLimit;
-use crate::metric::CacheName;
 use crate::storage::{self, LocationError};
 use crate::time;
 
@@ -87,7 +85,7 @@ pub const FALLBACK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_ROW_CACHE_SHARE: f64 = 0.9;
 
 /// The page cache shards `Config::parse` checks a set `server.cache_bytes`
-/// and `scan_page_cache_bytes` against: one, the fewest a cache has on any
+/// against: one, the fewest a cache has on any
 /// machine, since the worker count that sets the real number is not known
 /// until the cache opens on a runtime (`budget::resolve`).
 const PARSE_CACHE_SHARDS: usize = 1;
@@ -213,12 +211,6 @@ pub(crate) const DEFAULT_SCAN_DEADLINE: Duration = Duration::from_secs(5);
 /// seconds, flat whatever the call's size, as long as a `MultiGet`
 /// (RFD 025).
 pub(crate) const DEFAULT_MULTI_SCAN_DEADLINE: Duration = Duration::from_secs(15);
-
-/// The memory cache that holds the pages ordered tables' span GETs fetch,
-/// when the file says nothing: 256 mebibytes, as large as
-/// `FALLBACK_CACHE_BYTES` (RFD 025). It is separate from the page cache and keeps
-/// off the disk level, so a scan evicts only other scans' pages.
-pub(crate) const DEFAULT_SCAN_PAGE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How long a build from no serving generation may run when the file says
 /// nothing: thirty minutes. Such a build, a first load or a retry after
@@ -578,8 +570,8 @@ pub enum ConfigViolation {
         /// Its residency.
         residency: Residency,
     },
-    /// The memory budget of a page cache, its memory level's part of
-    /// `cache_bytes` or `scan_page_cache_bytes`, cannot hold one value page
+    /// The memory budget of the page cache, its memory level's part of
+    /// `cache_bytes`, cannot hold one value page
     /// in every shard of its memory level, so the cache would keep a page
     /// per shard however small the budget, and the budget would bound
     /// nothing (`cache::min_memory_bytes`). `Config::parse` checks a set
@@ -587,10 +579,8 @@ pub enum ConfigViolation {
     /// caches checks it against the shards they have on the runtime they
     /// open on, one per worker thread rounded up to a power of two, and
     /// checks a budget derived from the memory limit only then.
-    #[error("{}", page_cache_too_small(*cache, *bytes, *minimum, *shards, *limit))]
+    #[error("{}", page_cache_too_small(*bytes, *minimum, *shards, *limit))]
     PageCacheTooSmall {
-        /// The cache whose budget it is.
-        cache: CacheName,
         /// The budget.
         bytes: u64,
         /// The smallest budget that holds a value page in every shard: one
@@ -872,19 +862,17 @@ fn lookups_unreachable(
 /// setting, and for a budget derived from the memory limit, the limit and
 /// where it comes from, since the file names no number to raise.
 fn page_cache_too_small(
-    cache: CacheName,
     bytes: u64,
     minimum: u64,
     shards: usize,
     limit: Option<MemoryLimit>,
 ) -> String {
-    let setting = cache.budget_setting();
     let refusal = format!(
-        "server.{setting} gives the {cache} page cache {bytes} bytes, below one value page per cache shard, {minimum} bytes for {shards} shards"
+        "server.cache_bytes gives the page cache {bytes} bytes, below one value page per cache shard, {minimum} bytes for {shards} shards"
     );
     match limit {
         Some(limit) => format!(
-            "{refusal}; server.{setting} is unset, so it is derived from the {} memory limit of {} bytes: set it, or raise the limit",
+            "{refusal}; server.cache_bytes is unset, so it is derived from the {} memory limit of {} bytes: set it, or raise the limit",
             limit.of, limit.bytes
         ),
         None => refusal,
@@ -994,6 +982,7 @@ impl ServerConfig {
             cache_bytes,
             row_cache_share,
             removed_page_cache_bytes: _,
+            removed_scan_page_cache_bytes: _,
             log,
             get_deadline,
             multi_get_deadline,
@@ -1004,7 +993,6 @@ impl ServerConfig {
             scan_deadline,
             multi_scan_deadline,
             max_scan_bytes,
-            scan_page_cache_bytes,
             load_deadline,
             refresh_deadline,
             drain_deadline,
@@ -1058,10 +1046,6 @@ impl ServerConfig {
             (
                 "server.max_scan_bytes",
                 *max_scan_bytes == server.max_scan_bytes,
-            ),
-            (
-                "server.scan_page_cache_bytes",
-                *scan_page_cache_bytes == server.scan_page_cache_bytes,
             ),
             (
                 "server.load_deadline",
@@ -1123,9 +1107,19 @@ impl StorageConfig {
 
 /// The first rule the configuration breaks, or `Ok` when it breaks none.
 fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
-    if config.server.removed_page_cache_bytes.is_some() {
+    let removed = [
+        (
+            "page_cache_bytes",
+            config.server.removed_page_cache_bytes.is_some(),
+        ),
+        (
+            "scan_page_cache_bytes",
+            config.server.removed_scan_page_cache_bytes.is_some(),
+        ),
+    ];
+    if let Some((setting, _)) = removed.into_iter().find(|&(_, set)| set) {
         return Err(ConfigViolation::RemovedSetting {
-            setting: "page_cache_bytes",
+            setting,
             replacement: "cache_bytes",
         });
     }
@@ -1159,12 +1153,6 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
             PARSE_CACHE_SHARDS,
         )?;
     }
-    check_capacity(
-        CacheName::Scan,
-        config.server.scan_page_cache_bytes,
-        PARSE_CACHE_SHARDS,
-        None,
-    )?;
     if let Some(local) = &config.storage.local
         && local.page_cache_disk_bytes > 0
         && local.page_cache_disk_bytes < PAGE_CACHE_DISK_BLOCK_BYTES
@@ -1482,6 +1470,11 @@ pub struct ServerConfig {
     /// fail the parse without the replacement.
     #[serde(rename = "page_cache_bytes")]
     pub(crate) removed_page_cache_bytes: Option<IgnoredAny>,
+    /// The removed `scan_page_cache_bytes`, read and refused as
+    /// `removed_page_cache_bytes` is: ordered tables' pages are cached in
+    /// the one page cache `cache_bytes` budgets (RFD 027).
+    #[serde(rename = "scan_page_cache_bytes")]
+    pub(crate) removed_scan_page_cache_bytes: Option<IgnoredAny>,
     /// Log field renames and additions.
     pub log: LogConfig,
     /// How long a `Get` may run before it is `DEADLINE_EXCEEDED`, and how
@@ -1530,12 +1523,6 @@ pub struct ServerConfig {
     /// `max_in_flight`, it is set for the process, so a reload that changes
     /// it is refused and a restart applies it (RFD 018).
     pub max_scan_bytes: usize,
-    /// The budget in bytes of the memory cache for the pages ordered
-    /// tables' span GETs fetch, kept out of the disk level so a scan evicts
-    /// only other scans' pages (RFD 025); held to the same minimum as
-    /// `page_cache_bytes`, one contract value page with its entry overhead
-    /// per shard.
-    pub scan_page_cache_bytes: u64,
     /// How long a build from no serving generation, a table's first load
     /// or a retry after one failed, may run before it fails and the table
     /// is `Degraded`; the next poll tries again.
@@ -1561,6 +1548,7 @@ impl Default for ServerConfig {
             cache_bytes: None,
             row_cache_share: None,
             removed_page_cache_bytes: None,
+            removed_scan_page_cache_bytes: None,
             log: LogConfig::default(),
             get_deadline: DEFAULT_GET_DEADLINE,
             multi_get_deadline: DEFAULT_MULTI_GET_DEADLINE,
@@ -1571,7 +1559,6 @@ impl Default for ServerConfig {
             scan_deadline: DEFAULT_SCAN_DEADLINE,
             multi_scan_deadline: DEFAULT_MULTI_SCAN_DEADLINE,
             max_scan_bytes: DEFAULT_MAX_SCAN_BYTES,
-            scan_page_cache_bytes: DEFAULT_SCAN_PAGE_CACHE_BYTES,
             load_deadline: DEFAULT_LOAD_DEADLINE,
             refresh_deadline: DEFAULT_REFRESH_DEADLINE,
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
@@ -2658,8 +2645,6 @@ mod tests {
     /// The `max_scan_rows` the full fixture's ordered table names, below
     /// half of `FIXTURE_MAX_MULTI_SCAN_VALUES`.
     const FIXTURE_MAX_SCAN_ROWS: u32 = 500;
-    /// The scan page cache budget the full fixture names, in bytes.
-    const FIXTURE_SCAN_PAGE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
     /// The load deadline the full fixture names, `"45m"`.
     const FIXTURE_LOAD_DEADLINE: Duration = Duration::from_mins(45);
     /// The refresh deadline the full fixture names, `"10m"`.
@@ -2725,7 +2710,6 @@ max_multi_scan_values = {FIXTURE_MAX_MULTI_SCAN_VALUES}
 scan_deadline = "3s"
 multi_scan_deadline = "9s"
 max_scan_bytes = {FIXTURE_MAX_SCAN_BYTES}
-scan_page_cache_bytes = {FIXTURE_SCAN_PAGE_CACHE_BYTES}
 load_deadline = "45m"
 refresh_deadline = "10m"
 drain_deadline = "25s"
@@ -2841,7 +2825,6 @@ endpoint = "https://s3tables.example"
                 "scan_deadline": "3s",
                 "multi_scan_deadline": "9s",
                 "max_scan_bytes": FIXTURE_MAX_SCAN_BYTES,
-                "scan_page_cache_bytes": FIXTURE_SCAN_PAGE_CACHE_BYTES,
                 "load_deadline": "45m",
                 "refresh_deadline": "10m",
                 "drain_deadline": "25s",
@@ -2966,6 +2949,7 @@ value_columns = ["value"]
                 cache_bytes: Some(FIXTURE_CACHE_BYTES),
                 row_cache_share: Some(FIXTURE_ROW_CACHE_SHARE),
                 removed_page_cache_bytes: None,
+                removed_scan_page_cache_bytes: None,
                 log: LogConfig {
                     fields: BTreeMap::from([
                         (StandardField::Time, "ts".to_string()),
@@ -2982,7 +2966,6 @@ value_columns = ["value"]
                 scan_deadline: FIXTURE_SCAN_DEADLINE,
                 multi_scan_deadline: FIXTURE_MULTI_SCAN_DEADLINE,
                 max_scan_bytes: FIXTURE_MAX_SCAN_BYTES,
-                scan_page_cache_bytes: FIXTURE_SCAN_PAGE_CACHE_BYTES,
                 load_deadline: FIXTURE_LOAD_DEADLINE,
                 refresh_deadline: FIXTURE_REFRESH_DEADLINE,
                 drain_deadline: FIXTURE_DRAIN_DEADLINE,
@@ -3412,7 +3395,6 @@ locaton = "typo"
         next.server.scan_deadline += Duration::from_secs(1);
         next.server.multi_scan_deadline += Duration::from_secs(1);
         next.server.max_scan_bytes += 1;
-        next.server.scan_page_cache_bytes += 1;
         next.storage.max_retries += 1;
         assert_eq!(
             running.restart_settings(&next),
@@ -3423,7 +3405,6 @@ locaton = "typo"
                 "server.scan_deadline",
                 "server.multi_scan_deadline",
                 "server.max_scan_bytes",
-                "server.scan_page_cache_bytes",
                 "storage.max_retries"
             ]
         );
@@ -3441,22 +3422,34 @@ locaton = "typo"
         );
     }
 
-    /// The removed `page_cache_bytes` is refused naming its replacement,
-    /// in either syntax, rather than failing the parse as an unknown key.
-    #[test]
-    fn test_page_cache_bytes_is_refused_naming_cache_bytes() {
-        let toml = format!("[server]\npage_cache_bytes = 1048576\n{TOML_MINIMAL}");
-        let json = r#"{"server": {"page_cache_bytes": 1048576}, "tables": [{"name": "kv", "source": {"type": "static", "location": "s3://example-warehouse/db/kv"}, "ref": "main", "key_column": "key", "value_columns": ["value"]}]}"#;
-        for text in [toml.as_str(), json] {
+    /// Asserts that a file setting the removed `[server]` key `setting` is
+    /// refused naming `cache_bytes`, in either syntax, rather than failing
+    /// the parse as an unknown key.
+    fn assert_refused_naming_cache_bytes(setting: &'static str) {
+        let toml = format!("[server]\n{setting} = 1048576\n{TOML_MINIMAL}");
+        let json = format!(
+            r#"{{"server": {{"{setting}": 1048576}}, "tables": [{{"name": "kv", "source": {{"type": "static", "location": "s3://example-warehouse/db/kv"}}, "ref": "main", "key_column": "key", "value_columns": ["value"]}}]}}"#
+        );
+        for text in [toml, json] {
             assert_eq!(
-                violation(text),
+                violation(&text),
                 ConfigViolation::RemovedSetting {
-                    setting: "page_cache_bytes",
+                    setting,
                     replacement: "cache_bytes",
                 },
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn test_page_cache_bytes_is_refused_naming_cache_bytes() {
+        assert_refused_naming_cache_bytes("page_cache_bytes");
+    }
+
+    #[test]
+    fn test_scan_page_cache_bytes_is_refused_naming_cache_bytes() {
+        assert_refused_naming_cache_bytes("scan_page_cache_bytes");
     }
 
     #[test]
@@ -4099,35 +4092,30 @@ locaton = "typo"
     }
 
     /// A set `cache_bytes` whose page part, the whole of it at a row
-    /// share of zero, and `scan_page_cache_bytes` are each held to one
-    /// shard's minimum; a `cache_bytes` left to the memory limit is checked
-    /// only when the caches open.
+    /// share of zero, is held to one shard's minimum; a `cache_bytes` left
+    /// to the memory limit is checked only when the caches open.
     #[test]
-    fn test_parse_refuses_each_page_cache_below_a_value_page_per_shard() {
+    fn test_parse_refuses_a_page_cache_below_a_value_page_per_shard() {
         let minimum = min_memory_bytes(PARSE_CACHE_SHARDS);
-        for cache in [CacheName::Lookup, CacheName::Scan] {
-            let setting = cache.budget_setting();
-            let with_budget = |bytes: u64| {
-                format!(
-                    "[server]\n{setting} = {bytes}\nrow_cache_share = 0.0\n{}",
-                    TOML_MINIMAL.trim_start()
-                )
-            };
-            for bytes in [0, VALUE_PAGE_BYTES, minimum - 1] {
-                assert_eq!(
-                    violation(&with_budget(bytes)),
-                    ConfigViolation::PageCacheTooSmall {
-                        cache,
-                        bytes,
-                        minimum,
-                        shards: PARSE_CACHE_SHARDS,
-                        limit: None,
-                    },
-                    "{setting} {bytes} bytes"
-                );
-            }
-            Config::parse(&with_budget(minimum)).unwrap();
+        let with_budget = |bytes: u64| {
+            format!(
+                "[server]\ncache_bytes = {bytes}\nrow_cache_share = 0.0\n{}",
+                TOML_MINIMAL.trim_start()
+            )
+        };
+        for bytes in [0, VALUE_PAGE_BYTES, minimum - 1] {
+            assert_eq!(
+                violation(&with_budget(bytes)),
+                ConfigViolation::PageCacheTooSmall {
+                    bytes,
+                    minimum,
+                    shards: PARSE_CACHE_SHARDS,
+                    limit: None,
+                },
+                "{bytes} bytes"
+            );
         }
+        Config::parse(&with_budget(minimum)).unwrap();
         let rows_take_most = format!(
             "[server]\ncache_bytes = {minimum}\n{}",
             TOML_MINIMAL.trim_start()
@@ -4135,11 +4123,7 @@ locaton = "typo"
         assert!(
             matches!(
                 violation(&rows_take_most),
-                ConfigViolation::PageCacheTooSmall {
-                    cache: CacheName::Lookup,
-                    bytes,
-                    ..
-                } if bytes < minimum
+                ConfigViolation::PageCacheTooSmall { bytes, .. } if bytes < minimum
             ),
             "the row cache's share leaves the page cache under the minimum"
         );
@@ -4508,10 +4492,6 @@ locaton = "typo"
             DEFAULT_MULTI_SCAN_DEADLINE
         );
         assert_eq!(config.server.max_scan_bytes, DEFAULT_MAX_SCAN_BYTES);
-        assert_eq!(
-            config.server.scan_page_cache_bytes,
-            DEFAULT_SCAN_PAGE_CACHE_BYTES
-        );
     }
 
     /// The old name of `server.batch_fan_out` is unknown, so a file that

@@ -460,7 +460,7 @@ mod tests {
 
     use super::*;
     use crate::config::{HedgeConfig, StorageConfig};
-    use crate::generation::testing::{CACHE_BYTES, cache, page_rows};
+    use crate::generation::testing::{cache, page_rows};
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, MEM_PREFIX, MemStore};
 
     /// The `SegmentsFault` a parquet error carries, when it is one.
@@ -913,11 +913,11 @@ mod tests {
             let window = window_of(SPAN_DELAY);
             let both_in_flight = 2;
             gauged.fill_to(both_in_flight);
-            let scans = PageCache::for_scans(CACHE_BYTES);
+            let page_cache = cache().await;
             let span = one_byte_pages(pages);
             let (read, origin) = tokio::time::timeout(
                 DEADLINE_GUARD,
-                handle.read_pages(&span, &scans, Issue::default(), &window),
+                handle.read_pages(&span, &page_cache, Issue::default(), &window),
             )
             .await
             .unwrap_or_else(|_| panic!("a span of {pages} pages hedges at the window's delay"))
@@ -944,10 +944,10 @@ mod tests {
         );
         let handle = file_through(Arc::new(throttled)).await;
         let window = window_of(HUGE);
-        let scans = PageCache::for_scans(CACHE_BYTES);
+        let page_cache = cache().await;
         let span = one_byte_pages(MANY_PAGES);
         handle
-            .read_pages(&span, &scans, Issue::default(), &window)
+            .read_pages(&span, &page_cache, Issue::default(), &window)
             .await
             .unwrap();
         assert_eq!(handle.storage.stats().hedges(), 0);

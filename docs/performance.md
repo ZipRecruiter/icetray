@@ -111,7 +111,7 @@ read, and a page of 10 of those rows took about 12 µs. A page of 10 rows
 from the middle of a 10,000-row run took about 24 µs, and about 44 µs
 over a string order column whose values share 64 leading bytes and whose
 column index the writer cut short. Decompressing the pages a `Scan`
-reads from the scan cache took half of the long run's warm `Scan` and
+reads from memory took half of the long run's warm `Scan` and
 over a third of the string one's, the largest share of each. A cold
 bounded `Scan` took one round of GETs whatever the writer's order column
 index held, after the key-page round under `bloom`, and made the GETs in
@@ -155,16 +155,22 @@ idle, so it lowers the latency of a lightly loaded server without
 taking throughput from a busy one
 ([the measurements](analysis/2026-10-14-order-fences.md#multiscan)).
 
-### The scan cache
+### The page cache and scans
 
-icetray caches each page a span GET fetches as its own entry, keyed by
-file and offset, in a memory cache of its own, bounded by
-`server.scan_page_cache_bytes` ([Configuration](configuration.md#server)). A later `Scan` of the
-same key reads those pages from memory, and one that reaches past them
-fetches only its uncached spans. The scan cache has no disk level, and
-key-value lookups read through the page cache alone, so a long run evicts
-only other scans' pages. The `cache` label of the page-cache metrics
-separates the two ([Metrics](operating.md#metrics)).
+icetray caches an ordered table's pages in the page cache every table
+shares, each page a span GET fetches as its own entry, keyed by file and
+offset. A later `Scan` of the same key takes each page from memory, then
+from the page cache's disk level when the local directory has one, a
+local read in place of a GET, and fetches only the runs of pages neither
+holds, one GET per run. The memory level keeps a pass over pages read
+once from displacing pages read again. `server.cache_bytes` bounds the
+memory level ([Configuration](configuration.md#server)) and
+`storage.local.page_cache_disk_bytes` the disk level
+([Configuration](configuration.md#storagelocal)). Scans and lookups share
+both levels, so a long `Scan` can push a key-value table's pages off the
+disk level, though not its rows out of the row cache. Their hits and
+fetches count together in the page-cache metrics
+([Metrics](operating.md#metrics)).
 
 ## Packing or splitting a row
 
@@ -301,8 +307,8 @@ because the writer gave each file a 1 MiB filter whatever its key count.
 [Memory](operating.md#memory) turns these figures into a container memory
 limit: the predicted bytes for each table's residency, doubled for a
 table a refresh can rewrite wholesale or a reload can change, plus the
-page cache and, on a replica serving an ordered table, the scan cache,
-plus a third of that total for the process.
+cache budget, `server.cache_bytes`, plus a third of that total for the
+process.
 
 ## The row cache
 
@@ -540,5 +546,7 @@ read without blocking, so every local read there moves to another thread
 - [RFD 026](rfd/026-row-cache.md): the row cache, what it is keyed by,
   and why it is never invalidated.
 - [RFD 025](rfd/025-ordered-rows.md): ordered tables, what a `Scan`
-  reads in each residency, the scan cache, and spreading a `MultiScan`
-  across idle worker threads.
+  reads in each residency, and spreading a `MultiScan` across idle
+  worker threads.
+- [RFD 027](rfd/027-one-page-cache.md): one page cache for every table,
+  and a `Scan`'s span read from memory and the disk level.

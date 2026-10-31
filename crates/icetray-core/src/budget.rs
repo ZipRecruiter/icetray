@@ -10,7 +10,6 @@ use crate::config::{
     ServerConfig,
 };
 use crate::memory::MemoryLimit;
-use crate::metric::CacheName;
 
 /// The bytes each cache holds in memory, and the memory limit they were
 /// derived from.
@@ -59,7 +58,7 @@ pub fn resolve(
         0
     };
     let page_bytes = whole - row_bytes;
-    check_capacity(CacheName::Lookup, page_bytes, shards, derived_from)?;
+    check_capacity(page_bytes, shards, derived_from)?;
     Ok(Budget {
         row_bytes,
         page_bytes,
@@ -185,7 +184,6 @@ mod tests {
         assert_eq!(
             refused,
             ConfigViolation::PageCacheTooSmall {
-                cache: CacheName::Lookup,
                 bytes: page_bytes,
                 minimum: min_memory_bytes(SHARDS),
                 shards: SHARDS,

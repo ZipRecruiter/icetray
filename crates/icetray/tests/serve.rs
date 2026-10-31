@@ -21,7 +21,7 @@ use icetray_core::config::{
     Config, LocalConfig, Residency, ServerConfig, SourceConfig, TableConfig, ValueFormat,
 };
 use icetray_core::key::UUID_BYTES;
-use icetray_core::metric::{self, CacheName, Kind, LookupResult, ScanResult, Temperature};
+use icetray_core::metric::{self, Kind, LookupResult, ScanResult, Temperature};
 use icetray_core::{
     ColumnRead, ErrorKind, Generation, IoStats, Key, KeyType, MAX_FIELD_NUMBER, Row, Storage,
     TableState,
@@ -1453,18 +1453,11 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
         metric::PAGE_CACHE_BYTES,
     ] {
         gauge(&scrape, name);
-    }
-    for cache in [CacheName::Lookup, CacheName::Scan] {
-        let cache = cache.to_string();
-        for name in [
-            metric::PAGE_CACHE_FETCHES_TOTAL,
-            metric::PAGE_CACHE_HITS_TOTAL,
-        ] {
-            assert!(
-                series_value(&scrape, name, &[(metric::LABEL_CACHE, cache.as_str())]).is_some(),
-                "{name} of the {cache} cache in {scrape}"
-            );
-        }
+        let labeled = format!("{name}{{");
+        assert!(
+            !scrape.lines().any(|line| line.starts_with(&labeled)),
+            "the one page cache's {name} carries no label in {scrape}"
+        );
     }
     assert_in_flight(&scrape, 0, ServerConfig::default().max_in_flight);
     assert_eq!(

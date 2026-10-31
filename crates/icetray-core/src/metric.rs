@@ -19,10 +19,10 @@ pub const LOCAL_READS_TOTAL: &str = "icetray_local_reads_total";
 pub const LOCAL_BYTES_TOTAL: &str = "icetray_local_bytes_total";
 /// Second requests issued because a lookup GET was slow (RFD 013).
 pub const HEDGES_TOTAL: &str = "icetray_hedges_total";
-/// Pages served from a page cache without a fetch, by `cache`.
+/// Pages served from the page cache without a fetch.
 pub const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
-/// Page fetches a page cache ran, after coalescing, by `cache`: a span
-/// fetch of the scan cache counts once however many pages it holds.
+/// Page fetches the page cache ran, after coalescing: a span fetch counts
+/// once however many pages it holds.
 pub const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
 /// Value reads the row cache served without reading a page (RFD 026),
 /// a cached null included.
@@ -109,7 +109,7 @@ pub const ALLOCATOR_RESIDENT_BYTES: &str = "icetray_allocator_resident_bytes";
 /// Bytes of address space jemalloc keeps mapped for reuse after returning
 /// its pages: virtual, not resident.
 pub const ALLOCATOR_RETAINED_BYTES: &str = "icetray_allocator_retained_bytes";
-/// Bytes a page cache holds in memory, by `cache`.
+/// Bytes the page cache holds in memory.
 pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
 /// Bytes the row cache holds against its budget (RFD 026): each entry's
 /// value at its allocation size plus the per-entry overhead.
@@ -244,12 +244,12 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 57] = [
     (
         PAGE_CACHE_HITS_TOTAL,
         Kind::Counter,
-        "Pages served from a page cache without a fetch, by cache.",
+        "Pages served from the page cache without a fetch.",
     ),
     (
         PAGE_CACHE_FETCHES_TOTAL,
         Kind::Counter,
-        "Page fetches a page cache ran, after coalescing, by cache.",
+        "Page fetches the page cache ran, after coalescing.",
     ),
     (
         ROW_CACHE_HITS_TOTAL,
@@ -374,7 +374,7 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 57] = [
     (
         PAGE_CACHE_BYTES,
         Kind::Gauge,
-        "Bytes a page cache holds in memory against its budget, by cache.",
+        "Bytes the page cache holds in memory against its budget.",
     ),
     (
         ROW_CACHE_BYTES,
@@ -533,8 +533,6 @@ pub const LABEL_STATE: &str = "state";
 /// The `temperature` label: whether a Scan read a page from object
 /// storage, from `Temperature`.
 pub const LABEL_TEMPERATURE: &str = "temperature";
-/// The `cache` label: which page cache a series counts, from `CacheName`.
-pub const LABEL_CACHE: &str = "cache";
 
 /// Which path a GET serves; the `kind` label. Load reads (footers, key
 /// chunks, metadata) are bulk work nobody waits on and are never hedged;
@@ -645,39 +643,6 @@ impl fmt::Display for Temperature {
     }
 }
 
-/// Which page cache a series counts: the `cache` label. Display gives the
-/// label value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CacheName {
-    /// The value-page cache key-value lookups read through, budgeted by
-    /// its memory level's part of `server.cache_bytes`.
-    Lookup,
-    /// The memory cache of ordered tables' pages,
-    /// `server.scan_page_cache_bytes` (RFD 025).
-    Scan,
-}
-
-impl CacheName {
-    /// The `[server]` setting that budgets the cache's memory, alone or
-    /// with the row cache.
-    pub(crate) fn budget_setting(self) -> &'static str {
-        match self {
-            Self::Lookup => "cache_bytes",
-            Self::Scan => "scan_page_cache_bytes",
-        }
-    }
-}
-
-impl fmt::Display for CacheName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::Lookup => "lookup",
-            Self::Scan => "scan",
-        };
-        f.write_str(name)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -721,9 +686,6 @@ mod tests {
         }
         for (temperature, name) in [(Temperature::Cold, "cold"), (Temperature::Warm, "warm")] {
             assert_eq!(temperature.to_string(), name);
-        }
-        for (cache, name) in [(CacheName::Lookup, "lookup"), (CacheName::Scan, "scan")] {
-            assert_eq!(cache.to_string(), name);
         }
     }
 

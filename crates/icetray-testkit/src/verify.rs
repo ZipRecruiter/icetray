@@ -57,12 +57,10 @@ pub struct Served {
     /// The storage every read of the table goes through; its `stats` are
     /// the GET oracle.
     pub storage: Arc<Storage>,
-    /// The table's page cache; its counters say whether it is cold.
+    /// The table's page cache, which a key-value table's lookups and an
+    /// ordered table's Scans alike read through (RFD 027); its counters
+    /// say whether it is cold.
     pub cache: PageCache,
-    /// The table's scan cache (RFD 025), of the same budget, which an
-    /// ordered table's Scans read through and a key-value table never
-    /// touches.
-    pub scan_cache: PageCache,
     /// The row cache the table reads through (RFD 026) when it was built
     /// by `build_reading_rows`; `None` for every other table, whose lookups
     /// read every value from its page, so the GET oracles count what a
@@ -91,8 +89,7 @@ impl Served {
 }
 
 /// `config` from `source` over `storage`, not yet loaded: a `cache_bytes`
-/// page cache on `local`'s disk level when there is one, a scan cache of
-/// `cache_bytes` in memory, a count of calls
+/// page cache on `local`'s disk level when there is one, a count of calls
 /// in flight of its own, and the table in `Loading`. A test that asserts on a refused table's state or needs a
 /// cache of another size builds here and calls `Served::load` itself. The
 /// disk-tier tests build the storage first and open their `LocalDir` over
@@ -135,7 +132,6 @@ async fn build_with(
         local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;
-    let scan_cache = PageCache::for_scans(cache_bytes);
     let server = ServerConfig::default();
     let handles = TableHandles {
         storage: Arc::clone(&storage),
@@ -145,7 +141,6 @@ async fn build_with(
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
         batch_fan_out: server.batch_fan_out,
-        scan_cache: scan_cache.clone(),
         max_multi_scan_values: server.max_multi_scan_values,
         max_scan_bytes: server.max_scan_bytes,
     };
@@ -161,7 +156,6 @@ async fn build_with(
     Ok(Served {
         storage,
         cache,
-        scan_cache,
         row_cache,
         table,
     })

@@ -588,7 +588,11 @@ impl Generation {
                     continue;
                 }
                 let reads = columns.iter().map(|&column| async move {
-                    let cached = rows.zip(file.index.row_key(column, row));
+                    let cached = rows.and_then(|rows| {
+                        file.index
+                            .row_key(column, row)
+                            .map(|row_key| (rows, row_key))
+                    });
                     if let Some((row_cache, row_key)) = &cached {
                         match row_cache.get(row_key) {
                             Cached::Value(bytes) => return Ok((Some(bytes), false)),

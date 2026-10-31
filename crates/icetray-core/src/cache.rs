@@ -31,7 +31,7 @@ use crate::descriptors;
 use crate::error::{Error, Recurrence, Recurs, Result};
 use crate::local::DiskLevel;
 use crate::memory::MemoryLimit;
-use crate::metric::{self, CacheName};
+use crate::metric;
 use crate::shard::{self, Sharded, Tally};
 use crate::storage::IoStats;
 
@@ -80,13 +80,12 @@ pub(crate) fn min_memory_bytes(shards: usize) -> u64 {
     approx::count(shards) * (VALUE_PAGE_BYTES + approx::count(ENTRY_OVERHEAD_BYTES))
 }
 
-/// `ConfigViolation::PageCacheTooSmall` for `cache`'s budget of `bytes`
+/// `ConfigViolation::PageCacheTooSmall` for a memory budget of `bytes`
 /// below `min_memory_bytes(shards)`, naming the memory `limit` the budget
 /// was derived from, if any. Parsing calls it with one shard; `open_with`
 /// with `memory_shards()` before it opens a cache, since the worker count
 /// is not known when the configuration is parsed.
 pub(crate) fn check_capacity(
-    cache: CacheName,
     bytes: u64,
     shards: usize,
     limit: Option<MemoryLimit>,
@@ -94,7 +93,6 @@ pub(crate) fn check_capacity(
     let minimum = min_memory_bytes(shards);
     if bytes < minimum {
         return Err(ConfigViolation::PageCacheTooSmall {
-            cache,
             bytes,
             minimum,
             shards,
@@ -313,15 +311,13 @@ fn origin_of(source: Source) -> PageOrigin {
 }
 
 /// The shared value-page cache. Clones share one cache and one set of
-/// counters: every table of a process holds a clone of the same cache. A
-/// clone may carry a fetch deadline of its own (`with_fetch_deadline`),
-/// which bounds the fetches that clone runs. A process opens two: the
-/// lookup cache (`new`) and the scan cache of ordered tables' pages
-/// (`for_scans`, RFD 025), whose series the `cache` label tells apart.
+/// counters: every table of a process holds a clone of the same cache,
+/// whose pages a key-value table's lookups and an ordered table's Scans
+/// alike read through, from memory and then from the disk level (RFD
+/// 027). A clone may carry a fetch deadline of its own
+/// (`with_fetch_deadline`), which bounds the fetches that clone runs.
 #[derive(Clone, Debug)]
 pub struct PageCache {
-    /// Which cache this is, the `cache` label of its series.
-    name: CacheName,
     level: Arc<Level>,
     hits: Arc<Tally>,
     fetches: Arc<Fetches>,
@@ -422,7 +418,6 @@ impl PageCache {
     /// why this is async and can fail: running out of descriptors is
     /// `CacheError::DescriptorLimit`, any other failure
     /// `CacheError::Backend`.
-    /// Its series carry `cache = "lookup"`.
     pub async fn new(capacity_bytes: usize, disk: Option<DiskLevel>) -> Result<Self> {
         let level = match disk {
             None => memory_level(capacity_bytes),
@@ -433,31 +428,13 @@ impl PageCache {
                 stats: Arc::clone(disk.stats()),
             },
         };
-        Ok(Self::over(CacheName::Lookup, level))
-    }
-
-    /// The scan cache (RFD 025, Caching and hedging): `capacity_bytes` of
-    /// ordered tables' pages in memory alone, with no disk level, so a scan
-    /// evicts only other scans' pages and never a lookup's; `open_with`
-    /// checks the budget first (`check_capacity`). Its series carry
-    /// `cache = "scan"`.
-    pub fn for_scans(capacity_bytes: usize) -> Self {
-        Self::over(CacheName::Scan, memory_level(capacity_bytes))
-    }
-
-    /// A cache named `name` over `level`, its counters registered.
-    fn over(name: CacheName, level: Level) -> Self {
-        Self {
-            name,
+        Ok(Self {
             level: Arc::new(level),
-            hits: Arc::new(Tally::new(metrics::counter!(
-                metric::PAGE_CACHE_HITS_TOTAL,
-                metric::LABEL_CACHE => name.to_string()
-            ))),
-            fetches: Arc::new(Fetches::new(name)),
+            hits: Arc::new(Tally::new(metrics::counter!(metric::PAGE_CACHE_HITS_TOTAL))),
+            fetches: Arc::new(Fetches::new()),
             spans: Arc::new(SpanFlights::new()),
             fetch_deadline: None,
-        }
+        })
     }
 
     /// This handle on the same cache and counters, its fetches ending at
@@ -909,11 +886,7 @@ impl PageCache {
     /// (`usage`); a scrape calls this, so the gauge reads evictions as well
     /// as inserts.
     pub fn publish_usage(&self) {
-        metrics::gauge!(
-            metric::PAGE_CACHE_BYTES,
-            metric::LABEL_CACHE => self.name.to_string()
-        )
-        .set(approx::gauge_len(self.usage()));
+        metrics::gauge!(metric::PAGE_CACHE_BYTES).set(approx::gauge_len(self.usage()));
     }
 
     /// Bytes charged against the memory budget: each page in memory at its
@@ -934,6 +907,17 @@ impl PageCache {
         match self.level.as_ref() {
             Level::Memory(cache) => cache.evict_all(),
             Level::Hybrid { cache, .. } => cache.memory().evict_all(),
+        }
+    }
+
+    /// Waits until the disk level has written every page memory let go of
+    /// before the call, by eviction or `clear`; a memory-only cache returns
+    /// at once. What a test that reads a page back from the disk level
+    /// waits on.
+    #[cfg(test)]
+    pub(crate) async fn disk_writes_done(&self) {
+        if let Level::Hybrid { cache, .. } = self.level.as_ref() {
+            cache.storage().wait().await;
         }
     }
 
@@ -1119,13 +1103,10 @@ struct Fetches {
 }
 
 impl Fetches {
-    fn new(name: CacheName) -> Self {
+    fn new() -> Self {
         Self {
             count: AtomicU64::new(0),
-            total: metrics::counter!(
-                metric::PAGE_CACHE_FETCHES_TOTAL,
-                metric::LABEL_CACHE => name.to_string()
-            ),
+            total: metrics::counter!(metric::PAGE_CACHE_FETCHES_TOTAL),
         }
     }
 
@@ -1460,7 +1441,7 @@ mod tests {
     fn deadline_run() -> Run {
         Run {
             page: PageKey(Arc::from(FILE_ID), FIRST_OFFSET),
-            fetches: Arc::new(Fetches::new(CacheName::Lookup)),
+            fetches: Arc::new(Fetches::new()),
             deadline: Some(FETCH_DEADLINE),
             permit: None,
             counted: None,
@@ -1620,7 +1601,7 @@ mod tests {
             })
             .await
             .unwrap();
-        hybrid(cache).storage().wait().await;
+        cache.disk_writes_done().await;
     }
 
     /// Overwrites every copy of `page` in the level's files under
@@ -1703,20 +1684,17 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.block_on(async { memory_shards() }), shards);
         let minimum = min_memory_bytes(shards);
-        for cache in [CacheName::Lookup, CacheName::Scan] {
-            assert_eq!(
-                check_capacity(cache, minimum - 1, shards, None),
-                Err(ConfigViolation::PageCacheTooSmall {
-                    cache,
-                    bytes: minimum - 1,
-                    minimum,
-                    shards,
-                    limit: None,
-                })
-            );
-            assert_eq!(check_capacity(cache, minimum, shards, None), Ok(()));
-            assert_eq!(check_capacity(cache, minimum - 1, 1, None), Ok(()));
-        }
+        assert_eq!(
+            check_capacity(minimum - 1, shards, None),
+            Err(ConfigViolation::PageCacheTooSmall {
+                bytes: minimum - 1,
+                minimum,
+                shards,
+                limit: None,
+            })
+        );
+        assert_eq!(check_capacity(minimum, shards, None), Ok(()));
+        assert_eq!(check_capacity(minimum - 1, 1, None), Ok(()));
     }
 
     /// A cache's counters are registered at zero when it opens, before
@@ -1807,7 +1785,7 @@ mod tests {
     /// one fetch serves both reads.
     #[tokio::test]
     async fn test_get_span_joins_the_pages_another_read_is_fetching() {
-        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
         let gate = Notify::new();
@@ -1842,7 +1820,7 @@ mod tests {
     /// claims them and fetches them itself.
     #[tokio::test]
     async fn test_get_span_claims_the_pages_of_a_read_dropped_while_fetching() {
-        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
         let mut dropped = Box::pin(cache.get_span(&id, &SPAN, Issue::default(), |_| {
@@ -1894,7 +1872,7 @@ mod tests {
     /// `Arc<Error>` both receive, and caches none of them.
     #[tokio::test]
     async fn test_get_span_fetch_error_reaches_a_joined_read_and_caches_nothing() {
-        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
         let runs = Arc::new(AtomicU64::new(0));
@@ -1925,7 +1903,10 @@ mod tests {
     /// offset as the claimer does; nothing is cached.
     #[tokio::test]
     async fn test_get_span_ends_a_run_at_its_deadline_for_a_joined_read() {
-        let cache = PageCache::for_scans(ROOMY_BYTES).with_fetch_deadline(FETCH_DEADLINE);
+        let cache = PageCache::new(ROOMY_BYTES, None)
+            .await
+            .unwrap()
+            .with_fetch_deadline(FETCH_DEADLINE);
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
         let runs = Arc::new(AtomicU64::new(0));
@@ -1970,7 +1951,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_span_of_a_run_answered_short_fails_and_caches_nothing() {
         let short_by = 5;
-        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
         let short = |span: Range<u64>| {
@@ -1994,7 +1975,7 @@ mod tests {
     /// for that fetch to end.
     #[tokio::test]
     async fn test_get_span_returns_a_failed_run_without_waiting_on_its_joins() {
-        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let id: Arc<str> = Arc::from(FILE_ID);
         let mut fetching = Box::pin(cache.get_span(&id, &SPAN[1..], Issue::default(), |_| {
             std::future::pending::<Result<Bytes>>()
@@ -2033,7 +2014,7 @@ mod tests {
     /// other read cached and fetches nothing.
     #[tokio::test]
     async fn test_get_span_of_pages_another_read_has_queued_is_not_held_behind_its_permits() {
-        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
         let full = Arc::new(Semaphore::new(1));
@@ -2073,7 +2054,7 @@ mod tests {
     async fn test_get_span_of_a_run_partly_claimed_while_it_queued_fetches_the_rest() {
         let pages = [0..10, 10..20, 20..30];
         let claimed_elsewhere = 1;
-        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let id: Arc<str> = Arc::from(FILE_ID);
         let file = span_file();
         let full = Arc::new(Semaphore::new(1));
@@ -2151,7 +2132,7 @@ mod tests {
     /// memory holds every page they read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_get_span_of_two_files_takes_no_shared_lock_and_warm_reads_none() {
-        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let file = span_file();
         let first: Arc<str> = Arc::from(FILE_ID);
         let second = file_of_another_shard(&cache, &first);
@@ -2203,11 +2184,11 @@ mod tests {
         assert_eq!(cache.fetches(), 2, "one run per file");
     }
 
-    /// The lookup cache's and the scan cache's series are their own, told
-    /// apart by the `cache` label, so a Scan's fetch counts under the scan
-    /// cache alone (RFD 025).
+    /// The one page cache's series carry no label (RFD 027, Counted): a
+    /// fetch counts in the unlabeled `page_cache_fetches_total`, and
+    /// `publish_usage` sets the one unlabeled `page_cache_bytes`.
     #[test]
-    fn test_each_cache_counts_under_its_own_cache_label() {
+    fn test_the_page_cache_series_carry_no_label() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2216,37 +2197,36 @@ mod tests {
             .unwrap();
         let series = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
-                let lookup = PageCache::new(ROOMY_BYTES, None).await.unwrap();
-                let scan = PageCache::for_scans(ROOMY_BYTES);
+                let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
                 let runs = Arc::new(AtomicU64::new(0));
-                scan.get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
-                    answering(PAGE, &runs)
-                })
-                .await
-                .unwrap();
-                lookup.publish_usage();
-                scan.publish_usage();
+                cache
+                    .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+                        answering(PAGE, &runs)
+                    })
+                    .await
+                    .unwrap();
+                cache.publish_usage();
                 snapshotter.snapshot().into_vec()
             })
         });
-        let fetched = |cache: CacheName| {
-            series
+        let names = [
+            metric::PAGE_CACHE_HITS_TOTAL,
+            metric::PAGE_CACHE_FETCHES_TOTAL,
+            metric::PAGE_CACHE_BYTES,
+        ];
+        for name in names {
+            let found: Vec<_> = series
                 .iter()
-                .find(|(key, ..)| {
-                    key.key().name() == metric::PAGE_CACHE_FETCHES_TOTAL
-                        && key.key().labels().any(|label| {
-                            label.key() == metric::LABEL_CACHE && label.value() == cache.to_string()
-                        })
-                })
-                .map(|(.., value)| value)
-        };
-        assert_eq!(fetched(CacheName::Lookup), Some(&DebugValue::Counter(0)));
-        assert_eq!(fetched(CacheName::Scan), Some(&DebugValue::Counter(1)));
-        let gauges = series
+                .filter(|(key, ..)| key.key().name() == name)
+                .collect();
+            assert_eq!(found.len(), 1, "one {name} series");
+            assert_eq!(found[0].0.key().labels().count(), 0, "{name} has no label");
+        }
+        let fetched = series
             .iter()
-            .filter(|(key, ..)| key.key().name() == metric::PAGE_CACHE_BYTES)
-            .count();
-        assert_eq!(gauges, 2, "one bytes gauge per cache");
+            .find(|(key, ..)| key.key().name() == metric::PAGE_CACHE_FETCHES_TOTAL)
+            .map(|(.., value)| value);
+        assert_eq!(fetched, Some(&DebugValue::Counter(1)));
     }
 
     /// Hits spread over a multi-thread runtime's workers reach
@@ -2649,7 +2629,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_clear_drops_every_page_so_the_next_request_fetches() {
-        let cache = PageCache::for_scans(ROOMY_BYTES);
+        let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         for _ in 0..2 {
             cache
@@ -2840,7 +2820,7 @@ mod tests {
             .await
             .unwrap();
         cache.clear();
-        hybrid(&cache).storage().wait().await;
+        cache.disk_writes_done().await;
         for page in &DISK_SPAN {
             assert_eq!(cache.held_page(id, page.start), None, "left memory");
         }
@@ -2853,7 +2833,7 @@ mod tests {
         for offset in offsets {
             hybrid(cache).remove(&PageKey(Arc::clone(id), *offset));
         }
-        hybrid(cache).storage().wait().await;
+        cache.disk_writes_done().await;
     }
 
     /// Reads `DISK_SPAN` of `file` through `cache`, recording every span its

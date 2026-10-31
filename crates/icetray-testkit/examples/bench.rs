@@ -43,7 +43,7 @@
 //! Per table and tier it measures Scans of the keys the golden tests sample
 //! from each tier of rows per key (`golden::reference_tier_sample`), in
 //! both directions, whole and over a window of each run's middle half, cold
-//! (the page cache and the scan cache emptied before each operation,
+//! (the page cache emptied before each operation,
 //! outside its timing) and warm (every key paged through first);
 //! `MultiScan`s of 10 and 100 keys at each key's newest row and a light
 //! key's most rows (`reference_multi_limits`); and first loads with their
@@ -315,7 +315,7 @@ enum Scenario {
     /// only.
     #[value(name = "multi-scan-10")]
     MultiScan10,
-    /// `multi-scan-10` through the `COLD_CACHE_BYTES` scan cache. Ordered
+    /// `multi-scan-10` through the `COLD_CACHE_BYTES` page cache. Ordered
     /// table only.
     #[value(name = "multi-scan-10-cold")]
     MultiScan10Cold,
@@ -324,14 +324,14 @@ enum Scenario {
     /// call's keys are spread over workers. Ordered table only.
     #[value(name = "multi-scan-100")]
     MultiScan100,
-    /// `multi-scan-100` through the `COLD_CACHE_BYTES` scan cache. Ordered
+    /// `multi-scan-100` through the `COLD_CACHE_BYTES` page cache. Ordered
     /// table only.
     #[value(name = "multi-scan-100-cold")]
     MultiScan100Cold,
     /// `multi-scan-100` of `LARGE_BATCH_KEYS` keys. Ordered table only.
     #[value(name = "multi-scan-1000")]
     MultiScan1000,
-    /// `multi-scan-1000` through the `COLD_CACHE_BYTES` scan cache. Ordered
+    /// `multi-scan-1000` through the `COLD_CACHE_BYTES` page cache. Ordered
     /// table only.
     #[value(name = "multi-scan-1000-cold")]
     MultiScan1000Cold,
@@ -345,7 +345,7 @@ enum Scenario {
     /// (`bounded_in_run`), warm: a page deep in a long history. Long-run
     /// table only.
     ScanBoundedLong,
-    /// `scan-bounded-long` through the `COLD_CACHE_BYTES` scan cache.
+    /// `scan-bounded-long` through the `COLD_CACHE_BYTES` page cache.
     /// Long-run table only.
     ScanBoundedLongCold,
     /// A Scan of the `HEAD_ROWS` newest rows of a key's long run, no bound,
@@ -355,7 +355,7 @@ enum Scenario {
     /// values share a long prefix inside which the writer truncated the
     /// order column's index. String-ordered table only.
     ScanBoundedString,
-    /// `scan-bounded-string` through the `COLD_CACHE_BYTES` scan cache.
+    /// `scan-bounded-string` through the `COLD_CACHE_BYTES` page cache.
     /// String-ordered table only.
     ScanBoundedStringCold,
 }
@@ -444,8 +444,8 @@ struct Traits {
 enum Cache {
     /// One primed to hold every value page, which the table's must fit.
     Warm,
-    /// The `COLD_CACHE_BYTES` page cache and scan cache, which hold almost
-    /// none of the table's value pages.
+    /// The `COLD_CACHE_BYTES` caches, which hold almost none of the
+    /// table's value pages.
     Cold,
     /// None it depends on: a miss, served warm, reads no value page, and a
     /// load or a refresh reads none through it.
@@ -1792,7 +1792,6 @@ struct Served {
     beside: Option<Arc<Table>>,
     storage: Arc<Storage>,
     cache: PageCache,
-    scan_cache: PageCache,
     /// The local directory under the Disk tier, whose chunk files the
     /// sizing reports.
     local: Option<Arc<LocalDir>>,
@@ -1824,8 +1823,8 @@ struct Stack {
 /// The handles of a process serving over `storage` in `tier`, as
 /// `open_with` gives a process's tables: a cache budget of `cache_bytes`
 /// split between the row cache and the page cache as a server splits it
-/// with a table reading rows (`budget::resolve`), a `cache_bytes` scan
-/// cache, the run's `--batch-fan-out` and
+/// (`budget::resolve`), the row cache's share held only when `rows_read`,
+/// some table served reading through it; the run's `--batch-fan-out` and
 /// `server.max_multi_scan_values` (`Serving`), the server's defaults
 /// otherwise, and under Disk a local directory with no page-cache disk
 /// level, `reuse`'s when given (`local_for`).
@@ -1833,12 +1832,13 @@ async fn stack(
     storage: &Arc<Storage>,
     tier: Tier,
     cache_bytes: usize,
+    rows_read: bool,
     reuse: Option<TempDir>,
 ) -> BenchResult<Stack> {
     let (local, dir) = local_for(tier, storage, reuse)?;
     let mut server = ServerConfig::default();
     server.cache_bytes = Some(approx::count(cache_bytes));
-    let budget = budget::resolve(&server, None, true, BUDGET_SHARDS)?;
+    let budget = budget::resolve(&server, None, rows_read, BUDGET_SHARDS)?;
     let handles = TableHandles {
         storage: Arc::clone(storage),
         cache: PageCache::new(approx::length(budget.page_bytes), None).await?,
@@ -1847,7 +1847,6 @@ async fn stack(
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
         batch_fan_out: serving().batch_fan_out,
-        scan_cache: PageCache::for_scans(cache_bytes),
         max_multi_scan_values: serving().max_multi_scan_values,
         max_scan_bytes: ServerConfig::default().max_scan_bytes,
     };
@@ -1859,8 +1858,8 @@ async fn stack(
 }
 
 /// `prepared` in `tier` from `source`, over the production storage
-/// defaults (hedging on), a `cache_bytes` page cache, and a `cache_bytes`
-/// scan cache, not yet loaded; beside it, over the same handles as
+/// defaults (hedging on) and a `cache_bytes` cache budget (`stack`), not
+/// yet loaded; beside it, over the same handles as
 /// `open_with` gives a process's tables, `beside` pinned, loaded, and
 /// primed as the warm scenarios are. The Disk tier gets a fresh local
 /// directory with no page-cache disk level, or `reuse`'s when given, whose
@@ -1885,7 +1884,14 @@ async fn serve(
         handles,
         local,
         dir,
-    } = stack(&storage, tier, cache_bytes, reuse).await?;
+    } = stack(
+        &storage,
+        tier,
+        cache_bytes,
+        reads_rows(prepared, beside),
+        reuse,
+    )
+    .await?;
     let beside = match beside {
         Some(other) => {
             let table = table_over(other, tier, pinned(other), handles.clone()).await?;
@@ -1896,14 +1902,12 @@ async fn serve(
         None => None,
     };
     let cache = handles.cache.clone();
-    let scan_cache = handles.scan_cache.clone();
     let table = table_over(prepared, tier, source, handles).await?;
     Ok(Served {
         table: Arc::new(table),
         beside,
         storage,
         cache,
-        scan_cache,
         local,
         rounds,
         gets: None,
@@ -1981,6 +1985,15 @@ async fn table_of(config: TableConfig, handles: TableHandles) -> BenchResult<Tab
         server.get_deadline,
         server.scan_deadline,
     ))
+}
+
+/// Whether `prepared` or the table served `beside` it reads through the
+/// row cache: a key-value table does, as `table_over` configures it, and
+/// an ordered table never does.
+fn reads_rows(prepared: &Prepared, beside: Option<&Prepared>) -> bool {
+    std::iter::once(prepared)
+        .chain(beside)
+        .any(|served| served.shape.ordered.is_none())
 }
 
 /// The first build's metadata file, which never advances.
@@ -2338,12 +2351,13 @@ enum Op {
     },
     /// The next of `requests`, a `scan` or a `multi_scan` of a reference
     /// table reading `VALUE_COLUMN`, each key answering its own case as
-    /// `Scan` requires; before it, out of its timing, `cold`'s caches
-    /// emptied (`Op::before`).
+    /// `Scan` requires; before it, out of its timing, the page cache
+    /// `cold` emptied (`Op::before`, `PageCache::clear`), so it reads every
+    /// page from where the tier keeps it.
     Reference {
         requests: Arc<Vec<Request>>,
         value_bytes: usize,
-        cold: Option<ColdCaches>,
+        cold: Option<PageCache>,
     },
 }
 
@@ -2403,15 +2417,6 @@ async fn checked_scan<'a>(
     Ok(ValueBytes::of(returned, returned))
 }
 
-/// The page cache and scan cache a cold reference op empties before each
-/// operation (`PageCache::clear`), so it reads every page from where the
-/// tier keeps it.
-#[derive(Clone)]
-struct ColdCaches {
-    cache: PageCache,
-    scan_cache: PageCache,
-}
-
 impl Op {
     /// The positions in the key pool that operation `i` asks: the next
     /// key, or the next batch, which wraps before it would run past the
@@ -2448,14 +2453,13 @@ impl Op {
     }
 
     /// What runs before each operation, outside its timing: a cold
-    /// reference op's caches emptied; nothing for any other op.
+    /// reference op's page cache emptied; nothing for any other op.
     fn before(&self) {
         match self {
             Self::Reference {
                 cold: Some(cold), ..
             } => {
-                cold.cache.clear();
-                cold.scan_cache.clear();
+                cold.clear();
             }
             Self::Reference { cold: None, .. }
             | Self::Get { .. }
@@ -2722,8 +2726,7 @@ async fn join_loops(handles: Loops) -> BenchResult<Done> {
 }
 
 /// Counters of a served table and the process, read before and after a
-/// measured window; page fetches and hits are the page cache's and the
-/// scan cache's together, since an operation reads one or the other.
+/// measured window; page fetches and hits are the page cache's.
 #[derive(Clone, Copy, Debug, Default)]
 struct Counters {
     allocations: Allocations,
@@ -2748,8 +2751,8 @@ impl Counters {
             local_reads: stats.local_reads(),
             local_bytes: stats.local_bytes(),
             hedges: stats.hedges(),
-            fetches: served.cache.fetches() + served.scan_cache.fetches(),
-            hits: served.cache.hits() + served.scan_cache.hits(),
+            fetches: served.cache.fetches(),
+            hits: served.cache.hits(),
         }
     }
 
@@ -3030,7 +3033,7 @@ async fn measure_window(
 /// under Bloom every key page) before a warm run starts: a Get of each key
 /// of a key-value table, and of an ordered table Scans of each key's whole
 /// run, paged by order value as a caller pages a run longer than
-/// `max_scan_rows`, which fill the scan cache.
+/// `max_scan_rows`, which fill the page cache.
 async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
     for id in (0..shape.rows).step_by(approx::length(shape.prime_stride())) {
         let key = shape.key(id);
@@ -3423,7 +3426,7 @@ fn random_table(prepared: &[Prepared], name: TableName) -> BenchResult<&Prepared
 
 /// The `kv-beside-ordered` scenario in `tier`: the key-value scenarios of
 /// `Scenario::BESIDE_ORDERED` on the long table of random values, served
-/// beside the ordered table over one storage, page cache, scan cache, under
+/// beside the ordered table over one storage, page cache, row cache, under
 /// Disk one local directory, and one count of calls in flight, as
 /// `open_with` opens a process serving both kinds. The ordered table is
 /// loaded, primed, and idle, so a row against the same scenario on the long
@@ -4186,23 +4189,23 @@ enum ReferenceScenario {
     /// Scans of the keys sampled from each tier of rows per key, in both
     /// directions, whole and over a window of each run's middle half
     /// (`golden::reference_window`), at the table's `max_scan_rows`,
-    /// through a page cache and a scan cache emptied before each operation
+    /// through a page cache emptied before each operation
     /// (`PageCache::clear`, outside its timing), so every page comes from
     /// object storage, or under Disk the key and order pages from the
     /// local chunk files; in a multi-task run one task's operation may
     /// still find a page another task's fetched since, which
     /// `page_cache_hits_per_op` counts.
     ScanCold,
-    /// The same Scans through caches primed with every sampled key's whole
+    /// The same Scans through a page cache primed with every sampled key's whole
     /// run.
     ScanWarm,
     /// `MultiScan`s of 10 and of 100 keys (`REFERENCE_MULTI_KEYS`) at
     /// each key's newest row and a light key's most rows
     /// (`reference_multi_limits`), newest first,
     /// unbounded, their keys the first of each tier in turn
-    /// (`multi_scan_ids`), through the emptied caches.
+    /// (`multi_scan_ids`), through the emptied page cache.
     MultiScanCold,
-    /// The same `MultiScan`s through the primed caches.
+    /// The same `MultiScan`s through the primed page cache.
     MultiScanWarm,
     /// First loads, and under Disk each followed by a restart over the
     /// chunk files it left.
@@ -4221,7 +4224,7 @@ impl ReferenceScenario {
         }
     }
 
-    /// Whether its reads go through the emptied caches.
+    /// Whether its reads go through the emptied page cache.
     fn cold(self) -> bool {
         match self {
             Self::ScanCold | Self::MultiScanCold => true,
@@ -4410,9 +4413,9 @@ fn lookup_ids(keys: u64, lookup: &RefLookup) -> Vec<Vec<u64>> {
 
 /// The op of `lookup` over `table` of `keys` keys: a Scan of each sampled
 /// key of its tier in turn, or one `MultiScan` of its batch
-/// (`lookup_ids`); `cold` names the caches it empties before each
+/// (`lookup_ids`); `cold` names the page cache it empties before each
 /// operation.
-fn reference_op(table: GoldenTable, keys: u64, lookup: &RefLookup, cold: Option<ColdCaches>) -> Op {
+fn reference_op(table: GoldenTable, keys: u64, lookup: &RefLookup, cold: Option<PageCache>) -> Op {
     let requests = lookup_ids(keys, lookup)
         .iter()
         .map(|ids| reference_request(table, ids, lookup))
@@ -4463,20 +4466,19 @@ async fn serve_reference(
             rounds
         })
         .await?;
+    let config = reference_config(warehouse, table, tier);
     let Stack {
         handles,
         local,
         dir,
-    } = stack(&storage, tier, cache_bytes, reuse).await?;
+    } = stack(&storage, tier, cache_bytes, config.row_cache(), reuse).await?;
     let cache = handles.cache.clone();
-    let scan_cache = handles.scan_cache.clone();
-    let table = table_of(reference_config(warehouse, table, tier), handles).await?;
+    let table = table_of(config, handles).await?;
     Ok(Served {
         table: Arc::new(table),
         beside: None,
         storage,
         cache,
-        scan_cache,
         local,
         rounds: counted,
         gets: logged,
@@ -4859,11 +4861,8 @@ async fn reference_lookups_in(
         let served = served
             .as_ref()
             .expect("a table is served for every selected scenario");
-        let caches = lookup.scenario.cold().then(|| ColdCaches {
-            cache: served.cache.clone(),
-            scan_cache: served.scan_cache.clone(),
-        });
-        let op = reference_op(table, keys, &lookup, caches);
+        let cold_cache = lookup.scenario.cold().then(|| served.cache.clone());
+        let op = reference_op(table, keys, &lookup, cold_cache);
         verify_reference(&op, &served.table, table).await?;
         let rounds = count_rounds(served, &op).await?;
         let ids: Vec<u64> = lookup_ids(keys, &lookup).into_iter().flatten().collect();
@@ -4896,7 +4895,7 @@ fn reference_settings(cli: &Cli, warehouse: &str, tables: &[GoldenTable]) -> Jso
         "batch_fan_out": cli.batch_fan_out,
         "warm_cache_bytes": WARM_CACHE_BYTES,
         "cold_cache_bytes": COLD_CACHE_BYTES,
-        "cold": "the page cache and the scan cache emptied before each operation, outside its timing",
+        "cold": "the page cache emptied before each operation, outside its timing",
         "warm": "every key a warm scenario reads paged through whole before it is measured",
         "verified": "every request's answers compared whole with the derivation before it is measured",
         "reference_max_scan_rows": cli.reference_max_scan_rows,

@@ -210,11 +210,6 @@ pub struct TableHandles {
     /// One `scan` or `multi_scan` holds the same bound across every file
     /// and key it reads (RFD 025, Limits).
     pub batch_fan_out: usize,
-    /// The scan cache (`PageCache::for_scans`, RFD 025): every page an
-    /// ordered table's Scan reads, a Bloom-tier key page included, goes
-    /// through it, so a long run evicts only other scans' pages. A
-    /// key-value table never reads it.
-    pub scan_cache: PageCache,
     /// `server.max_multi_scan_values`: the values one `multi_scan` may ask
     /// for, its keys times its limit times one more than its columns.
     pub max_multi_scan_values: usize,
@@ -875,8 +870,8 @@ impl Drop for LookupMetrics {
 }
 
 /// What an ordered table's Scan needs beside its generation (RFD 025): the
-/// scan cache, through a handle whose fetches end at `scan_deadline`, and
-/// the scan metrics.
+/// page cache every table shares (RFD 027), through a handle whose fetches
+/// end at `scan_deadline`, and the scan metrics.
 struct Scans {
     cache: PageCache,
     metrics: ScanMetrics,
@@ -1195,9 +1190,10 @@ impl Table {
     /// calls in flight while it runs. The lookup metrics and
     /// `generation_swaps_total` are registered here, at zero, with the
     /// recorder current then: a process installs its recorder first. On an
-    /// ordered table every page fetch a Scan runs through
-    /// `handles.scan_cache` ends at `scan_deadline` from its start, and the
-    /// scan metrics are registered here too. The table shows its gauges
+    /// ordered table every page a Scan reads, a Bloom-tier key page
+    /// included, goes through the same `cache` (RFD 027), and every fetch
+    /// a Scan runs there ends at `scan_deadline` from its start; the scan
+    /// metrics are registered here too. The table shows its gauges
     /// from here on.
     pub fn new(
         config: TableConfig,
@@ -1241,7 +1237,6 @@ impl Table {
             calls,
             findings,
             batch_fan_out,
-            scan_cache,
             max_multi_scan_values,
             max_scan_bytes,
         } = handles;
@@ -1249,7 +1244,7 @@ impl Table {
         let span_hedge = Arc::new(HedgeWindow::new(storage.hedge_config()));
         let scans = config.order_column.as_deref().map(|order_column| {
             Arc::new(Scans {
-                cache: scan_cache.with_fetch_deadline(scan_deadline),
+                cache: cache.clone().with_fetch_deadline(scan_deadline),
                 metrics: ScanMetrics::new(&config.name, order_column),
             })
         });
@@ -1659,7 +1654,7 @@ impl Table {
     /// entry, `Error::WrongTableKind` on a key-value table among them,
     /// whether or not it has loaded; `Error::NotReady` with no generation;
     /// and the faults `select_scan` names against the generation. Every
-    /// file holding the key is read in one round (`Generation::scan`) through the scan cache,
+    /// file holding the key is read in one round (`Generation::scan`) through the page cache,
     /// each fetch ending at `scan_deadline`, its span GETs hedged in the
     /// table's span window, and every GET holding one of
     /// `TableHandles::batch_fan_out` permits while it runs. Counted under
@@ -2950,27 +2945,21 @@ mod tests {
         table_sharing(fixture, config, handles, load_deadline, refresh_deadline)
     }
 
-    /// Handles over `fixture`'s storage, a fresh cache, no local directory,
-    /// and a count of calls in flight of their own.
+    /// Handles over `fixture`'s storage, a fresh page cache, no row cache,
+    /// so a lookup reads every value from its page, no local directory, and
+    /// a count of calls in flight of their own.
     async fn handles_over(fixture: &Fixture) -> TableHandles {
         TableHandles {
             storage: Arc::clone(&fixture.storage),
             cache: cache().await,
-            row_cache: Some(RowCache::new(approx::count(testing::CACHE_BYTES))),
+            row_cache: None,
             local: None,
             calls: CallsInFlight::new(),
             findings: FindingLog::Events,
             batch_fan_out: DEFAULT_BATCH_FAN_OUT,
-            scan_cache: scan_cache(),
             max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
             max_scan_bytes: ServerConfig::default().max_scan_bytes,
         }
-    }
-
-    /// A scan cache of `testing::CACHE_BYTES`, roomy enough that a test
-    /// sees no eviction it did not ask for.
-    fn scan_cache() -> PageCache {
-        PageCache::for_scans(testing::CACHE_BYTES)
     }
 
     /// A table following `fixture`'s main branch under `config`, built over
@@ -8370,14 +8359,14 @@ mod tests {
 
     /// A Scan counts in `scans_total` by result, `scan_rows` and
     /// `scan_files`, and `scan_seconds` by temperature: cold while a page
-    /// came from object storage, warm once the scan cache holds them. Its
+    /// came from object storage, warm once the page cache holds them. Its
     /// GETs count in `value_page_gets_total` under each column's name and
-    /// the order column's; the lookup cache sees none of its pages (RFD
-    /// 025, Metrics).
+    /// the order column's, and its spans are fetched once through the one
+    /// page cache (RFD 025, Metrics; RFD 027).
     #[test]
     fn test_scan_counts_result_rows_files_temperature_and_gets_per_column() {
         let rows = ordered_rows(&[KEY_STEP], SCAN_ROWS_PER_KEY);
-        let ((lookup_pages, scan_fetches), series) = recorded(async {
+        let (fetches, series) = recorded(async {
             let (table, _fixture, _gauged) =
                 ordered_table_of(&rows, WriterLayout::contract(), DEFAULT_BATCH_FAN_OUT).await;
             let key = Key::Long(KEY_STEP);
@@ -8393,16 +8382,10 @@ mod tests {
                 .await
                 .unwrap();
             assert!(absent.scanned.rows.is_empty() && absent.scanned.next.is_none());
-            let lookup = &table.lookups.cache;
-            let scan_cache = &table.scans.as_ref().unwrap().cache;
-            (lookup.fetches() + lookup.hits(), scan_cache.fetches())
+            table.scans.as_ref().unwrap().cache.fetches()
         });
         assert_eq!(
-            lookup_pages, 0,
-            "no Scan page goes through the lookup cache"
-        );
-        assert_eq!(
-            scan_fetches,
+            fetches,
             approx::count(BOTH_READS.len() + 1),
             "one span fetch per column and one for the order column, once"
         );

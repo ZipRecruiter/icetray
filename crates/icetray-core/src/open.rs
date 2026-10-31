@@ -23,7 +23,6 @@ use crate::config::{Config, ConfigError, TableConfig};
 use crate::error::{Error, Result};
 use crate::local::{ChunkRules, DataFileIdentity, LocalDir};
 use crate::memory;
-use crate::metric::CacheName;
 use crate::row_cache::RowCache;
 use crate::storage::Storage;
 use crate::table::{self, CallsInFlight, FindingLog, Table, TableHandles};
@@ -41,9 +40,6 @@ pub struct Opened {
     /// What the row cache and the page cache's memory level were opened
     /// with (RFD 028).
     pub budget: Budget,
-    /// The scan cache every ordered table shares (RFD 025), memory alone;
-    /// no key-value table reads it.
-    pub scan_cache: PageCache,
     /// The local directory (RFD 017), when `storage.local` is set.
     pub local: Option<Arc<LocalDir>>,
     /// The tables served, each in `Loading` until the caller loads it.
@@ -433,12 +429,10 @@ pub async fn open(config: &Config, only: Option<&str>, findings: FindingLog) -> 
 /// chain, and registers its own stores on it. The binary's subcommands
 /// use `open`; the daemon's in-process tests start it over this. Before
 /// anything is opened, the cache budget is resolved under the process's
-/// memory limit (`budget::resolve`) and logged, and its page part and
-/// `scan_page_cache_bytes` are checked against the minimum of the shards
-/// a cache has on the calling runtime, which parsing could not know: less
-/// is `Error::Config` with `ConfigViolation::PageCacheTooSmall`.
-/// The scan cache is memory alone, whether or not the lookup cache has a
-/// disk level (RFD 025).
+/// memory limit (`budget::resolve`) and logged, and its page part is
+/// checked against the minimum of the shards a cache has on the calling
+/// runtime, which parsing could not know: less is `Error::Config` with
+/// `ConfigViolation::PageCacheTooSmall`.
 pub async fn open_with(
     config: &Config,
     only: Option<&str>,
@@ -447,16 +441,8 @@ pub async fn open_with(
 ) -> Result<Opened> {
     let limit = memory::limit();
     let shards = cache::memory_shards();
-    let invalid = |violation| Error::Config(ConfigError::Invalid(violation));
-    let budget =
-        budget::resolve(&config.server, limit, config.reads_rows(), shards).map_err(invalid)?;
-    cache::check_capacity(
-        CacheName::Scan,
-        config.server.scan_page_cache_bytes,
-        shards,
-        None,
-    )
-    .map_err(invalid)?;
+    let budget = budget::resolve(&config.server, limit, config.reads_rows(), shards)
+        .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
     tracing::info!(
         cache_bytes = budget.row_bytes + budget.page_bytes,
         row_bytes = budget.row_bytes,
@@ -475,9 +461,6 @@ pub async fn open_with(
     )
     .await?;
     let row_cache = RowCache::new(budget.row_bytes);
-    let scan_cache = PageCache::for_scans(
-        usize::try_from(config.server.scan_page_cache_bytes).unwrap_or(usize::MAX),
-    );
     let handles = TableHandles {
         storage: Arc::clone(&storage),
         cache: cache.clone(),
@@ -486,7 +469,6 @@ pub async fn open_with(
         calls: CallsInFlight::new(),
         findings,
         batch_fan_out: config.server.batch_fan_out,
-        scan_cache: scan_cache.clone(),
         max_multi_scan_values: config.server.max_multi_scan_values,
         max_scan_bytes: config.server.max_scan_bytes,
     };
@@ -512,7 +494,6 @@ pub async fn open_with(
         cache,
         row_cache,
         budget,
-        scan_cache,
         local,
         tables: ArcSwap::from_pointee(Tables::new(tables)),
         pending: Mutex::new(Vec::new()),
@@ -554,19 +535,21 @@ mod tests {
     use super::*;
     use crate::check::FindingCode;
     use crate::config::{
-        ConfigError, ConfigViolation, LocalConfig, Residency, ServerConfig, SourceConfig,
-        StorageConfig, TableConfig,
+        ConfigError, ConfigViolation, DEFAULT_MAX_SCAN_ROWS, LocalConfig, Residency, ServerConfig,
+        SourceConfig, StorageConfig, TableConfig,
     };
     use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
     use crate::error::{Budget, ErrorKind, RefusalReason};
     use crate::generation::testing::{
-        E2E_KEYS, FIRST_SNAPSHOT, KEY_STEP, POLL_GETS, SECOND_SEQUENCE, SECOND_SNAPSHOT,
-        SECOND_VERSION, TABLE, TWO, Table as Fixture, bucketing, keys_from, keys_in_bucket,
-        refusal_of, two_bucket_table,
+        E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION, KEY_STEP, POLL_GETS,
+        SECOND_SEQUENCE, SECOND_SNAPSHOT, SECOND_VERSION, TABLE, TWO, Table as Fixture,
+        WriterLayout, bucketing, keys_from, keys_in_bucket, refusal_of, two_bucket_table,
     };
+    use crate::key::Key;
     use crate::level::Level;
-    use crate::manifest::testing::whole;
-    use crate::metric::CacheName;
+    use crate::manifest::ColumnRead;
+    use crate::manifest::testing::{Partition, VALUE_COLUMN, whole};
+    use crate::order::{Direction, ScanBounds};
     use crate::snapshot::SnapshotId;
     use crate::storage::FILE_PREFIX;
     use crate::storage::testing::STALL;
@@ -656,8 +639,7 @@ mod tests {
 
     /// A budget `Config::parse` admits, one shard's minimum, is refused
     /// on a runtime of two workers, whose cache has two shards, before any
-    /// table is opened; the scan cache's budget is held to it as the page
-    /// cache's part of `cache_bytes` is (RFD 025).
+    /// table is opened.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_open_with_refuses_a_page_cache_below_the_runtime_shards_minimum() {
         let workers = 2;
@@ -666,40 +648,128 @@ mod tests {
         let two_shards = cache::min_memory_bytes(workers);
         let mut config = config(vec![named(FIRST_TABLE, &fixture, Residency::Full)]);
         config.server.row_cache_share = Some(0.0);
-        for refused in [CacheName::Lookup, CacheName::Scan] {
-            let (lookup, scan) = match refused {
-                CacheName::Lookup => (one_shard, two_shards),
-                CacheName::Scan => (two_shards, one_shard),
-            };
-            config.server.cache_bytes = Some(lookup);
-            config.server.scan_page_cache_bytes = scan;
-            let error = open_with(&config, None, storage_for(&config), FindingLog::Events)
-                .await
-                .err()
-                .expect("a budget below two shards' minimum");
-            assert!(
-                matches!(
-                    error,
-                    Error::Config(ConfigError::Invalid(ConfigViolation::PageCacheTooSmall {
-                        cache,
-                        bytes,
-                        minimum,
-                        shards,
-                        limit: None,
-                    })) if cache == refused
-                        && bytes == one_shard
-                        && minimum == two_shards
-                        && shards == workers
-                ),
-                "{error}"
-            );
-        }
+        config.server.cache_bytes = Some(one_shard);
+        let error = open_with(&config, None, storage_for(&config), FindingLog::Events)
+            .await
+            .err()
+            .expect("a budget below two shards' minimum");
+        assert!(
+            matches!(
+                error,
+                Error::Config(ConfigError::Invalid(ConfigViolation::PageCacheTooSmall {
+                    bytes,
+                    minimum,
+                    shards,
+                    limit: None,
+                })) if bytes == one_shard && minimum == two_shards && shards == workers
+            ),
+            "{error}"
+        );
         config.server.cache_bytes = Some(two_shards);
-        config.server.scan_page_cache_bytes = two_shards;
         let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();
         assert_eq!(names(&opened), [FIRST_TABLE]);
+    }
+
+    /// Rows of `KEY_STEP` in the ordered fixture's one file.
+    const ORDERED_ROWS: usize = 6;
+
+    /// An ordered table of one file holding `ORDERED_ROWS` rows of
+    /// `KEY_STEP`, ascending by order value, committed as `FIRST_SNAPSHOT`.
+    async fn ordered_fixture() -> Fixture {
+        let mut fixture = Fixture::ordered(1);
+        let rows: Vec<(i64, i64)> = (0..i64::try_from(ORDERED_ROWS).unwrap())
+            .map(|order| (KEY_STEP, order))
+            .collect();
+        fixture
+            .add_ordered_file("f1", &rows, Partition::Bucket(0), WriterLayout::contract())
+            .await;
+        fixture
+            .commit(FIRST_SNAPSHOT, None, FIRST_SEQUENCE, FIRST_VERSION)
+            .await;
+        fixture
+    }
+
+    /// The rows a Scan of `KEY_STEP` naming the value column answers, every
+    /// row oldest first.
+    async fn scan_every_row(table: &Table) -> usize {
+        let bounds = ScanBounds {
+            direction: Direction::OldestFirst,
+            limit: DEFAULT_MAX_SCAN_ROWS,
+            start: None,
+            before: None,
+        };
+        table
+            .scan(
+                &Key::Long(KEY_STEP),
+                &[ColumnRead::whole(VALUE_COLUMN)],
+                &bounds,
+            )
+            .await
+            .unwrap()
+            .scanned
+            .rows
+            .len()
+    }
+
+    /// The first table `opened` serves, loaded.
+    async fn loaded_first(opened: &Opened) -> Arc<Table> {
+        let table = table_named(opened, FIRST_TABLE).unwrap();
+        table.load().await.unwrap();
+        table
+    }
+
+    /// An ordered table's Scans read through the one page cache every
+    /// table shares (RFD 027): the first Scan's spans are fetches of
+    /// `Opened.cache`, and the second's are its hits, with no GET.
+    #[tokio::test]
+    async fn test_a_scan_reads_through_the_one_page_cache() {
+        let fixture = ordered_fixture().await;
+        let config = config(vec![lenient(FIRST_TABLE, &fixture)]);
+        let storage = storage_for(&config);
+        let opened = open_with(&config, None, Arc::clone(&storage), FindingLog::Events)
+            .await
+            .unwrap();
+        let table = loaded_first(&opened).await;
+        assert_eq!(scan_every_row(&table).await, ORDERED_ROWS);
+        let fetched = opened.cache.fetches();
+        assert!(fetched > 0, "the cold Scan's spans are fetched through it");
+        let (gets, hits) = (storage.stats().gets(), opened.cache.hits());
+        assert_eq!(scan_every_row(&table).await, ORDERED_ROWS);
+        assert_eq!(opened.cache.fetches(), fetched, "nothing fetched again");
+        assert_eq!(storage.stats().gets(), gets, "no GET");
+        assert!(
+            opened.cache.hits() > hits,
+            "the warm Scan's pages are hits of the one page cache"
+        );
+    }
+
+    /// With a disk level, a Scan whose pages memory let go of reads them
+    /// from it (RFD 027, A span read): the repeated Scan issues no GET and
+    /// reads its pages locally.
+    #[tokio::test]
+    async fn test_a_repeated_scan_is_served_from_the_disk_level() {
+        let fixture = ordered_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_local(dir.path(), vec![lenient(FIRST_TABLE, &fixture)]);
+        config.storage.local.as_mut().unwrap().page_cache_disk_bytes = PAGE_CACHE_DISK_BLOCK_BYTES;
+        let storage = storage_for(&config);
+        let opened = open_with(&config, None, Arc::clone(&storage), FindingLog::Events)
+            .await
+            .unwrap();
+        let table = loaded_first(&opened).await;
+        assert_eq!(scan_every_row(&table).await, ORDERED_ROWS);
+        opened.cache.clear();
+        opened.cache.disk_writes_done().await;
+        let stats = storage.stats();
+        let (gets, reads) = (stats.gets(), stats.local_reads());
+        assert_eq!(scan_every_row(&table).await, ORDERED_ROWS);
+        assert_eq!(stats.gets(), gets, "no GET");
+        assert!(
+            stats.local_reads() > reads,
+            "the pages come back from the disk level"
+        );
     }
 
     /// The budget follows the tables: a key-value table gives the row

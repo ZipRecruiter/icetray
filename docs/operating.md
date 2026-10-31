@@ -101,8 +101,8 @@ Counters and histograms:
 | `icetray_local_reads_total` | | yes | Reads from the local directory. |
 | `icetray_local_bytes_total` | | yes | Bytes of those reads. |
 | `icetray_hedges_total` | | yes | Second GETs issued because a lookup GET or a `Scan`'s span GET was slow. |
-| `icetray_page_cache_hits_total` | `cache` | every cache | Pages served from the page cache without a fetch. |
-| `icetray_page_cache_fetches_total` | `cache` | every cache | Page fetches the page cache ran, after coalescing. The scan cache counts a span GET once, however many pages it holds. |
+| `icetray_page_cache_hits_total` | | yes | Pages served from the page cache without a fetch, from memory or the disk level, for lookups and Scans alike. |
+| `icetray_page_cache_fetches_total` | | yes | Page fetches the page cache ran, after coalescing. A `Scan`'s span GET counts once, however many pages it holds. |
 | `icetray_row_cache_hits_total` | | yes | Value reads the row cache served without reading a page, a cached null included (RFD 026). |
 | `icetray_row_cache_misses_total` | | yes | Value reads the row cache did not hold, each then read from the page cache. |
 | `icetray_lookups_total` | `table`, `result` | every table and result | Lookups that completed. |
@@ -163,7 +163,7 @@ Gauges, written at each scrape:
 | `icetray_generation_swapped_at_seconds` | `table` | When the serving generation was swapped in, in Unix seconds. |
 | `icetray_findings` | `table`, `code`, and `column` for a code about one value column | The number of findings of each code that icetray raised on the serving generation, 0 for a code not raised. A code about one value column has one series per configured column. |
 | `icetray_index_bytes` | `table` | The resident index's live bytes. |
-| `icetray_page_cache_bytes` | `cache` | Bytes a page cache's memory level holds after evictions: the lookup cache against its part of `server.cache_bytes`, the scan cache against `server.scan_page_cache_bytes`. |
+| `icetray_page_cache_bytes` | | Bytes the page cache's memory level holds after evictions, against its part of `server.cache_bytes`. |
 | `icetray_row_cache_bytes` | | Bytes the row cache holds after evictions: each entry's value at its allocation size plus the per-entry overhead. It stays about a sixteenth below the row cache's part of the budget, which is reserved for the keys of rows evicted recently, so a row read again soon after its eviction is kept longer. |
 | `icetray_config_pending` | | 1 while the configuration file differs from the configuration applied, else 0. |
 | `icetray_process_rss_bytes` | | The process's resident set size. |
@@ -580,13 +580,16 @@ An [ordered table](table-layout.md#ordered-tables) serves `Scan` and
 `MultiScan` beside the key-value tables of the same process. It shares
 `server.max_in_flight`, `server.batch_fan_out`, the process's GET
 throughput, and its resident memory with them, and reads its pages
-through [the scan cache](performance.md#the-scan-cache), a cache of its
-own.
+through [the page cache](performance.md#the-page-cache-and-scans) every
+table shares.
 
-**The scan cache.** `icetray_page_cache_hits_total{cache="scan"}` against
-`icetray_page_cache_fetches_total{cache="scan"}` gives its hit rate, and
-`icetray_page_cache_bytes{cache="scan"}` its fill against
-`server.scan_page_cache_bytes`.
+**The page cache.** A `Scan` takes each page from the page cache's
+memory, then from its disk level when the local directory has one, and
+fetches only the runs of pages neither holds. Its hits and fetches count
+in `icetray_page_cache_hits_total` and `icetray_page_cache_fetches_total`
+beside every lookup's, and a page read from the disk level counts in
+`icetray_local_reads_total`. A long `Scan` can push another table's pages
+off the disk level, though not its rows out of the row cache.
 
 **Levels.** A table whose writer appends between compactions is
 `permissive` under `overlapping_files`, so its owner configures
@@ -667,8 +670,7 @@ through settings, mounted files, and environment variables.
   for each table's residency (`predicted.full`, `predicted.disk_memory`,
   or `predicted.bloom`), doubled for a table a refresh can rewrite
   wholesale or a reload can change; plus `server.cache_bytes`, half the
-  limit when unset, and `server.scan_page_cache_bytes` on a replica that
-  serves an ordered table; plus a
+  limit when unset; plus a
   third of that total for the process, requests in flight, a load's
   transient chunks, and the allocator's fragmentation and bookkeeping. The
   `icetray_allocator_*` gauges show how much of the resident set the

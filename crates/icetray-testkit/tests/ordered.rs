@@ -1109,7 +1109,7 @@ const ORDER_SPAN: u64 = 1;
 const KEY_PAGES_OF_A_MIDDLE_RUN: u64 = 1;
 
 /// The GETs a cold Scan of a middle key reading `columns` value columns
-/// costs in one compacted file, each a page the scan cache fetches: one per
+/// costs in one compacted file, each a page the page cache fetches: one per
 /// column and one for the order column, after the key page's under
 /// `bloom`; under `disk` the key page and the order column are read from
 /// the chunk file instead.
@@ -1293,70 +1293,32 @@ async fn test_get_on_an_ordered_table_is_wrong_table_kind() -> Result<()> {
 }
 
 /// An ordered table's pages, a Bloom-tier key page included, go through
-/// the scan cache and never the lookup cache, and a key-value table's
-/// lookups never touch the scan cache (RFD 025, Caching and hedging).
+/// the one page cache every table shares (RFD 027): a cold Scan fetches
+/// each through it, and the same Scan again finds each there, a hit, with
+/// no fetch and no GET.
 #[tokio::test]
-async fn test_scan_pages_stay_out_of_the_key_value_cache() -> Result<()> {
+async fn test_scan_pages_go_through_the_one_page_cache() -> Result<()> {
     let (_dir, _catalog, fixture) = compacted_table("caches").await?;
     let key = fixture.key(middle_id(&fixture, TWO_BUCKETS));
     let columns = count(BOTH.len());
     let tiers = serve_in_every_tier(|residency| fixture.config(residency, false)).await?;
+    let bounds = TestScan::default().bounds(OrderKind::Long);
     for (residency, served) in tiers.all() {
-        served
-            .table
-            .scan(
-                &key,
-                &reads(&BOTH),
-                &TestScan::default().bounds(OrderKind::Long),
-            )
-            .await?;
+        let pages = cold_scan_gets(*residency, columns);
+        served.table.scan(&key, &reads(&BOTH), &bounds).await?;
         assert_eq!(
-            served.cache.fetches() + served.cache.hits(),
-            0,
-            "{residency}: the lookup cache saw no page"
+            (served.cache.fetches(), served.cache.hits()),
+            (pages, 0),
+            "{residency}: every page the cold Scan fetched went through the page cache"
         );
+        let gets = served.storage.stats().gets();
+        served.table.scan(&key, &reads(&BOTH), &bounds).await?;
         assert_eq!(
-            served.scan_cache.fetches(),
-            cold_scan_gets(*residency, columns),
-            "{residency}: every fetched page went through the scan cache"
+            (served.cache.fetches(), served.cache.hits()),
+            (pages, pages),
+            "{residency}: the warm Scan found every page there"
         );
-    }
-    let (_kv_dir, kv_catalog) = local_catalog().await?;
-    let kv = write_fixture(
-        kv_catalog.as_ref(),
-        icetray_testkit::fixture::NAMESPACE,
-        FixtureSpec {
-            ids: COMPACTED_IDS,
-            buckets: TWO_BUCKETS,
-            ..FixtureSpec::small("plain_caches", KeyType::Long)
-        },
-    )
-    .await?;
-    let kv_tiers = serve_in_every_tier(|residency| kv.config(residency, false)).await?;
-    for (residency, served) in kv_tiers.all() {
-        let kv_key = kv.key(COMPACTED_IDS.start);
-        assert_eq!(
-            served
-                .table
-                .get(&kv_key, &reads(&[VALUE_COLUMN]))
-                .await?
-                .row,
-            kv.expected(&kv_key)
-        );
-        let key_pages = match residency {
-            Residency::Full | Residency::Disk => 0,
-            Residency::Bloom => KEY_PAGES_OF_A_MIDDLE_RUN,
-        };
-        assert_eq!(
-            served.cache.fetches(),
-            key_pages + 1,
-            "{residency}: the value page, and under bloom the key page"
-        );
-        assert_eq!(
-            served.scan_cache.fetches() + served.scan_cache.hits(),
-            0,
-            "{residency}: the scan cache saw no page"
-        );
+        assert_eq!(served.storage.stats().gets(), gets, "{residency}: no GET");
     }
     Ok(())
 }
