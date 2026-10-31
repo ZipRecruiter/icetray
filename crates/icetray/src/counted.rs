@@ -248,6 +248,7 @@ mod tests {
     use bytes::Bytes;
     use futures::FutureExt as _;
     use http_body_util::BodyExt as _;
+    use hyper::header::HeaderValue;
     use icetray_core::metric;
     use icetray_testkit::verify::{series_sum, series_value};
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -256,27 +257,52 @@ mod tests {
     use super::*;
     use crate::telemetry::CodeLabel;
 
-    /// A body that yields `frames` in order and then ends.
+    /// A body that yields `frames` in order and then ends, or, when
+    /// `fails`, fails as a body read from a closed connection does.
     #[derive(Debug, Default)]
-    struct Frames(VecDeque<Frame<Bytes>>);
+    struct Frames {
+        frames: VecDeque<Frame<Bytes>>,
+        fails: bool,
+    }
+
+    impl Frames {
+        /// A body that yields `frames` and then ends.
+        fn of(frames: impl IntoIterator<Item = Frame<Bytes>>) -> Self {
+            Self {
+                frames: frames.into_iter().collect(),
+                fails: false,
+            }
+        }
+    }
 
     impl Body for Frames {
         type Data = Bytes;
-        type Error = Infallible;
+        type Error = tonic::Status;
 
         fn poll_frame(
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-            Poll::Ready(self.0.pop_front().map(Ok))
+        ) -> Poll<Option<Result<Frame<Bytes>, tonic::Status>>> {
+            match self.frames.pop_front() {
+                Some(frame) => Poll::Ready(Some(Ok(frame))),
+                None if self.fails => {
+                    self.fails = false;
+                    Poll::Ready(Some(Err(tonic::Status::unknown(
+                        "h2 protocol error: error reading a body from connection",
+                    ))))
+                }
+                None => Poll::Ready(None),
+            }
         }
     }
 
-    /// A service that answers every request with a response `answer` builds.
+    /// A service that reads each request's body until it ends or fails, as
+    /// tonic decodes a request, and answers with a response `answer`
+    /// builds.
     #[derive(Clone)]
     struct Answers(fn() -> hyper::Response<Frames>);
 
-    impl<B> tower::Service<hyper::Request<B>> for Answers {
+    impl<B: Body + Unpin> tower::Service<hyper::Request<B>> for Answers {
         type Response = hyper::Response<Frames>;
         type Error = Infallible;
         type Future = Ready<Result<Self::Response, Infallible>>;
@@ -285,58 +311,58 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _request: hyper::Request<B>) -> Self::Future {
+        fn call(&mut self, request: hyper::Request<B>) -> Self::Future {
+            let mut body = request.into_body();
+            while let Some(Ok(_)) = body.frame().now_or_never().flatten() {}
             ready(Ok((self.0)()))
         }
     }
 
     /// Headers carrying `code` as a gRPC status.
-    fn status(code: &'static str) -> HeaderMap {
+    fn status(code: Code) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(GRPC_STATUS, hyper::header::HeaderValue::from_static(code));
+        headers.insert(GRPC_STATUS, HeaderValue::from(i32::from(code)));
         headers
     }
 
     /// A trailers-only answer: the status in the headers, no body.
     fn trailers_only() -> hyper::Response<Frames> {
         let mut response = hyper::Response::new(Frames::default());
-        *response.headers_mut() = status("13");
+        *response.headers_mut() = status(Code::Internal);
         response
     }
 
     /// An answer with a message and then trailers carrying `OK`.
     fn with_trailers() -> hyper::Response<Frames> {
-        hyper::Response::new(Frames(VecDeque::from([
+        hyper::Response::new(Frames::of([
             Frame::data(Bytes::from_static(b"message")),
-            Frame::trailers(status("0")),
-        ])))
+            Frame::trailers(status(Code::Ok)),
+        ]))
     }
 
     /// An answer whose body ends with no trailers.
     fn without_trailers() -> hyper::Response<Frames> {
-        hyper::Response::new(Frames(VecDeque::from([Frame::data(Bytes::from_static(
-            b"message",
-        ))])))
+        hyper::Response::new(Frames::of([Frame::data(Bytes::from_static(b"message"))]))
     }
 
-    /// `answer` behind `Counted`, over handles registered with a recorder
+    /// `service` behind `Counted`, over handles registered with a recorder
     /// of the test's own, so no other test's counts reach it.
-    fn counted(answer: fn() -> hyper::Response<Frames>) -> (Counted<Answers>, PrometheusHandle) {
+    fn counted<S>(service: S) -> (Counted<S>, PrometheusHandle) {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let requests = metrics::with_local_recorder(&recorder, Requests::register);
-        (Counted::new(Answers(answer), requests), handle)
+        (Counted::new(service, requests), handle)
     }
 
-    /// A request of `call`.
-    fn request(call: Call) -> hyper::Request<()> {
+    /// A request of `call` whose body is `body`.
+    fn request(call: Call, body: Frames) -> hyper::Request<Frames> {
         hyper::Request::builder()
             .uri(format!(
                 "/{}/{}",
                 icetray_proto::v1::icetray_server::SERVICE_NAME,
                 call.method()
             ))
-            .body(())
+            .body(body)
             .unwrap()
     }
 
@@ -362,8 +388,11 @@ mod tests {
     /// its body is read.
     #[test]
     fn test_call_counts_a_trailers_only_answer_at_its_headers() {
-        let (mut service, handle) = counted(trailers_only);
-        let response = service.call(request(Call::Get)).now_or_never().unwrap();
+        let (mut service, handle) = counted(Answers(trailers_only));
+        let response = service
+            .call(request(Call::Get, Frames::default()))
+            .now_or_never()
+            .unwrap();
         assert_eq!(
             count(&handle, Call::Get, Code::Internal).to_bits(),
             1.0_f64.to_bits()
@@ -375,9 +404,9 @@ mod tests {
     /// A status in the trailers is counted as the body yields them, once.
     #[test]
     fn test_call_counts_an_answer_at_its_trailers() {
-        let (mut service, handle) = counted(with_trailers);
+        let (mut service, handle) = counted(Answers(with_trailers));
         let mut body = service
-            .call(request(Call::MultiGet))
+            .call(request(Call::MultiGet, Frames::default()))
             .now_or_never()
             .unwrap()
             .unwrap()
@@ -402,22 +431,25 @@ mod tests {
     /// before its trailers; a body that ends without trailers is `UNKNOWN`.
     #[test]
     fn test_call_counts_a_request_that_ends_without_a_status() {
-        let (mut service, handle) = counted(with_trailers);
-        drop(service.call(request(Call::Get)));
+        let (mut service, handle) = counted(Answers(with_trailers));
+        drop(service.call(request(Call::Get, Frames::default())));
         assert_eq!(
             count(&handle, Call::Get, Code::Cancelled).to_bits(),
             1.0_f64.to_bits()
         );
-        let response = service.call(request(Call::Get)).now_or_never().unwrap();
+        let response = service
+            .call(request(Call::Get, Frames::default()))
+            .now_or_never()
+            .unwrap();
         drop(response);
         assert_eq!(
             count(&handle, Call::Get, Code::Cancelled).to_bits(),
             2.0_f64.to_bits()
         );
 
-        let (mut service, handle) = counted(without_trailers);
+        let (mut service, handle) = counted(Answers(without_trailers));
         let mut body = service
-            .call(request(Call::TableInfo))
+            .call(request(Call::TableInfo, Frames::default()))
             .now_or_never()
             .unwrap()
             .unwrap()
@@ -431,91 +463,21 @@ mod tests {
         assert_eq!(counted_total(&handle).to_bits(), 1.0_f64.to_bits());
     }
 
-    /// A request body that yields `frames` in order, then fails as a body
-    /// read from a closed connection does, unless `fails` is false.
-    #[derive(Debug)]
-    struct Request {
-        frames: VecDeque<Frame<Bytes>>,
-        fails: bool,
-    }
-
-    impl Body for Request {
-        type Data = Bytes;
-        type Error = tonic::Status;
-
-        fn poll_frame(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Bytes>, tonic::Status>>> {
-            match self.frames.pop_front() {
-                Some(frame) => Poll::Ready(Some(Ok(frame))),
-                None if self.fails => {
-                    self.fails = false;
-                    Poll::Ready(Some(Err(tonic::Status::unknown(
-                        "h2 protocol error: error reading a body from connection",
-                    ))))
-                }
-                None => Poll::Ready(None),
-            }
-        }
-    }
-
-    /// A service that reads each request's body to its end, as tonic
-    /// decodes a request, and answers trailers-only: `UNKNOWN` whether or
-    /// not the read failed, since tonic answers a failed read with the
-    /// code it gives the transport's error, `UNKNOWN` for a closed
-    /// connection.
-    #[derive(Clone)]
-    struct Reads;
-
-    impl tower::Service<hyper::Request<RequestBody<Request>>> for Reads {
-        type Response = hyper::Response<Frames>;
-        type Error = Infallible;
-        type Future = Ready<Result<Self::Response, Infallible>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, request: hyper::Request<RequestBody<Request>>) -> Self::Future {
-            let mut body = request.into_body();
-            while let Some(Ok(_)) = body.frame().now_or_never().flatten() {}
-            let mut response = hyper::Response::new(Frames::default());
-            *response.headers_mut() = status("2");
-            ready(Ok(response))
-        }
-    }
-
-    /// A request of `call` whose body yields one message, then fails when
-    /// `fails`.
-    fn reading(call: Call, fails: bool) -> hyper::Request<Request> {
-        hyper::Request::builder()
-            .uri(format!(
-                "/{}/{}",
-                icetray_proto::v1::icetray_server::SERVICE_NAME,
-                call.method()
-            ))
-            .body(Request {
-                frames: VecDeque::from([Frame::data(Bytes::from_static(b"keys"))]),
-                fails,
-            })
-            .unwrap()
-    }
-
     /// A request whose body fails to read from its connection is counted
     /// as `CANCELLED`, whatever the service answers, since its client went
     /// away before it finished sending; a request read whole is counted
     /// under the code it is answered.
     #[test]
     fn test_call_counts_a_request_whose_body_fails_as_cancelled() {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let requests = metrics::with_local_recorder(&recorder, Requests::register);
-        let mut service = Counted::new(Reads, requests);
+        let (mut service, handle) = counted(Answers(trailers_only));
+        let reading = |fails| Frames {
+            fails,
+            ..Frames::of([Frame::data(Bytes::from_static(b"keys"))])
+        };
 
         drop(
             service
-                .call(reading(Call::MultiGet, true))
+                .call(request(Call::MultiGet, reading(true)))
                 .now_or_never()
                 .unwrap(),
         );
@@ -524,18 +486,18 @@ mod tests {
             1.0_f64.to_bits()
         );
         assert_eq!(
-            count(&handle, Call::MultiGet, Code::Unknown).to_bits(),
+            count(&handle, Call::MultiGet, Code::Internal).to_bits(),
             0.0_f64.to_bits()
         );
 
         drop(
             service
-                .call(reading(Call::MultiGet, false))
+                .call(request(Call::MultiGet, reading(false)))
                 .now_or_never()
                 .unwrap(),
         );
         assert_eq!(
-            count(&handle, Call::MultiGet, Code::Unknown).to_bits(),
+            count(&handle, Call::MultiGet, Code::Internal).to_bits(),
             1.0_f64.to_bits()
         );
         assert_eq!(counted_total(&handle).to_bits(), 2.0_f64.to_bits());
@@ -544,10 +506,10 @@ mod tests {
     /// A request for a path that is no call is answered and not counted.
     #[test]
     fn test_call_counts_no_request_outside_the_contract_s_calls() {
-        let (mut service, handle) = counted(trailers_only);
+        let (mut service, handle) = counted(Answers(trailers_only));
         let other = hyper::Request::builder()
             .uri("/grpc.health.v1.Health/Check")
-            .body(())
+            .body(Frames::default())
             .unwrap();
         let response = service.call(other).now_or_never().unwrap();
         drop(response);

@@ -1388,7 +1388,7 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
             ordered_spec(FRESH_ORDERED_TABLE),
         ],
         async |setup| {
-            setup.options.reload = Some(Versions::new(setup.config.clone()).reload());
+            setup.options.reload = Some(Versions::new(setup.config.clone(), false).reload());
             Ok(())
         },
     )
@@ -1495,7 +1495,7 @@ async fn test_scrape_keeps_every_gauge_the_scrape_before_exposed() -> TestResult
         ],
         async |setup| {
             setup.with_local_dir()?;
-            setup.options.reload = Some(Versions::new(setup.config.clone()).reload());
+            setup.options.reload = Some(Versions::new(setup.config.clone(), false).reload());
             Ok(())
         },
     )
@@ -2757,21 +2757,13 @@ struct Versions {
 }
 
 impl Versions {
-    /// Version 0, `config`, each version read as it was set.
-    fn new(config: Config) -> Arc<Self> {
+    /// Version 0, `config`, each version validated as it is read when
+    /// `validated`, else read as it was set.
+    fn new(config: Config, validated: bool) -> Arc<Self> {
         Arc::new(Self {
             current: std::sync::Mutex::new((0, config)),
             reads: std::sync::atomic::AtomicU64::new(0),
-            validated: false,
-        })
-    }
-
-    /// Version 0, `config`, each version validated as it is read.
-    fn validated(config: Config) -> Arc<Self> {
-        Arc::new(Self {
-            current: std::sync::Mutex::new((0, config)),
-            reads: std::sync::atomic::AtomicU64::new(0),
-            validated: true,
+            validated,
         })
     }
 
@@ -2816,15 +2808,8 @@ impl ConfigSource for Versions {
             .lock()
             .expect("no test panics holding it")
             .clone();
-        if !self.validated {
-            return Ok(Reading {
-                digest: Self::digest(version),
-                config: Ok(config),
-            });
-        }
-        Ok(Reading {
-            digest: Self::digest(version),
-            config: config.validated().map_err(|error| {
+        let config = if self.validated {
+            config.validated().map_err(|error| {
                 let icetray_core::Error::Config(source) = error else {
                     panic!("validation fails with a configuration error, got {error}");
                 };
@@ -2835,7 +2820,13 @@ impl ConfigSource for Versions {
                     },
                     source,
                 }
-            }),
+            })
+        } else {
+            Ok(config)
+        };
+        Ok(Reading {
+            digest: Self::digest(version),
+            config,
         })
     }
 }
@@ -2853,17 +2844,21 @@ async fn following() -> Result<(Stack, Arc<Versions>), BoxError> {
 /// A stack over `specs`, serving the first alone and following `Versions`
 /// from there, loaded.
 async fn following_over(specs: Vec<FixtureSpec>) -> Result<(Stack, Arc<Versions>), BoxError> {
-    following_with(specs, Versions::new).await
+    following_with(specs, |config| Versions::new(config, false)).await
 }
 
-/// `following_over` with every version validated as it is read. The
-/// test poll interval is under validation's minimum, so the stack polls at
-/// the default interval instead, and a test that waits for a reload
-/// requests it.
-async fn following_validated(specs: Vec<FixtureSpec>) -> Result<(Stack, Arc<Versions>), BoxError> {
+/// `following_over` with every version validated as it is read, version
+/// 0 the stack's configuration after `edit`. The test poll interval is
+/// under validation's minimum, so the stack polls at the default interval
+/// instead, and a test that waits for a reload requests it.
+async fn following_validated(
+    specs: Vec<FixtureSpec>,
+    edit: impl FnOnce(&mut Config),
+) -> Result<(Stack, Arc<Versions>), BoxError> {
     following_with(specs, |mut config| {
         config.server.poll_interval = ServerConfig::default().poll_interval;
-        Versions::validated(config)
+        edit(&mut config);
+        Versions::new(config, true)
     })
     .await
 }
@@ -2919,6 +2914,15 @@ impl Stack {
             Ok((self.reloads(result).await? > before).then_some(()))
         })
         .await
+    }
+
+    /// Makes `next` the next of `versions`, requests a reload, and waits
+    /// for it to be counted refused.
+    async fn refuse(&self, versions: &Versions, next: Config) -> Result<(), BoxError> {
+        let before = self.reloads(ReloadResult::Refused).await?;
+        versions.set(next);
+        self.serving.reload();
+        self.reloaded(ReloadResult::Refused, before).await
     }
 }
 
@@ -3026,13 +3030,10 @@ async fn test_reload_follows_the_file_on_the_poll() -> TestResult {
 async fn test_reload_refuses_a_change_outside_the_tables() -> TestResult {
     let _serial = SERIAL.lock().await;
     let (mut stack, versions) = following().await?;
-    let before = stack.reloads(ReloadResult::Refused).await?;
     let mut next = versions.config();
     next.tables.push(stack.uuid_table());
     next.server.max_in_flight += 1;
-    versions.set(next);
-    stack.serving.reload();
-    stack.reloaded(ReloadResult::Refused, before).await?;
+    stack.refuse(&versions, next).await?;
 
     assert_eq!(code_of(stack.table_info(UUID_TABLE).await), Code::NotFound);
     stack.table_info(TABLE).await?;
@@ -3046,13 +3047,10 @@ async fn test_reload_refuses_a_change_outside_the_tables() -> TestResult {
 async fn test_reload_refused_for_a_failed_load_is_retried_on_request_only() -> TestResult {
     let _serial = SERIAL.lock().await;
     let (mut stack, versions) = following().await?;
-    let before = stack.reloads(ReloadResult::Refused).await?;
     let mut next = versions.config();
     next.tables.push(stack.uuid_table());
     next.tables.push(missing_table(&stack.fixtures[0]));
-    versions.set(next);
-    stack.serving.reload();
-    stack.reloaded(ReloadResult::Refused, before).await?;
+    stack.refuse(&versions, next).await?;
     assert_eq!(code_of(stack.table_info(UUID_TABLE).await), Code::NotFound);
     stack.table_info(TABLE).await?;
 
@@ -3154,13 +3152,10 @@ async fn test_reload_refuses_a_strict_change_the_serving_snapshot_is_below() -> 
     };
     let (mut stack, versions) = following_over(vec![balanced]).await?;
     let table = Arc::clone(&stack.serving.opened().tables()[0]);
-    let before = stack.reloads(ReloadResult::Refused).await?;
     let mut next = versions.config();
     assert!(!next.tables[0].strict);
     next.tables[0].strict = true;
-    versions.set(next);
-    stack.serving.reload();
-    stack.reloaded(ReloadResult::Refused, before).await?;
+    stack.refuse(&versions, next).await?;
 
     assert!(Arc::ptr_eq(&stack.serving.opened().tables()[0], &table));
     assert!(!table.config().strict, "the refused entry is not taken");
@@ -3178,19 +3173,19 @@ async fn test_reload_refuses_a_strict_change_the_serving_snapshot_is_below() -> 
 async fn test_a_reload_adding_an_ordered_table_to_a_row_server_without_disk_is_refused()
 -> TestResult {
     let _serial = SERIAL.lock().await;
-    let (mut stack, versions) = following_validated(vec![
-        FixtureSpec::small(TABLE, KeyType::Long),
-        ordered_spec(ORDERED_TABLE),
-    ])
+    let (mut stack, versions) = following_validated(
+        vec![
+            FixtureSpec::small(TABLE, KeyType::Long),
+            ordered_spec(ORDERED_TABLE),
+        ],
+        |_| {},
+    )
     .await?;
     let budget = stack.serving.opened().budget();
-    let before = stack.reloads(ReloadResult::Refused).await?;
     let mut next = versions.config();
     next.tables
         .push(stack.ordered().config(Residency::Full, false));
-    versions.set(next);
-    stack.serving.reload();
-    stack.reloaded(ReloadResult::Refused, before).await?;
+    stack.refuse(&versions, next).await?;
 
     assert_eq!(
         code_of(stack.table_info(ORDERED_TABLE).await),
@@ -3202,10 +3197,14 @@ async fn test_a_reload_adding_an_ordered_table_to_a_row_server_without_disk_is_r
     Ok(())
 }
 
-/// A `cache_bytes` of fifteen value pages, whose page part beside a table
-/// reading rows, a tenth, is a page and a half: one shard's minimum, which
+/// A `row_cache_share` that leaves the page cache a tenth of the budget.
+const PAGES_A_TENTH: f64 = 0.9;
+/// The parts of a budget `PAGES_A_TENTH` gives pages one of.
+const TENTHS: u64 = 10;
+/// A `cache_bytes` whose page part beside a table reading rows, at
+/// `PAGES_A_TENTH`, is a page and a half: one shard's minimum, which
 /// parsing checks, and not the two shards' a two-worker runtime has.
-const SPLIT_TOO_THIN_BYTES: u64 = 15 * VALUE_PAGE_BYTES;
+const SPLIT_TOO_THIN_BYTES: u64 = TENTHS * (VALUE_PAGE_BYTES + VALUE_PAGE_BYTES / 2);
 
 /// A reload that serves the first table reading through the row cache,
 /// where the page part it leaves is under the minimum for the runtime's
@@ -3215,22 +3214,18 @@ const SPLIT_TOO_THIN_BYTES: u64 = 15 * VALUE_PAGE_BYTES;
 async fn test_a_reload_whose_split_a_start_would_refuse_is_refused() -> TestResult {
     let _serial = SERIAL.lock().await;
     let specs = vec![FixtureSpec::small(TABLE, KeyType::Long)];
-    let (mut stack, versions) = following_with(specs, |mut config| {
-        config.server.poll_interval = ServerConfig::default().poll_interval;
+    let (mut stack, versions) = following_validated(specs, |config| {
         config.server.cache_bytes = Some(SPLIT_TOO_THIN_BYTES);
+        config.server.row_cache_share = Some(PAGES_A_TENTH);
         config.tables[0].row_cache = Some(false);
-        Versions::validated(config)
     })
     .await?;
     let opened = Arc::clone(stack.serving.opened());
     let budget = opened.budget();
     assert_eq!(budget.row_bytes, 0, "no table reads rows");
-    let before = stack.reloads(ReloadResult::Refused).await?;
     let mut rows = versions.config();
     rows.tables[0].row_cache = None;
-    versions.set(rows);
-    stack.serving.reload();
-    stack.reloaded(ReloadResult::Refused, before).await?;
+    stack.refuse(&versions, rows).await?;
 
     assert!(
         !opened.tables()[0].config().row_cache(),
@@ -3252,7 +3247,7 @@ async fn test_a_reload_that_changes_whether_rows_are_read_resizes_the_caches() -
     let opened = Arc::clone(stack.serving.opened());
     let split = opened.budget();
     assert!(split.row_bytes > 0, "the key-value table reads rows");
-    let whole = split.row_bytes + split.page_bytes;
+    let whole = split.whole();
 
     let mut pages_alone = versions.config();
     pages_alone.tables[0].row_cache = Some(false);
