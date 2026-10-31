@@ -22,6 +22,7 @@ use icetray_core::approx;
 use icetray_core::config::{
     Config, LocalConfig, Residency, ServerConfig, SourceConfig, TableConfig, ValueFormat,
 };
+use icetray_core::contract::VALUE_PAGE_BYTES;
 use icetray_core::key::UUID_BYTES;
 use icetray_core::metric::{self, Kind, LookupResult, ScanResult, Temperature};
 use icetray_core::{
@@ -2863,7 +2864,7 @@ async fn following_validated(specs: Vec<FixtureSpec>) -> Result<(Stack, Arc<Vers
 }
 
 /// `following_over` with the versions `versions` makes of the stack's
-/// configuration.
+/// configuration, version 0 being the one the stack starts with.
 async fn following_with(
     specs: Vec<FixtureSpec>,
     versions: impl FnOnce(Config) -> Arc<Versions>,
@@ -2872,7 +2873,7 @@ async fn following_with(
     let mut stack = Stack::start_with(specs, async |setup| {
         setup.config.tables.truncate(1);
         let versions = versions(setup.config.clone());
-        setup.config.server = versions.config().server;
+        setup.config = versions.config();
         setup.options.reload = Some(versions.reload());
         followed = Some(versions);
         Ok(())
@@ -3193,6 +3194,46 @@ async fn test_a_reload_adding_an_ordered_table_to_a_row_server_without_disk_is_r
     stack.table_info(TABLE).await?;
     assert_eq!(stack.pending().await?, Some(1.0));
     assert_eq!(stack.serving.opened().budget(), budget);
+    Ok(())
+}
+
+/// A `cache_bytes` of fifteen value pages, whose page part beside a table
+/// reading rows, a tenth, is a page and a half: one shard's minimum, which
+/// parsing checks, and not the two shards' a two-worker runtime has.
+const SPLIT_TOO_THIN_BYTES: u64 = 15 * VALUE_PAGE_BYTES;
+
+/// A reload that serves the first table reading through the row cache,
+/// where the page part it leaves is under the minimum for the runtime's
+/// shards, is refused whole, as a start with its file would be: the table
+/// keeps its entry, the caches keep their split, and the file is pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_reload_whose_split_a_start_would_refuse_is_refused() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let specs = vec![FixtureSpec::small(TABLE, KeyType::Long)];
+    let (mut stack, versions) = following_with(specs, |mut config| {
+        config.server.poll_interval = ServerConfig::default().poll_interval;
+        config.server.cache_bytes = Some(SPLIT_TOO_THIN_BYTES);
+        config.tables[0].row_cache = Some(false);
+        Versions::validated(config)
+    })
+    .await?;
+    let opened = Arc::clone(stack.serving.opened());
+    let budget = opened.budget();
+    assert_eq!(budget.row_bytes, 0, "no table reads rows");
+    let before = stack.reloads(ReloadResult::Refused).await?;
+    let mut rows = versions.config();
+    rows.tables[0].row_cache = None;
+    versions.set(rows);
+    stack.serving.reload();
+    stack.reloaded(ReloadResult::Refused, before).await?;
+
+    assert!(
+        !opened.tables()[0].config().row_cache(),
+        "the refused entry is not taken"
+    );
+    assert_eq!(opened.budget(), budget);
+    assert_eq!(stack.pending().await?, Some(1.0));
+    stack.table_info(TABLE).await?;
     Ok(())
 }
 

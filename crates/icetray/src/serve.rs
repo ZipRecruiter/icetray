@@ -701,8 +701,10 @@ pub(crate) async fn retain(opened: &Opened) {
 }
 
 /// Resizes the caches to the split the tables a reload swapped in call
-/// for (`Opened::fit_caches`). A refusal is logged and leaves both caches
-/// as they were: the tables serve on, the row cache at the part it had.
+/// for (`Opened::fit_caches`). The reload checked that split before the
+/// swap (`Opened::check_split`), so only a failure of the page cache's
+/// level remains, which is logged: the tables serve on, and the split
+/// recorded stays the one before.
 fn fit_caches(opened: &Opened) {
     if let Err(error) = opened.fit_caches() {
         tracing::error!(

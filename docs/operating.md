@@ -297,9 +297,6 @@ Events worth knowing:
   ([Refresh and reload](#refresh-and-reload)). The
   budget is derived from the limit unless `server.cache_bytes` sets it
   ([Configuration](configuration.md#server)).
-- `caches not resized for the tables reloaded`, at `error`, with the
-  `reason` and the `error`, when the page cache's new part after a reload
-  is below its minimum; both caches keep the split they had.
 - `listening`, with both addresses and the table count; then
   `table serving` for each table as its first load completes.
 - `swapped in a generation`, with the snapshot id and the files reused,
@@ -564,11 +561,16 @@ restart ([RFD 018](rfd/018-configuration-reload.md)).
   level when there is one. icetray logs the new split as `cache budget`.
   A file that mixes the two kinds of table with no page-cache disk level
   and no `row_cache_share` fails validation, so such a reload is refused
-  ([Configuration](configuration.md#server)).
+  ([Configuration](configuration.md#server)). icetray also refuses a
+  reload whose new split leaves the page cache a part under the minimum
+  for its shards on this machine, which a start with that file would
+  refuse.
 - icetray refuses a reload whole when any of those tables fails to load
   or a retuned table is refused, when the file does not parse or fails
-  validation (a file that lists no table fails it), or when any setting
-  outside `[[tables]]` changed, since those apply only on restart. icetray
+  validation (a file that lists no table fails it), when the caches'
+  split for its tables is one a start with it would refuse, or when any
+  setting outside `[[tables]]` changed, since those apply only on
+  restart. icetray
   logs the refusal as `configuration reload refused` and counts it, and
   `icetray_config_pending` reads 1 until the file matches the applied
   configuration. The refusal's `reason` names what to fix:
@@ -576,6 +578,8 @@ restart ([RFD 018](rfd/018-configuration-reload.md)).
     the file and the setting by its full path;
   - for a restart-only change, the setting, as in
     `server.listen changed, which only a restart applies`;
+  - for a split a start would refuse, the page cache part and the
+    minimum for the machine's shards, as the start's refusal names them;
   - for refused tables, their names, as in `tables refused: kv`. icetray
     logs each table's own error just before, as `table refused for a
     reload` with `table`, `reason`, and `error`: a load's failure, or

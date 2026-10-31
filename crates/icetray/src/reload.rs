@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use icetray_core::config::{Config, ConfigError};
+use icetray_core::config::{Config, ConfigError, ConfigViolation};
 use icetray_core::{Applied, Opened, Refused, Table, approx, metric};
 use metrics::Counter;
 use sha2::{Digest as _, Sha256};
@@ -135,6 +135,10 @@ pub enum ReloadRefusal {
     Invalid(ConfigRejected),
     /// Settings outside the tables changed, by their names in the file.
     Restart(Vec<&'static str>),
+    /// The caches' split for the new tables, which a start with the file
+    /// would refuse on this machine (RFD 028): a page cache part under the
+    /// minimum for its shards, which parsing checks against one shard only.
+    Split(ConfigViolation),
     /// A table failed to open or load, or its serving generation does not
     /// meet its retuned `lookups`, `strict`, column formats, or
     /// `max_scan_rows`.
@@ -145,6 +149,7 @@ impl fmt::Display for ReloadRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(error) => write!(f, "{error}"),
+            Self::Split(violation) => write!(f, "{violation}"),
             Self::Restart(settings) => write!(
                 f,
                 "{} changed, which only a restart applies",
@@ -318,7 +323,9 @@ impl Reloader {
         }
     }
 
-    /// Applies `reading`'s tables when nothing else in it changed.
+    /// Applies `reading`'s tables when nothing else in it changed and the
+    /// caches' split for them is one a start with the file would take
+    /// (`Opened::check_split`).
     async fn reload(
         &mut self,
         opened: &Opened,
@@ -329,6 +336,9 @@ impl Reloader {
         if !restart.is_empty() {
             return Err(ReloadRefusal::Restart(restart));
         }
+        opened
+            .check_split(&config.tables)
+            .map_err(ReloadRefusal::Split)?;
         let applied = opened
             .apply(&config.tables)
             .await
@@ -420,8 +430,6 @@ mod tests {
     use std::io::Write as _;
 
     use std::path::Path;
-
-    use icetray_core::config::ConfigViolation;
 
     use super::*;
     use crate::cli::PathOrigin;

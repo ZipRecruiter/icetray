@@ -19,7 +19,7 @@ use crate::approx;
 use crate::budget::{self, Budget};
 use crate::cache::{self, PageCache};
 use crate::catalog::TableSource;
-use crate::config::{Config, ConfigError, ServerConfig, TableConfig};
+use crate::config::{Config, ConfigError, ConfigViolation, ServerConfig, TableConfig};
 use crate::error::{Error, Result};
 use crate::local::{ChunkRules, DataFileIdentity, LocalDir};
 use crate::memory::{self, MemoryLimit};
@@ -217,6 +217,27 @@ impl Opened {
         *self.budget.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The split the caches take serving `tables` (RFD 028), which
+    /// `fit_caches` applies once they are the tables served: what a start
+    /// with them resolves, under the settings and the memory limit the
+    /// caches opened with. A page part under the minimum for the page
+    /// cache's shards on this runtime is
+    /// `ConfigViolation::PageCacheTooSmall`, which `Config::parse` checks
+    /// against one shard only, so a reload checks its tables here before it
+    /// applies them and is refused whole, as a start with its file would be.
+    pub fn check_split(
+        &self,
+        tables: &[TableConfig],
+    ) -> std::result::Result<Budget, ConfigViolation> {
+        self.split(tables.iter().any(TableConfig::row_cache))
+    }
+
+    /// The budget under the settings and the memory limit the caches
+    /// opened with, with the row cache's part when `rows_read`.
+    fn split(&self, rows_read: bool) -> std::result::Result<Budget, ConfigViolation> {
+        budget::resolve(&self.server, self.limit, rows_read, cache::memory_shards())
+    }
+
     /// Resizes the row cache and the page cache's memory level to the split
     /// the tables served now call for (RFD 028): the budget resolved under
     /// the settings and the memory limit the caches opened with, so its
@@ -226,7 +247,8 @@ impl Opened {
     /// two never hold more than the whole between the resizes, and a resize
     /// blocks until its evictions are done. A new page part under the
     /// minimum for the page cache's shards is `Error::Config` with
-    /// `ConfigViolation::PageCacheTooSmall` and changes nothing; a failure
+    /// `ConfigViolation::PageCacheTooSmall` and changes nothing, which the
+    /// tables a reload checked with `check_split` never meet; a failure
     /// of the page cache's level is `CacheError::Backend`, after a row
     /// cache that shrinks has shrunk, and leaves the split recorded as it
     /// was, so the next call resizes again. The serve loop
@@ -234,7 +256,8 @@ impl Opened {
     /// as `cache budget` when it changes.
     pub fn fit_caches(&self) -> Result<()> {
         let rows_read = self.tables().iter().any(|table| table.config().row_cache());
-        let next = budget::resolve(&self.server, self.limit, rows_read, cache::memory_shards())
+        let next = self
+            .split(rows_read)
             .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
         let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
         if next.row_bytes == budget.row_bytes {
@@ -936,6 +959,43 @@ mod tests {
         assert!(
             held <= opened.budget().page_bytes,
             "{held} over the page part"
+        );
+    }
+
+    /// A budget whose page part with a row-reading table, a tenth, holds
+    /// one shard's minimum and not two shards', which parsing admits and
+    /// a two-worker runtime refuses; whole, it holds two shards' minimum.
+    fn one_shard_s_tenth() -> u64 {
+        let tenths = 10;
+        let shards_and_a_half = 3;
+        tenths * shards_and_a_half * cache::min_memory_bytes(1) / 2
+    }
+
+    /// On a server whose tables read pages alone, tables that read rows
+    /// give a split whose page part is under the minimum for the runtime's
+    /// two shards, which a start with them refuses, so `check_split`
+    /// refuses it; the tables served pass it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_check_split_refuses_a_page_part_below_the_runtime_shards_minimum() {
+        let workers = 2;
+        let fixture = two_file_fixture().await;
+        let first = named(FIRST_TABLE, &fixture, Residency::Full);
+        let mut config = config(vec![pages_alone(first.clone())]);
+        config.server.cache_bytes = Some(one_shard_s_tenth());
+        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
+            .await
+            .unwrap();
+        assert_eq!(opened.check_split(&config.tables), Ok(opened.budget()));
+        let refused = opened.check_split(&[first]).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                ConfigViolation::PageCacheTooSmall { bytes, minimum, shards, limit: None }
+                    if bytes >= cache::min_memory_bytes(1)
+                        && minimum == cache::min_memory_bytes(workers)
+                        && shards == workers
+            ),
+            "{refused:?}"
         );
     }
 
