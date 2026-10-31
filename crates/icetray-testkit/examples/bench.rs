@@ -81,17 +81,18 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
+use futures::future::OptionFuture;
 use iceberg::spec::MAIN_BRANCH;
 use icetray_core::ColumnRead;
 use icetray_core::config::{
     Config, LocalConfig, Residency, RewriteRule, ServerConfig, SourceConfig, StorageConfig,
-    TableConfig, ValueColumnConfig, ValueFormat, least_max_multi_scan_values,
+    TableConfig, ValueColumnConfig, ValueFormat, least_max_multi_scan_values, reads_rows,
 };
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
-    CallsInFlight, DEFAULT_MAX_SCAN_ROWS, Direction, FILE_PREFIX, FindingLog, Generation, Key,
-    KeyType, Level, LocalDir, OrderValue, PageCache, ResidentParts, Row, RowCache, ScanBounds,
-    Scanned, Storage, Table, TableHandles, TableSource,
+    DEFAULT_MAX_SCAN_ROWS, Direction, FILE_PREFIX, FindingLog, Generation, Key, KeyType, Level,
+    LocalDir, OrderValue, PageCache, ResidentParts, Row, RowCache, ScanBounds, Scanned, Storage,
+    Table, TableHandles, TableSource,
 };
 use icetray_core::{approx, budget, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, SECOND_VALUE_COLUMN, memory_catalog_local};
@@ -1433,7 +1434,7 @@ impl TableShape {
     /// Whether the warm scenarios' page cache holds every value page of the
     /// table, of every column it serves, which their measurement assumes.
     fn fits_warm_cache(self) -> bool {
-        approx::length(self.first_build_rows()) * self.row_value_bytes() <= WARM_CACHE_BYTES
+        self.first_build_rows() * approx::count(self.row_value_bytes()) <= WARM_CACHE_BYTES
     }
 
     /// The table's `i`-th key.
@@ -1836,20 +1837,21 @@ fn local_path(location: &str) -> BenchResult<PathBuf> {
 /// every key page besides, and under `on` that its row cache part holds
 /// every such value, so nothing is evicted. A table whose values do not
 /// fit is not run warm (`fits_warm_cache`).
-const WARM_CACHE_BYTES: usize = 1 << 30;
+const WARM_CACHE_BYTES: u64 = 1 << 30;
 
 /// The cache budget of the cold-hit scenario: one mebibyte, about ten of
 /// a table's two thousand value pages, so nearly every uniformly random
 /// hit misses both caches, reads its page from the file, and decodes it.
 /// The run reports the page fetches it measured per lookup.
-const COLD_CACHE_BYTES: usize = 1 << 20;
+const COLD_CACHE_BYTES: u64 = 1 << 20;
 
 /// The cache budget of the skewed scenario: 32 MiB, about a sixth of a
-/// table of 100-byte values' 200 MB of value pages and, at the row
-/// cache's charge for such a row, room for about one row in sixteen, so
-/// neither cache holds the whole table and the skew decides which rows
-/// each serves.
-const SKEWED_CACHE_BYTES: usize = 1 << 25;
+/// table of 100-byte values' 200 MB of value pages and, under
+/// `--row-cache on`, room in the row cache's share, at its charge for such
+/// a row and beside its ghost list's reserve, for about one row in
+/// nineteen, so neither cache holds the whole table and the skew decides
+/// which rows each serves.
+const SKEWED_CACHE_BYTES: u64 = 1 << 25;
 
 /// One table served over storage of its own, so its counters are its own,
 /// beside at most one other table over the same handles, and a local
@@ -1902,25 +1904,25 @@ struct Stack {
 async fn stack(
     storage: &Arc<Storage>,
     tier: Tier,
-    cache_bytes: usize,
+    cache_bytes: u64,
     rows_read: bool,
     reuse: Option<TempDir>,
 ) -> BenchResult<Stack> {
     let (local, dir) = local_for(tier, storage, reuse)?;
+    let serving = serving();
     let mut server = ServerConfig::default();
-    server.cache_bytes = Some(approx::count(cache_bytes));
+    server.cache_bytes = Some(cache_bytes);
+    server.batch_fan_out = serving.batch_fan_out;
+    server.max_multi_scan_values = serving.max_multi_scan_values;
     let budget = budget::resolve(&server, None, rows_read, BUDGET_SHARDS)?;
-    let handles = TableHandles {
-        storage: Arc::clone(storage),
-        cache: PageCache::new(budget.page_bytes, None).await?,
-        row_cache: Some(RowCache::new(budget.row_bytes)),
-        local: local.clone(),
-        calls: CallsInFlight::new(),
-        findings: FindingLog::Events,
-        batch_fan_out: serving().batch_fan_out,
-        max_multi_scan_values: serving().max_multi_scan_values,
-        max_scan_bytes: ServerConfig::default().max_scan_bytes,
-    };
+    let handles = TableHandles::new(
+        &server,
+        Arc::clone(storage),
+        PageCache::new(budget.page_bytes, None).await?,
+        Some(RowCache::new(budget.row_bytes)),
+        local.clone(),
+        FindingLog::Events,
+    );
     Ok(Stack {
         handles,
         local,
@@ -1940,7 +1942,7 @@ async fn serve(
     prepared: &Prepared,
     beside: Option<&Prepared>,
     tier: Tier,
-    cache_bytes: usize,
+    cache_bytes: u64,
     source: SourceConfig,
     reuse: Option<TempDir>,
 ) -> BenchResult<Served> {
@@ -1951,21 +1953,17 @@ async fn serve(
     if let Some(store) = &rounds {
         storage.register(FILE_PREFIX, Arc::clone(store) as Arc<dyn ObjectStore>);
     }
+    let beside = beside.map(|other| (other, table_config(other, tier, pinned(other))));
+    let config = table_config(prepared, tier, source);
+    let rows_read = reads_rows(beside.iter().map(|(_, entry)| entry).chain([&config]));
     let Stack {
         handles,
         local,
         dir,
-    } = stack(
-        &storage,
-        tier,
-        cache_bytes,
-        reads_rows(prepared, beside),
-        reuse,
-    )
-    .await?;
+    } = stack(&storage, tier, cache_bytes, rows_read, reuse).await?;
     let beside = match beside {
-        Some(other) => {
-            let table = table_over(other, tier, pinned(other), handles.clone()).await?;
+        Some((other, entry)) => {
+            let table = table_of(entry, handles.clone()).await?;
             table.load().await?;
             prime_cache(&table, other.shape).await?;
             Some(Arc::new(table))
@@ -1973,7 +1971,7 @@ async fn serve(
         None => None,
     };
     let cache = handles.cache.clone();
-    let table = table_over(prepared, tier, source, handles).await?;
+    let table = table_of(config, handles).await?;
     Ok(Served {
         table: Arc::new(table),
         beside,
@@ -2015,18 +2013,12 @@ fn local_for(
     }
 }
 
-/// `prepared` as a `Table` in `tier` from `source`, strict at its shape's
-/// level (`TableShape::lookups`), over `handles`, with the default
-/// deadlines, a key-value table reading through the row cache as the
-/// run's `--row-cache` says, an ordered table, which sets no `row_cache`,
-/// with its order column at the default `max_scan_rows`.
-async fn table_over(
-    prepared: &Prepared,
-    tier: Tier,
-    source: SourceConfig,
-    handles: TableHandles,
-) -> BenchResult<Table> {
-    let config = TableConfig {
+/// The entry of `prepared` in `tier` from `source`, strict at its shape's
+/// level (`TableShape::lookups`): a key-value table reading through the
+/// row cache as the run's `--row-cache` says, an ordered table, which sets
+/// no `row_cache`, with its order column at the default `max_scan_rows`.
+fn table_config(prepared: &Prepared, tier: Tier, source: SourceConfig) -> TableConfig {
+    TableConfig {
         name: prepared.shape.table_name(),
         source,
         r#ref: MAIN_BRANCH.to_string(),
@@ -2043,8 +2035,7 @@ async fn table_over(
             .ordered
             .is_none()
             .then_some(serving().row_cache),
-    };
-    table_of(config, handles).await
+    }
 }
 
 /// The table `config` names over `handles`, under the server's default
@@ -2061,16 +2052,6 @@ async fn table_of(config: TableConfig, handles: TableHandles) -> BenchResult<Tab
         server.get_deadline,
         server.scan_deadline,
     ))
-}
-
-/// Whether `prepared` or the table served `beside` it reads through the
-/// row cache: a key-value table does when the run's `--row-cache` is on,
-/// as `table_over` configures it, and an ordered table never does.
-fn reads_rows(prepared: &Prepared, beside: Option<&Prepared>) -> bool {
-    serving().row_cache
-        && std::iter::once(prepared)
-            .chain(beside)
-            .any(|served| served.shape.ordered.is_none())
 }
 
 /// The first build's metadata file, which never advances.
@@ -3158,9 +3139,9 @@ fn rounds_json(rounds: Option<Rounds>) -> Json {
 /// allocates nothing inside the window. The warm-up's operations start at
 /// `first` and the window's follow them, so neither asks again the keys
 /// an earlier run of the op just asked, which a cache smaller than the
-/// table would still hold; the window and the operation after its last.
-/// A GET log over the served store (`Served::gets`) starts anew with the
-/// window's counters.
+/// table would still hold. Returns the window and the operation after its
+/// last. A GET log over the served store (`Served::gets`) starts anew with
+/// the window's counters.
 async fn measure_window(
     served: &Served,
     op: &Op,
@@ -3276,6 +3257,7 @@ struct Budgets {
     /// Under `WARM_CACHE_BYTES`, primed (`prime_cache`), for the warm
     /// scenarios and the misses.
     warm: Option<Served>,
+    /// Under `COLD_CACHE_BYTES`, for the cold scenarios.
     cold: Option<Served>,
     /// Under `SKEWED_CACHE_BYTES`, unfilled: the skewed scenario fills it
     /// with its own keys.
@@ -3292,23 +3274,21 @@ impl Budgets {
         scenarios: &[Scenario],
     ) -> BenchResult<Self> {
         let uses = |cache: Cache| scenarios.iter().any(|s| s.traits().cache == cache);
-        let warm = if uses(Cache::Warm) || uses(Cache::Unread) {
-            let served = serve_loaded(prepared, beside, tier, WARM_CACHE_BYTES).await?;
+        let serve_if = |wanted: bool, cache_bytes| {
+            OptionFuture::from(wanted.then(|| serve_loaded(prepared, beside, tier, cache_bytes)))
+        };
+        let warm = serve_if(uses(Cache::Warm) || uses(Cache::Unread), WARM_CACHE_BYTES)
+            .await
+            .transpose()?;
+        if let Some(served) = &warm {
             prime_cache(&served.table, prepared.shape).await?;
-            Some(served)
-        } else {
-            None
-        };
-        let cold = if uses(Cache::Cold) {
-            Some(serve_loaded(prepared, beside, tier, COLD_CACHE_BYTES).await?)
-        } else {
-            None
-        };
-        let skewed = if uses(Cache::Skewed) {
-            Some(serve_loaded(prepared, beside, tier, SKEWED_CACHE_BYTES).await?)
-        } else {
-            None
-        };
+        }
+        let cold = serve_if(uses(Cache::Cold), COLD_CACHE_BYTES)
+            .await
+            .transpose()?;
+        let skewed = serve_if(uses(Cache::Skewed), SKEWED_CACHE_BYTES)
+            .await
+            .transpose()?;
         Ok(Self { warm, cold, skewed })
     }
 
@@ -3482,7 +3462,7 @@ async fn serve_loaded(
     prepared: &Prepared,
     beside: Option<&Prepared>,
     tier: Tier,
-    cache_bytes: usize,
+    cache_bytes: u64,
 ) -> BenchResult<Served> {
     let served = serve(prepared, beside, tier, cache_bytes, pinned(prepared), None).await?;
     served.table.load().await?;
@@ -4688,7 +4668,7 @@ async fn serve_reference(
     warehouse: &str,
     table: GoldenTable,
     tier: Tier,
-    cache_bytes: usize,
+    cache_bytes: u64,
     reuse: Option<TempDir>,
 ) -> BenchResult<Served> {
     let storage = Arc::new(Storage::with_sdk_defaults(serving().storage));
@@ -4708,7 +4688,7 @@ async fn serve_reference(
         handles,
         local,
         dir,
-    } = stack(&storage, tier, cache_bytes, config.row_cache(), reuse).await?;
+    } = stack(&storage, tier, cache_bytes, reads_rows([&config]), reuse).await?;
     let cache = handles.cache.clone();
     let table = table_of(config, handles).await?;
     Ok(Served {

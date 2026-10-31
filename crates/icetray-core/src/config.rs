@@ -1186,7 +1186,7 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
 /// Whether any of `tables` reads through the row cache
 /// (`TableConfig::row_cache`). The row cache's part of the budget is zero
 /// when none does (`budget::resolve`).
-pub(crate) fn reads_rows<'a>(tables: impl IntoIterator<Item = &'a TableConfig>) -> bool {
+pub fn reads_rows<'a>(tables: impl IntoIterator<Item = &'a TableConfig>) -> bool {
     tables.into_iter().any(TableConfig::row_cache)
 }
 
