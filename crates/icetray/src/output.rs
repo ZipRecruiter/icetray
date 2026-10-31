@@ -593,6 +593,7 @@ mod tests {
                 level: Level::Optimal,
                 gets_per_hit: 1,
                 files_predating_column: 0,
+                value_bytes: 1,
             }],
             deletes: DeleteSummary {
                 rows: 1,

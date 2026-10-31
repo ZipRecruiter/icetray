@@ -863,6 +863,12 @@ pub struct ColumnSummary {
     /// Data files written before the column was added, for whose rows a
     /// lookup returns the column's default (RFD 023).
     pub files_predating_column: usize,
+    /// The column's uncompressed chunk bytes summed over the snapshot's
+    /// files, the bytes `ValueColumnReport::avg_value_bytes` divides by each
+    /// file's rows, so an owner compares a table's hot share with the
+    /// cache budget (RFD 028). A file written before the column was added
+    /// contributes none.
+    pub value_bytes: u64,
 }
 
 /// An ordered table's order column in its summary (RFD 025, Doctor).
@@ -1026,6 +1032,9 @@ pub fn diagnose(
             level: cost.level,
             gets_per_hit: cost.gets_per_hit,
             files_predating_column: predating_column(g, at),
+            value_bytes: facts.iter().fold(0, |sum, file| {
+                u64::saturating_add(sum, file.column_bytes[at])
+            }),
         })
         .collect();
     let buckets = by_bucket(&facts);
@@ -1546,6 +1555,9 @@ fn scan_gets(
 /// the footer's prediction).
 struct FileFacts {
     report: FileReport,
+    /// Each configured value column's uncompressed chunk bytes in the file,
+    /// in the layout's order; zero for a column the file predates.
+    column_bytes: Vec<u64>,
     size: u64,
     rows: u64,
     predicted: ResidentBytes,
@@ -1644,7 +1656,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
     );
     let pages = key_page_facts(metadata, index.key_leaf());
     let order_facts = layout.order.as_ref().and(index.order_facts());
-    let mut value_bytes = 0;
+    let mut column_bytes = Vec::with_capacity(layout.value_columns.len());
     let mut dictionary_columns = Vec::new();
     if column_chunk_facts(metadata, index.key_leaf()).dictionary {
         dictionary_columns.push(layout.key_column.clone());
@@ -1655,6 +1667,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
         .zip(index.value_leaves())
         .map(|(column, leaf)| {
             let Some(leaf) = leaf else {
+                column_bytes.push(0);
                 return ValueColumnReport {
                     column: column.name.clone(),
                     predates_column: true,
@@ -1668,7 +1681,7 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             if chunks.dictionary {
                 dictionary_columns.push(column.name.clone());
             }
-            value_bytes += chunks.uncompressed_bytes;
+            column_bytes.push(chunks.uncompressed_bytes);
             let (value_pages, pages_aligned) = value_page_facts(metadata, index.key_leaf(), leaf);
             ValueColumnReport {
                 column: column.name.clone(),
@@ -1686,7 +1699,11 @@ fn measure(file: &LoadedFile, layout: &TableLayout) -> FileFacts {
             }
         })
         .collect();
+    let value_bytes = column_bytes
+        .iter()
+        .fold(0, |sum, bytes| u64::saturating_add(sum, *bytes));
     FileFacts {
+        column_bytes,
         report: FileReport {
             path: file.entry.path.clone(),
             bucket: file.entry.bucket,
@@ -3453,6 +3470,47 @@ mod tests {
         assert!(report.files[0].value_columns[0].avg_value_page_bytes > VALUE_PAGE_BYTES_ADVICE);
     }
 
+    /// The bytes of the value column's chunks over a file's row groups, read
+    /// from the footer.
+    fn uncompressed_chunk_bytes(file: &LoadedFile) -> u64 {
+        let leaf = file.index.value_leaf(0).unwrap();
+        file.index
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|group| approx::measured(group.column(leaf).uncompressed_size()))
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn test_column_summary_sums_the_value_bytes_of_every_file() {
+        let small: &[u8] = &[0x07; testing::VALUE_BYTES];
+        let growth = 3;
+        let large: &[u8] = &vec![0x07; testing::VALUE_BYTES * growth];
+        let (_table, generation) = files_of_values(&[Some(small), Some(large)]).await;
+        let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
+        let per_file: Vec<u64> = generation
+            .files
+            .iter()
+            .map(|file| uncompressed_chunk_bytes(file))
+            .collect();
+        assert_ne!(
+            per_file[0], per_file[1],
+            "the files' columns differ in size"
+        );
+        assert_eq!(
+            report.summary.value_columns[0].value_bytes,
+            per_file.iter().sum::<u64>(),
+            "the snapshot's column is every file's uncompressed chunk bytes"
+        );
+        let mean_of_first = report.files[0].value_columns[0].avg_value_bytes;
+        assert_eq!(
+            mean_of_first,
+            per_file[0] / u64::try_from(FILE_KEYS).unwrap(),
+            "the sum is the bytes avg_value_bytes divides"
+        );
+    }
+
     /// A value page just over the lookup ceiling draws `value_pages_over_ceiling`
     /// beside `large_value_pages`, and a lookup into it is refused with the
     /// file fault the message names.
@@ -4303,6 +4361,10 @@ mod tests {
                 "advice",
             ])
         );
+        assert!(
+            report.summary.value_columns[0].value_bytes > 0,
+            "the column's pages are measured, so its bytes are not zero"
+        );
         assert_eq!(
             summary["value_columns"],
             serde_json::json!([{
@@ -4311,6 +4373,7 @@ mod tests {
                 "level": Level::Balanced.to_string(),
                 "gets_per_hit": VALUE_PAGE_GETS + DICTIONARY_PAGE_GETS,
                 "files_predating_column": 0,
+                "value_bytes": report.summary.value_columns[0].value_bytes,
             }]),
             "the dictionary-encoded column is balanced at two GETs"
         );

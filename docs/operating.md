@@ -706,7 +706,11 @@ through settings, mounted files, and environment variables.
   the indexes and the largest table's once more. With `cache_bytes` set,
   it may be at most three quarters of the limit less those indexes. The
   `icetray_allocator_*` gauges show how much of the resident set the
-  allocator accounts for.
+  allocator accounts for. To judge whether the budget suits a table, compare
+  the doctor's `value_columns[].value_bytes`, each column's uncompressed
+  bytes in the snapshot, with the budget: a table whose hot rows are a small
+  share of those bytes fits a small budget, and one that is read evenly wants
+  the budget near their sum.
 - Once the tables serve, and after every reload that applies, icetray
   applies that rule to itself: it adds each table's resident index bytes
   (`icetray_index_bytes`), the largest once more, and the cache budget, adds

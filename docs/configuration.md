@@ -823,7 +823,7 @@ Three conventions hold for the lines below:
 One per table, from `info` and from `doctor`:
 
 ```json
-{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"value_columns":[{"column":"value","format":"opaque","level":"optimal","gets_per_hit":1,"files_predating_column":0}],"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
+{"kind":"table","table":"long_2m","snapshot_id":"7128216514704790069","level":"optimal","lookups":"optimal","residency":"full","file_count":4,"buckets":4,"buckets_with_files":4,"max_files_per_bucket":1,"records":2000000,"index_bytes":2623999,"predicted":{"full":2623999,"disk_memory":239082,"disk_bytes":2405869,"bloom":4433458,"bloom_bits_per_key":16.777504,"key_chunk_bytes":2384917,"filter_bytes":4194376},"level_by_residency":{"full":"optimal","disk":"optimal","bloom":"balanced"},"lookup_cost":{"gets_per_hit":1,"gets_per_miss":0,"files_probed":1},"value_columns":[{"column":"value","format":"opaque","level":"optimal","gets_per_hit":1,"files_predating_column":0,"value_bytes":216000000}],"deletes":{"rows":0,"files":0,"fraction":0.0,"state_bytes":0},"capping":0,"advice":0}
 ```
 
 | Key | Value |
@@ -856,6 +856,7 @@ One per table, from `info` and from `doctor`:
 | `value_columns[].level` | The level a lookup requesting the column achieves, as `icetray_table_column_level` reports it. |
 | `value_columns[].gets_per_hit` | The value-page GETs a cold hit spends on the column alone, 1, or 2 when a file dictionary-encodes it, as `icetray_table_column_gets_per_hit` reports it. A request's cold cost is `lookup_cost.gets_per_miss` plus the figures of the columns it requests. On an ordered table, the GETs a cold `Scan` spends on the column's span, which `order.gets_per_scan` sums over the configured columns. |
 | `value_columns[].files_predating_column` | Data files written before the column was added, for which a lookup returns the column's default. |
+| `value_columns[].value_bytes` | The column's uncompressed bytes in the snapshot, summed over the data files from their footers; a file written before the column was added contributes none. The same bytes `value_columns[].avg_value_bytes` of `doctor --files` divides by each file's rows. Compare it with `server.cache_bytes` to see how much of the column the cache budget could hold. |
 | `deletes.rows` | Rows the snapshot's deletes remove from the data files it holds, as `icetray_table_deleted_rows` reports it while the snapshot serves. |
 | `deletes.files` | Position delete files and deletion vectors whose rows the load applied, as `icetray_table_delete_files` reports it. |
 | `deletes.fraction` | `deletes.rows` over `records`, as `icetray_table_deleted_fraction` reports it. |

@@ -384,6 +384,89 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
     Ok(())
 }
 
+/// The uncompressed chunk bytes of the value column at `column` in the files
+/// of `generation` that hold it, read from their footers.
+fn uncompressed_bytes_of(generation: &icetray_core::Generation, column: usize) -> u64 {
+    generation
+        .files
+        .iter()
+        .filter_map(|file| {
+            let leaf = file.index.value_leaf(column)?;
+            Some(
+                file.index
+                    .metadata()
+                    .row_groups()
+                    .iter()
+                    .map(|group| {
+                        u64::try_from(group.column(leaf).uncompressed_size())
+                            .expect("a chunk's uncompressed size is not negative")
+                    })
+                    .sum::<u64>(),
+            )
+        })
+        .sum()
+}
+
+/// A column added after the first build holds bytes only in the files
+/// written since; the column every file holds reports all of them.
+#[tokio::test]
+async fn test_doctor_sums_a_column_s_bytes_over_the_files_that_hold_it() -> Result<()> {
+    let (_dir, mut fixture) = two_bucket_fixture("kv_added_sum", FormatVersion::V2, false).await?;
+    add_column_then_rows(&mut fixture, StatedDefault::None).await?;
+    let served = serve_root(&fixture, &[VALUE_COLUMN, SECOND_VALUE_COLUMN]).await?;
+    let generation = served.current();
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
+    let [added, held] = report.summary.value_columns.as_slice() else {
+        panic!("two columns: {:?}", report.summary.value_columns);
+    };
+    assert_eq!(added.column, SECOND_VALUE_COLUMN);
+    assert_eq!(
+        added.value_bytes,
+        uncompressed_bytes_of(&generation, 0),
+        "a file written before the column adds none"
+    );
+    assert!(added.value_bytes > 0, "the later files hold it");
+    assert!(added.files_predating_column > 0);
+    assert_eq!(held.column, VALUE_COLUMN);
+    assert_eq!(held.value_bytes, uncompressed_bytes_of(&generation, 1));
+    Ok(())
+}
+
+/// A column every file predates holds no bytes in the snapshot, while the
+/// column they all hold reports its footers' bytes.
+#[tokio::test]
+async fn test_doctor_reports_no_bytes_for_a_column_every_file_predates() -> Result<()> {
+    let (_dir, mut fixture) =
+        two_bucket_fixture("kv_added_bytes", FormatVersion::V2, false).await?;
+    fixture
+        .evolve(&[SchemaChange::Add {
+            name: SECOND_VALUE_COLUMN.to_string(),
+            ty: PrimitiveType::Binary,
+            default: StatedDefault::None,
+        }])
+        .await?;
+    let data = fixture.files().to_vec();
+    fixture
+        .commit_by_hand(HandSnapshot {
+            data,
+            deletes: Vec::new(),
+        })
+        .await?;
+    let served = serve_root(&fixture, &[VALUE_COLUMN, SECOND_VALUE_COLUMN]).await?;
+    let generation = served.current();
+    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
+    let [added, held] = report.summary.value_columns.as_slice() else {
+        panic!("two columns: {:?}", report.summary.value_columns);
+    };
+    assert_eq!(added.column, SECOND_VALUE_COLUMN);
+    assert_eq!(added.files_predating_column, generation.files.len());
+    assert_eq!(added.value_bytes, 0);
+    assert_eq!(held.column, VALUE_COLUMN);
+    assert!(held.value_bytes > 0);
+    assert_eq!(held.value_bytes, uncompressed_bytes_of(&generation, 1));
+    Ok(())
+}
+
 /// In the Bloom tier a row that gets its column's default costs the key page its
 /// probe decodes and no value page; in the Disk tier it costs no GET, the
 /// key page being on local disk. One `multi_get` answers keys of files
