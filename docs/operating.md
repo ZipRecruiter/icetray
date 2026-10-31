@@ -164,7 +164,7 @@ Gauges, written at each scrape:
 | `icetray_findings` | `table`, `code`, and `column` for a code about one value column | The number of findings of each code that icetray raised on the serving generation, 0 for a code not raised. A code about one value column has one series per configured column. |
 | `icetray_index_bytes` | `table` | The resident index's live bytes. |
 | `icetray_page_cache_bytes` | `cache` | Bytes a page cache's memory level holds after evictions: the lookup cache against its part of `server.cache_bytes`, the scan cache against `server.scan_page_cache_bytes`. |
-| `icetray_row_cache_bytes` | | Bytes the row cache holds after evictions: each entry's value at its allocation size plus the per-entry overhead. |
+| `icetray_row_cache_bytes` | | Bytes the row cache holds after evictions: each entry's value at its allocation size plus the per-entry overhead. It stays about a sixteenth below the row cache's part of the budget, which is reserved for the keys of rows evicted recently, so a row read again soon after its eviction is kept longer. |
 | `icetray_config_pending` | | 1 while the configuration file differs from the configuration applied, else 0. |
 | `icetray_process_rss_bytes` | | The process's resident set size. |
 | `icetray_allocator_allocated_bytes`, `_active_bytes`, `_metadata_bytes`, `_resident_bytes`, `_retained_bytes` | | jemalloc's own counts, which split the resident set. `allocated` is live data; `active` minus `allocated` is free space inside pages in use; `resident` minus `active` and `metadata` is freed memory not yet returned to the operating system; `retained` is address space only. |

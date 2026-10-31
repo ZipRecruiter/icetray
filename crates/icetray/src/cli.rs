@@ -700,6 +700,7 @@ impl Target {
                 lookups: None,
                 residency: self.residency,
                 resident_budget_bytes: None,
+                row_cache: None,
             }],
         }
     }
@@ -770,6 +771,7 @@ mod tests {
                 lookups: None,
                 residency: Residency::Full,
                 resident_budget_bytes: None,
+                row_cache: None,
             }]
         );
     }

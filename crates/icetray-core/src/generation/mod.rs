@@ -48,6 +48,7 @@ use crate::manifest::{self, Bucketing, DataFileEntry, DeleteFileEntry, TableLayo
 use crate::metric::LookupResult;
 use crate::order::ScanBounds;
 use crate::parquet_io::{FileHandle, Segments};
+use crate::row_cache::{Cached, RowCache};
 use crate::scan::{self, Scanned};
 use crate::shard;
 use crate::snapshot::{SequenceNumber, SnapshotId};
@@ -539,32 +540,41 @@ impl Generation {
     /// the candidates are probed in probe order and the first whose `find`
     /// answers with a row its file's deletes do not remove gives the row,
     /// checked against the deletes once whatever the columns (RFD 021); a
-    /// deleted row is passed over with no value page read. The row's value
-    /// page of each column named is read through `cache`, every column's
-    /// read at once, each a GET of its own, hedged on its own (RFD 013,
-    /// RFD 022); a row of a file written before a column was added answers
-    /// that column's default and reads no page of it (RFD 023). No column
-    /// named answers presence alone and reads no value page. `Present`
-    /// carries one value per column named, each its bytes or `None` for a
-    /// null; `Absent` is a key no candidate holds. The GET cost is the
-    /// index's: in the Full tier one GET per column named for a cold hit,
-    /// two for a dictionary-encoded column, none for a warm hit, a default,
-    /// presence alone, or a miss. Each GET the lookup issues, a Bloom-tier
-    /// key page's included, holds one permit of `fan_out`, the batch's,
-    /// while it runs, and each GET of a value or dictionary page of the
-    /// column at position `c` is counted under `value_gets[c]` as it is
-    /// issued, where `value_gets` has it (`Issue`).
-    /// The label is `Miss` for an absent key; for a present one,
-    /// `ColdHit` when a value or dictionary page of a column named came
-    /// from outside the cache (a fetch this lookup ran or joined) and
-    /// `WarmHit` otherwise, a hit that read no value page included. Only
-    /// the columns' pages decide it; a key-page GET in the Bloom tier does
-    /// not.
+    /// deleted row is passed over with no value page read. Then each column
+    /// named is read from `rows`, the row cache, when given (RFD 026), at
+    /// the key of the file, the row, and the column's leaf there
+    /// (`FileIndex::row_key`), so the index has chosen the file and row,
+    /// and the deletes have spoken, before the cache is asked: a row
+    /// deleted or rewritten into another file is never served from it. A
+    /// column the row cache lacks is read from the row's value page through
+    /// `cache`, every such column's read at once, each a GET of its own,
+    /// hedged on its own (RFD 013, RFD 022), and its value, or its null, is
+    /// inserted into `rows`; a row of a file written before a column was
+    /// added answers that column's default, reads no page of it, and uses
+    /// no entry (RFD 023). No column named answers presence alone and
+    /// reads no value page. `Present` carries one value per column named,
+    /// each its bytes or `None` for a null; `Absent` is a key no candidate
+    /// holds. The GET cost is the index's: in the Full tier one GET per
+    /// column named for a cold hit, two for a dictionary-encoded column,
+    /// none for a warm hit, a row-cache hit, a default, presence alone, or
+    /// a miss; the key is resolved the same way on a row-cache hit, a key
+    /// page read in the Bloom tier. Each GET the lookup issues, a
+    /// Bloom-tier key page's included, holds one permit of `fan_out`, the
+    /// batch's, while it runs, and each GET of a value or dictionary page
+    /// of the column at position `c` is counted under `value_gets[c]` as it
+    /// is issued, where `value_gets` has it (`Issue`); a row-cache hit
+    /// takes no permit. The label is `Miss` for an absent key; for a
+    /// present one, `ColdHit` when a value or dictionary page of a column
+    /// named came from outside the cache (a fetch this lookup ran or
+    /// joined) and `WarmHit` otherwise, a hit that read no value page, a
+    /// row-cache hit among them, included. Only the columns' pages decide
+    /// it; a key-page GET in the Bloom tier does not.
     pub(crate) async fn lookup(
         &self,
         key: &Key,
         columns: &[usize],
         cache: &PageCache,
+        rows: Option<&RowCache>,
         fan_out: Option<&Arc<Semaphore>>,
         value_gets: &[Counter],
     ) -> Result<(Row, LookupResult)> {
@@ -578,6 +588,14 @@ impl Generation {
                     continue;
                 }
                 let reads = columns.iter().map(|&column| async move {
+                    let cached = rows.zip(file.index.row_key(column, row));
+                    if let Some((row_cache, row_key)) = &cached {
+                        match row_cache.get(row_key) {
+                            Cached::Value(bytes) => return Ok((Some(bytes), false)),
+                            Cached::Null => return Ok((None, false)),
+                            Cached::Absent => {}
+                        }
+                    }
                     let issue = Issue {
                         fan_out,
                         counted: value_gets.get(column),
@@ -588,7 +606,12 @@ impl Generation {
                             .read_column(column, row, Some(cache), issue)
                             .await?
                         {
-                            Some(read) => (read.value, read.from_store),
+                            Some(read) => {
+                                if let Some((row_cache, row_key)) = cached {
+                                    row_cache.insert(row_key, read.value.as_deref());
+                                }
+                                (read.value, read.from_store)
+                            }
                             None => (self.layout.value_columns[column].default.clone(), false),
                         },
                     )
@@ -682,7 +705,7 @@ impl Generation {
         key: &Key,
         cache: &PageCache,
     ) -> Result<(Row, LookupResult)> {
-        self.lookup(key, &[0], cache, None, &[]).await
+        self.lookup(key, &[0], cache, None, None, &[]).await
     }
 
     /// Which file and page each key would reach; the oracle for cost tests.
@@ -2656,11 +2679,14 @@ pub(crate) mod testing {
         /// Rows per row group; `None` leaves the writer's default, one row
         /// group for every fixture this size.
         pub(crate) row_group_rows: Option<usize>,
+        /// The pages' compression; uncompressed pages are decoded in place,
+        /// so a value read from one is a slice of the page.
+        pub(crate) compression: Compression,
     }
 
     impl WriterLayout {
         /// RFD 002's shape: contract pages, no dictionary, a whole column
-        /// index, a sized filter.
+        /// index, a sized filter, zstd pages.
         pub(crate) fn contract() -> Self {
             Self {
                 page_rows: page_rows(),
@@ -2668,6 +2694,7 @@ pub(crate) mod testing {
                 column_index_truncate: None,
                 bloom: Bloom::Sized,
                 row_group_rows: None,
+                compression: Compression::ZSTD(ZstdLevel::default()),
             }
         }
 
@@ -2678,7 +2705,7 @@ pub(crate) mod testing {
                 .set_data_page_row_count_limit(self.page_rows)
                 .set_write_batch_size(self.page_rows)
                 .set_column_index_truncate_length(self.column_index_truncate)
-                .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                .set_compression(self.compression)
                 .set_bloom_filter_enabled(false)
                 .set_max_row_group_row_count(self.row_group_rows);
             let builder = with_dictionary(builder, self.dictionary);
@@ -3052,6 +3079,7 @@ pub(crate) mod testing {
                 lookups: None,
                 residency,
                 resident_budget_bytes: budget,
+                row_cache: None,
             }
         }
 
@@ -5196,7 +5224,7 @@ mod tests {
         );
         let value = value_for(all[0]);
         let (row, _) = generation
-            .lookup(&Key::Long(all[0]), &[1, 0], &cache().await, None, &[])
+            .lookup(&Key::Long(all[0]), &[1, 0], &cache().await, None, None, &[])
             .await
             .unwrap();
         assert_ne!(testing::detail_of(&value), value, "the columns differ");
@@ -5227,7 +5255,7 @@ mod tests {
         let second = planned.build(None).await.unwrap();
         let value = value_for(all[0]);
         let (row, _) = second
-            .lookup(&Key::Long(all[0]), &[0, 1], &cache().await, None, &[])
+            .lookup(&Key::Long(all[0]), &[0, 1], &cache().await, None, None, &[])
             .await
             .unwrap();
         assert_eq!(

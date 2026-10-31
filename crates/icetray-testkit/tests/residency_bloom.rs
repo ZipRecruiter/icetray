@@ -121,6 +121,38 @@ async fn test_bloom_cold_hit_is_two_gets_warm_none() -> Result<()> {
     Ok(())
 }
 
+/// A Bloom-tier row-cache hit still resolves its key: with the page cache
+/// emptied, it reads the key page, and no value page (RFD 026).
+#[tokio::test]
+async fn test_a_bloom_row_cache_hit_still_reads_its_key_page() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let fixture = write_fixture(
+        catalog.as_ref(),
+        NAMESPACE,
+        FixtureSpec::small("kv_bloom_row_cache", KeyType::Long),
+    )
+    .await?;
+    let served = verify::serve_reading_rows(
+        fixture.config(Residency::Bloom, false),
+        fixture.catalog_source(Arc::clone(&catalog)),
+    )
+    .await?;
+    let full = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
+    let keys = fixture.keys_at(&SAMPLE);
+    assert!(
+        full.current().overlapping_buckets().is_empty(),
+        "one candidate per key"
+    );
+    let key_pages = verify::expected_key_pages(&full.current(), &keys);
+    let value_pages = verify::expected_cold_gets(&full.current(), &keys, &[VALUE_COLUMN])?;
+    let cold = verify::verify_hits(&served, &fixture, &SAMPLE).await?;
+    assert_eq!(cold, key_pages + value_pages, "a key page and a value page");
+    served.cache.clear();
+    let hit = verify::verify_hits(&served, &fixture, &SAMPLE).await?;
+    assert_eq!(hit, key_pages, "the key pages alone");
+    Ok(())
+}
+
 /// The Full-tier oracle names value pages from resident key pages; a Bloom
 /// generation holds none, and the oracle says so rather than guessing.
 #[tokio::test]

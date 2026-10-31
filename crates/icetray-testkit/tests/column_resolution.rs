@@ -505,6 +505,49 @@ async fn test_a_default_answer_is_counted_a_warm_hit() -> Result<()> {
     Ok(())
 }
 
+/// A lookup answering presence alone, and a column a file written before
+/// it was added answers by its default, read no page and use no row-cache
+/// entry, while a column the file holds does (RFD 026).
+#[tokio::test]
+async fn test_a_default_and_presence_alone_use_no_entry() -> Result<()> {
+    let (_dir, mut fixture) =
+        two_bucket_fixture("kv_added_row_cache", FormatVersion::V2, false).await?;
+    add_column_then_rows(&mut fixture, StatedDefault::None).await?;
+    let config = root_entry(
+        &fixture,
+        &[VALUE_COLUMN, SECOND_VALUE_COLUMN],
+        Residency::Full,
+    );
+    let source = TableSource::from_config(&config.source).await?;
+    let served = verify::serve_reading_rows(config, source).await?;
+    let rows = served.row_cache.as_ref().expect("served reading rows");
+    let key = fixture.key(FIRST_BUILD_SAMPLE[0]);
+    assert_eq!(
+        served.table.get(&key, &[]).await?.row,
+        Row::Present(Vec::new())
+    );
+    assert_eq!(
+        served
+            .table
+            .get(&key, &[ColumnRead::whole(SECOND_VALUE_COLUMN)])
+            .await?
+            .row,
+        Row::Present(vec![None]),
+        "the default, a null"
+    );
+    assert_eq!(rows.usage(), 0, "neither uses an entry");
+    assert_eq!(
+        served
+            .table
+            .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
+        fixture.expected(&key)
+    );
+    assert!(rows.usage() > 0, "a column the file holds does");
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_a_column_added_with_a_v3_initial_default_answers_its_bytes() -> Result<()> {
     let (_dir, mut fixture) = two_bucket_fixture("kv_default", FormatVersion::V3, false).await?;

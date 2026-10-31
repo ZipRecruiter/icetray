@@ -663,6 +663,7 @@ pub fn table_config(warehouse: &str, table: GoldenTable, strict: bool) -> TableC
         lookups: None,
         residency: Residency::Full,
         resident_budget_bytes: None,
+        row_cache: None,
     }
 }
 

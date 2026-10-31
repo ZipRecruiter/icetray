@@ -202,6 +202,7 @@ mod tests {
             lookups: None,
             residency: Residency::Full,
             resident_budget_bytes: None,
+            row_cache: None,
         };
         let mut config = Config {
             server: ServerConfig::default(),

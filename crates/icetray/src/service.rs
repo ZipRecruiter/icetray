@@ -1532,6 +1532,7 @@ mod tests {
             lookups: None,
             residency: icetray_core::Residency::Full,
             resident_budget_bytes: None,
+            row_cache: None,
         };
         let wire: Vec<(String, i32, u32, i32)> = value_columns_wire(&layout, &entry)
             .into_iter()

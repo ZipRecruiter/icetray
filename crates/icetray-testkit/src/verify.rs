@@ -17,8 +17,8 @@ use icetray_core::approx::count;
 use icetray_core::config::{HedgeConfig, LocalConfig, ServerConfig, StorageConfig, TableConfig};
 use icetray_core::{
     CallsInFlight, Error, FindingLog, Generation, Key, LocalDir, OrderValue, PageCache,
-    RefusalReason, Residency, Row, ScanBounds, ScanRow, Scanned, Storage, Table, TableHandles,
-    TableSource,
+    RefusalReason, Residency, Row, RowCache, ScanBounds, ScanRow, Scanned, Storage, Table,
+    TableHandles, TableSource,
 };
 
 use crate::error::{Precondition, Result};
@@ -63,6 +63,11 @@ pub struct Served {
     /// ordered table's Scans read through and a key-value table never
     /// touches.
     pub scan_cache: PageCache,
+    /// The row cache the table reads through (RFD 026) when it was built
+    /// by `build_reading_rows`; `None` for every other table, whose lookups
+    /// read every value from its page, so the GET oracles count what a
+    /// lookup's pages cost.
+    pub row_cache: Option<RowCache>,
     /// The table.
     pub table: Table,
 }
@@ -99,6 +104,32 @@ pub async fn build(
     local: Option<Arc<LocalDir>>,
     cache_bytes: usize,
 ) -> Result<Served> {
+    build_with(storage, config, source, local, cache_bytes, None).await
+}
+
+/// `build` with a row cache of `cache_bytes` beside the page cache, which
+/// a key-value table whose entry has `row_cache` on reads through: what the
+/// row-cache tests serve over.
+pub async fn build_reading_rows(
+    storage: Arc<Storage>,
+    config: TableConfig,
+    source: TableSource,
+    local: Option<Arc<LocalDir>>,
+    cache_bytes: usize,
+) -> Result<Served> {
+    let row_cache = RowCache::new(count(cache_bytes));
+    build_with(storage, config, source, local, cache_bytes, Some(row_cache)).await
+}
+
+/// `build` with `row_cache` in the table's handles.
+async fn build_with(
+    storage: Arc<Storage>,
+    config: TableConfig,
+    source: TableSource,
+    local: Option<Arc<LocalDir>>,
+    cache_bytes: usize,
+    row_cache: Option<RowCache>,
+) -> Result<Served> {
     let cache = PageCache::new(
         cache_bytes,
         local.as_ref().and_then(|local| local.page_cache_level()),
@@ -109,7 +140,7 @@ pub async fn build(
     let handles = TableHandles {
         storage: Arc::clone(&storage),
         cache: cache.clone(),
-        row_cache: None,
+        row_cache: row_cache.clone(),
         local,
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
@@ -131,6 +162,7 @@ pub async fn build(
         storage,
         cache,
         scan_cache,
+        row_cache,
         table,
     })
 }
@@ -229,6 +261,22 @@ pub async fn serve_over(
         .await?
         .load()
         .await
+}
+
+/// `build_reading_rows` of `config` from `source` over a fresh hedge-free
+/// storage (`storage_config_for_tests`) with no local directory and a
+/// `TEST_PAGE_CACHE_BYTES` page cache and row cache, loaded.
+pub async fn serve_reading_rows(config: TableConfig, source: TableSource) -> Result<Served> {
+    build_reading_rows(
+        Arc::new(Storage::new(storage_config_for_tests())),
+        config,
+        source,
+        None,
+        TEST_PAGE_CACHE_BYTES,
+    )
+    .await?
+    .load()
+    .await
 }
 
 /// `serve_over` a fresh `Storage::new(storage)` with no local directory.

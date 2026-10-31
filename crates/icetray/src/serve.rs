@@ -888,7 +888,8 @@ async fn page_cache_loop(opened: Arc<Opened>) -> Infallible {
 
 #[cfg(test)]
 mod tests {
-    use icetray_core::config::{FALLBACK_CACHE_BYTES, SourceConfig, StorageConfig, TableConfig};
+    use icetray_core::budget;
+    use icetray_core::config::{SourceConfig, StorageConfig, TableConfig};
     use icetray_core::memory::LimitSource;
     use icetray_core::{CallsInFlight, PageCache, RowCache, TableHandles, TableSource};
     use tokio::sync::oneshot;
@@ -956,9 +957,12 @@ mod tests {
         );
     }
 
-    /// A table in `residency`, never loaded.
+    /// A table in `residency`, never loaded, over the default cache budget
+    /// split as a server with a table reading rows splits it.
     async fn table_in(residency: Residency) -> Arc<Table> {
         let server = ServerConfig::default();
+        let page_cache_shards = 1;
+        let budget = budget::resolve(&server, None, true, page_cache_shards).unwrap();
         let source = SourceConfig::Static {
             location: "file:///nowhere".to_string(),
         };
@@ -974,13 +978,14 @@ mod tests {
             lookups: None,
             residency,
             resident_budget_bytes: None,
+            row_cache: None,
         };
         let handles = TableHandles {
             storage: Arc::new(Storage::new(StorageConfig::default())),
-            cache: PageCache::new(approx::length(FALLBACK_CACHE_BYTES), None)
+            cache: PageCache::new(approx::length(budget.page_bytes), None)
                 .await
                 .unwrap(),
-            row_cache: Some(RowCache::new(FALLBACK_CACHE_BYTES)),
+            row_cache: Some(RowCache::new(budget.row_bytes)),
             local: None,
             calls: CallsInFlight::new(),
             findings: FindingLog::Debug,

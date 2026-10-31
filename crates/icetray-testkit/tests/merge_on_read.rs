@@ -237,6 +237,43 @@ async fn gets_during<T>(served: &Served, work: impl Future<Output = T>) -> (T, u
     (out, stats.gets() - before)
 }
 
+/// A row cached before a position delete removes it is not served after
+/// the refresh that applies the delete: a lookup checks the row against
+/// its file's deletes before it asks the row cache (RFD 026), and the
+/// entry itself is never invalidated.
+#[tokio::test]
+async fn test_a_deleted_row_is_not_served_from_the_row_cache_after_refresh() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let mut fixture = fixture(catalog.as_ref(), "kv_row_cache_delete").await?;
+    fixture.write_hint().await?;
+    let source = fixture.root_source();
+    let served = verify::serve_reading_rows(
+        TableConfig {
+            source: source.clone(),
+            ..fixture.config(Residency::Full, false)
+        },
+        TableSource::from_config(&source).await?,
+    )
+    .await?;
+    let id = FIRST_FILE_IDS[0];
+    let key = fixture.key(id);
+    let read = [ColumnRead::whole(VALUE_COLUMN)];
+    assert_eq!(
+        served.table.get(&key, &read).await?.row,
+        fixture.expected(&key)
+    );
+    let rows = served.row_cache.as_ref().expect("served reading rows");
+    let cached = rows.usage();
+    assert!(cached > 0, "the row is cached");
+    fixture
+        .delete(&[id], DeleteForm::Positions, "deleted")
+        .await?;
+    assert!(served.table.refresh().await?);
+    assert_eq!(served.table.get(&key, &read).await?.row, Row::Absent);
+    assert_eq!(rows.usage(), cached, "the entry stays, never asked for");
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_each_delete_kind_is_served_in_every_tier() -> Result<()> {
     let forms = [

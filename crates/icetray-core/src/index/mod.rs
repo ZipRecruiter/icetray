@@ -46,6 +46,7 @@ use crate::local::{ChunkRules, DataFileIdentity, DiskChunks};
 use crate::manifest::TableLayout;
 use crate::order::OrderFacts;
 use crate::parquet_io::{FileHandle, Segments};
+use crate::row_cache::RowKey;
 use build::{check_utf8, checked_values, decode_run, fetch_chunk_parts};
 pub(crate) use inspect::Inspected;
 use inspect::{Layout, ResidentSet, column_chunk_ranges, kept_footer, tiers};
@@ -1543,6 +1544,16 @@ impl FileIndex {
             row_group,
             row: self.key_column().group(row_group).page_rows(page).start,
         })
+    }
+
+    /// The row cache's key of value column `column`, a position in the
+    /// table's layout, at `row` (RFD 026): the file's id, the row's
+    /// position, and the column's leaf in the file. `None` for a file that
+    /// does not hold the column (`value_leaf`), which answers it by its
+    /// default and reads no page of it.
+    pub(crate) fn row_key(&self, column: usize, row: RowRef) -> Option<RowKey> {
+        self.value_leaf(column)
+            .map(|leaf| RowKey::new(self.handle.file_id(), self.position(row), leaf))
     }
 
     /// The position of `row` in the file: the rows of every earlier row

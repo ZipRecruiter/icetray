@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use iceberg::spec::{DataFileFormat, Struct};
 use icetray_core::ColumnRead;
 use icetray_core::approx;
@@ -26,7 +27,7 @@ use icetray_testkit::fixture::{
     NEWEST_SAMPLE, OLD_ID, OVERLAPPING_APPEND, SAMPLE_4K, SECOND_CLASS, TAIL, THIRD_CLASS,
     THREE_FILES, TWO_BUCKETS, TWO_FILES, data_file_entry, local_catalog, residue_class,
 };
-use icetray_testkit::keys::FIRST_VERSION;
+use icetray_testkit::keys::{FIRST_VERSION, value_of_version};
 use icetray_testkit::layout::VALUE_COLUMN;
 use icetray_testkit::verify::{
     self, HINT_POLL_GETS, LOAD_GETS_PER_FILE, LOAD_METADATA_GETS, METADATA_FILE_GETS, Served,
@@ -139,6 +140,120 @@ async fn test_refresh_follows_the_catalog_and_reuses_files() -> Result<()> {
             .row,
         fixture.expected(&old_key)
     );
+    Ok(())
+}
+
+/// `fixture` served in the Full tier from its root, through the hint,
+/// reading through a row cache (`verify::serve_reading_rows`).
+async fn serve_root_reading_rows(fixture: &Fixture) -> Result<Served> {
+    let source = fixture.root_source();
+    verify::serve_reading_rows(
+        TableConfig {
+            source: source.clone(),
+            ..fixture.config(Residency::Full, false)
+        },
+        TableSource::from_config(&source).await?,
+    )
+    .await
+}
+
+/// A row cached from one file and rewritten into another by a
+/// copy-on-write commit with a new value is read from the new file after
+/// the refresh: the cache is keyed by file, so the new file's row is a
+/// miss, though it sits at the same position (RFD 026).
+#[tokio::test]
+async fn test_a_rewritten_row_is_read_from_its_new_file() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        ids: IDS_4K,
+        ..FixtureSpec::small("kv_row_cache_rewrite", KeyType::Long)
+    };
+    let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    fixture.write_hint().await?;
+    let served = serve_root_reading_rows(&fixture).await?;
+    let key = fixture.key(OLD_ID);
+    let read = [ColumnRead::whole(VALUE_COLUMN)];
+    let old = served.table.get(&key, &read).await?.row;
+    assert_eq!(old, fixture.expected(&key));
+    let rows = served.row_cache.as_ref().expect("served reading rows");
+    assert!(rows.usage() > 0, "the row is cached");
+
+    let ids: Vec<u64> = fixture.ids().collect();
+    let next = FIRST_VERSION + 1;
+    let rewritten = fixture.write_rows(&ids, next, "rewritten").await?;
+    fixture
+        .commit_by_hand(HandSnapshot {
+            data: rewritten,
+            deletes: Vec::new(),
+        })
+        .await?;
+    assert!(served.table.refresh().await?);
+    let generation = served.current();
+    let (file, _) = generation.plan(std::slice::from_ref(&key))[0]
+        .clone()
+        .expect("the plan names the key's file");
+    assert!(
+        fixture
+            .files()
+            .iter()
+            .any(|data| data.file_path() == file.entry.path),
+        "the key is read from a rewritten file"
+    );
+    let spec = fixture.spec();
+    let new = Row::Present(vec![Some(Bytes::from(value_of_version(
+        &key,
+        spec.value_bytes,
+        spec.value_kind,
+        next,
+    )))]);
+    assert_ne!(new, old, "the rewrite changed the value");
+    assert_eq!(served.table.get(&key, &read).await?.row, new);
+    Ok(())
+}
+
+/// A refresh that appends a file keeps the entries of the files it reuses:
+/// a row cached before it is a row-cache hit after it, which reads no
+/// value page with the page cache emptied (RFD 026).
+#[tokio::test]
+async fn test_a_reused_file_keeps_its_entries_across_refresh() -> Result<()> {
+    let (_dir, catalog) = local_catalog().await?;
+    let spec = FixtureSpec {
+        ids: IDS_4K,
+        ..FixtureSpec::small("kv_row_cache_reuse", KeyType::Long)
+    };
+    let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
+    let served = verify::serve_reading_rows(
+        fixture.config(Residency::Full, false),
+        fixture.catalog_source(Arc::clone(&catalog)),
+    )
+    .await?;
+    let key = fixture.key(OLD_ID);
+    let read = [ColumnRead::whole(VALUE_COLUMN)];
+    assert_eq!(
+        served.table.get(&key, &read).await?.row,
+        fixture.expected(&key)
+    );
+    let v1 = served.current();
+
+    fixture
+        .append(catalog.as_ref(), APPENDED_4K_6K, "build2")
+        .await?;
+    assert!(served.table.refresh().await?);
+    let v2 = served.current();
+    assert!(
+        v1.files
+            .iter()
+            .all(|old| v2.files.iter().any(|now| Arc::ptr_eq(old, now))),
+        "every file of the first generation is reused"
+    );
+    served.cache.clear();
+    let stats = served.storage.stats();
+    let before = stats.gets();
+    assert_eq!(
+        served.table.get(&key, &read).await?.row,
+        fixture.expected(&key)
+    );
+    assert_eq!(stats.gets() - before, 0, "no value page is read");
     Ok(())
 }
 

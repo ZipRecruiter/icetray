@@ -510,6 +510,10 @@ struct Lookups {
     /// The process's page cache, through a handle whose fetches end at the
     /// table's `get_deadline`.
     cache: PageCache,
+    /// The process's row cache, when the table's entry has `row_cache` on
+    /// (`TableConfig::row_cache`); `None` reads every value from its page.
+    /// A change of the setting builds the table anew, so it is fixed here.
+    row_cache: Option<RowCache>,
     metrics: LookupMetrics,
     /// The calls in flight on every table sharing the table's handles, its
     /// own among them.
@@ -557,12 +561,14 @@ impl Lookups {
     }
 
     /// One lookup through `generation` reading the value columns
-    /// `selection` names, timed and counted under its result, each value or
-    /// dictionary page GET it issues counted under its column's
-    /// `value_page_gets_total` and, in a batch, holding a permit of
-    /// `fan_out` while it runs (`Generation::lookup`), then each value a
-    /// read names fields of trimmed to them (`trim`); the one path `get`
-    /// and `multi_get` share.
+    /// `selection` names, each from the row cache when the table reads
+    /// through one and from its page otherwise, timed and counted under its
+    /// result, each value or dictionary page GET it issues counted under
+    /// its column's `value_page_gets_total` and, in a batch, holding a
+    /// permit of `fan_out` while it runs (`Generation::lookup`), then each
+    /// value a read names fields of trimmed to them (`trim`), after the row
+    /// cache, so callers naming different fields share one entry; the one
+    /// path `get` and `multi_get` share.
     async fn one(
         &self,
         generation: &Generation,
@@ -576,6 +582,7 @@ impl Lookups {
                 key,
                 &selection.positions,
                 &self.cache,
+                self.row_cache.as_ref(),
                 fan_out,
                 &self.metrics.value_page_gets,
             )
@@ -586,12 +593,13 @@ impl Lookups {
     }
 
     /// `row` with each value a read of `selection` names fields of trimmed
-    /// to them (RFD 024), after the page cache, so the pages stay whole for
-    /// every caller; a null stays null and a value holding none of the
-    /// fields is empty. The bytes each column read and returned are counted
-    /// for an answered lookup alone, a null as none. A malformed value
-    /// fails the lookup as `Error::MalformedValue` and counts one
-    /// `projection_errors_total` for its column.
+    /// to them (RFD 024), after the page cache and the row cache, so pages
+    /// and entries stay whole for every caller; a null stays null and a
+    /// value holding none of the fields is empty. The bytes each column
+    /// read and returned are counted for an answered lookup alone, a null
+    /// as none. A malformed value fails the lookup as
+    /// `Error::MalformedValue` and counts one `projection_errors_total` for
+    /// its column.
     fn trim(
         &self,
         generation: &Generation,
@@ -1228,7 +1236,7 @@ impl Table {
         let TableHandles {
             storage,
             cache,
-            row_cache: _,
+            row_cache,
             local,
             calls,
             findings,
@@ -1247,6 +1255,7 @@ impl Table {
         });
         let lookups = Arc::new(Lookups {
             cache: cache.with_fetch_deadline(get_deadline),
+            row_cache: row_cache.filter(|_| config.row_cache()),
             metrics: LookupMetrics::new(&config.name, &config.value_column_names()),
             in_flight: calls,
             batch_fan_out: batch_fan_out.min(Semaphore::MAX_PERMITS),
@@ -1529,13 +1538,16 @@ impl Table {
     }
 
     /// One lookup against the serving generation, reading the value
-    /// columns `columns` names, answered in that order, each value trimmed
-    /// to the fields its read names (RFD 024); none answers presence alone
-    /// (RFD 022). Refused before any read, in this order: the faults
-    /// `check_column_reads` names, a column named twice or a field list out
-    /// of range or with a number named twice, whatever the table holds;
-    /// `Error::WrongTableKind` on an ordered table, which `scan` serves (RFD
-    /// 025), whether or not it has loaded; `Error::NotReady` with no
+    /// columns `columns` names, answered in that order, each from the row
+    /// cache when the table's entry has `row_cache` on and the cache holds
+    /// it (RFD 026) and from its value page otherwise, and each value
+    /// trimmed to the fields its read names (RFD 024); none answers
+    /// presence alone (RFD 022). Refused before any read, in this order:
+    /// the faults `check_column_reads` names, a column named twice or a
+    /// field list out of range or with a number named twice, whatever the
+    /// table holds; `Error::WrongTableKind` on an ordered table, which
+    /// `scan` serves (RFD 025), whether or not it has loaded;
+    /// `Error::NotReady` with no
     /// generation; `Error::KeyType` for a key of another type than the
     /// table's; and `Error::ColumnRequest` for a column the generation does
     /// not serve or a field list the entry's format for it does not take
@@ -2872,6 +2884,7 @@ mod tests {
     use crate::metric::LookupResult;
     use crate::order::{Direction, OrderValue, OrderVariant};
     use crate::projection::MAX_FIELD_NUMBER;
+    use crate::row_cache::weigh;
     use crate::scan::{BoundSide, Fits, ScanRequestFault, ScanRow, check_scan_request};
     use crate::storage::testing::{DEADLINE_GUARD, Gauged, STALL};
     use crate::storage::{FILE_PREFIX, LocationError, LocationFault};
@@ -5725,6 +5738,245 @@ mod tests {
             panic!("the key is present");
         };
         values[0].as_ref().map(Bytes::len)
+    }
+
+    /// A loaded table of `fixture` under `config` reading through a row
+    /// cache of its own, which comes back beside it with the page cache
+    /// the table reads through.
+    async fn table_reading_rows(
+        fixture: &Fixture,
+        config: TableConfig,
+    ) -> (Table, RowCache, PageCache) {
+        let rows = RowCache::new(approx::count(testing::CACHE_BYTES));
+        let handles = TableHandles {
+            row_cache: Some(rows.clone()),
+            ..handles_over(fixture).await
+        };
+        let pages = handles.cache.clone();
+        let defaults = ServerConfig::default();
+        let table = table_sharing(
+            fixture,
+            config,
+            handles,
+            defaults.load_deadline,
+            defaults.refresh_deadline,
+        );
+        table.load().await.unwrap();
+        (table, rows, pages)
+    }
+
+    /// The one value a lookup naming one column answers.
+    fn only_value(row: Row) -> Option<Bytes> {
+        let Row::Present(mut values) = row else {
+            panic!("the key is present");
+        };
+        assert_eq!(values.len(), 1, "one column named");
+        values.remove(0)
+    }
+
+    /// The lookups `series` counts under `result` for the fixture's table.
+    fn lookups_counted(series: &Series, result: LookupResult) -> u64 {
+        series.counter(
+            metric::LOOKUPS_TOTAL,
+            &[table_label(), (metric::LABEL_RESULT, result.to_string())],
+        )
+    }
+
+    /// A repeated Get is served from the row cache: with the page cache
+    /// emptied between the two, the second reads no value page and is a
+    /// warm hit (RFD 026).
+    #[test]
+    fn test_a_row_cache_hit_reads_no_value_page() {
+        let (gets, series) = recorded(async {
+            let fixture = one_file_fixture(WriterLayout::contract()).await;
+            let (table, rows, pages) = table_reading_rows(&fixture, lenient(&fixture)).await;
+            let first = keys_from(0, FILE_KEYS)[0];
+            let read = [ColumnRead::whole(VALUE_COLUMN)];
+            let key = Key::Long(first);
+            assert_eq!(table.get(&key, &read).await.unwrap().row, present(first));
+            assert!(rows.usage() > 0, "the value was cached");
+            pages.clear();
+            let before = fixture.gets();
+            assert_eq!(table.get(&key, &read).await.unwrap().row, present(first));
+            table.publish_lookup_counts();
+            fixture.gets() - before
+        });
+        assert_eq!(gets, 0, "no value page is read");
+        assert_eq!(lookups_counted(&series, LookupResult::ColdHit), 1);
+        assert_eq!(lookups_counted(&series, LookupResult::WarmHit), 1);
+    }
+
+    /// The value a hit answers from the row cache is a copy of its own,
+    /// outside the page it was read from, though a value read from an
+    /// uncompressed page is a slice of it, so the cache keeps no page
+    /// alive.
+    #[tokio::test]
+    async fn test_a_cached_value_owns_its_bytes() {
+        let fixture = one_file_fixture(WriterLayout {
+            compression: parquet::basic::Compression::UNCOMPRESSED,
+            ..WriterLayout::contract()
+        })
+        .await;
+        let (table, _rows, pages) = table_reading_rows(&fixture, lenient(&fixture)).await;
+        let first = keys_from(0, FILE_KEYS)[0];
+        let key = Key::Long(first);
+        let read = [ColumnRead::whole(VALUE_COLUMN)];
+        let missed = only_value(table.get(&key, &read).await.unwrap().row).unwrap();
+        let generation = table.current().unwrap();
+        let (file, page_ref) = generation.plan(std::slice::from_ref(&key))[0]
+            .clone()
+            .unwrap();
+        let offset = file.index.value_page_offset(0, &page_ref).unwrap();
+        let page = pages
+            .held_page(file.index.handle().file_id(), offset)
+            .expect("the value page is in memory");
+        let within_page = |value: &Bytes| page.as_ptr_range().contains(&value.as_ptr());
+        assert!(
+            within_page(&missed),
+            "a value read from an uncompressed page is a slice of it"
+        );
+        let hit = only_value(table.get(&key, &read).await.unwrap().row).unwrap();
+        assert!(!within_page(&hit), "the cached value is a copy");
+        assert_eq!(hit.len(), value_for(first).len());
+        assert_eq!(hit, missed);
+    }
+
+    /// Tables over one source listing their value columns in opposite
+    /// orders, and one listing the value column alone, which a table's
+    /// layout places first where the others place it second, share one row
+    /// cache and each read each column's own bytes: an entry is keyed by
+    /// the column's leaf in the file, not its place in a table's layout.
+    #[tokio::test]
+    async fn test_tables_listing_columns_in_another_order_read_their_own_columns() {
+        const VALUE_ALONE_TABLE: &str = "value_alone";
+        let (fixture, all, _gauged) = two_column_fixture(FILE_KEYS, WriterLayout::contract()).await;
+        let rows = RowCache::new(approx::count(testing::CACHE_BYTES));
+        let handles = TableHandles {
+            row_cache: Some(rows.clone()),
+            ..handles_over(&fixture).await
+        };
+        let listed = lenient(&fixture);
+        let reversed = TableConfig {
+            name: STRICT_TABLE.to_string(),
+            value_columns: listed.value_columns.iter().rev().cloned().collect(),
+            ..listed.clone()
+        };
+        let value_alone = TableConfig {
+            name: VALUE_ALONE_TABLE.to_string(),
+            value_columns: vec![ValueColumnConfig::named(VALUE_COLUMN)],
+            ..listed.clone()
+        };
+        let defaults = ServerConfig::default();
+        let tables = [value_alone, listed, reversed].map(|config| {
+            table_sharing(
+                &fixture,
+                config,
+                handles.clone(),
+                defaults.load_deadline,
+                defaults.refresh_deadline,
+            )
+        });
+        for table in &tables {
+            table.load().await.unwrap();
+        }
+        let key = Key::Long(all[0]);
+        let value = value_for(all[0]);
+        let detail = detail_of(&value);
+        for (column, bytes) in [(VALUE_COLUMN, &value), (DETAIL_COLUMN, &detail)] {
+            for table in tables
+                .iter()
+                .filter(|table| table.config().format_of(column).is_some())
+            {
+                assert_eq!(
+                    only_value(
+                        table
+                            .get(&key, &[ColumnRead::whole(column)])
+                            .await
+                            .unwrap()
+                            .row
+                    ),
+                    Some(Bytes::from(bytes.clone())),
+                    "{} reads {column}",
+                    table.name
+                );
+            }
+        }
+        assert_eq!(
+            rows.usage(),
+            weigh(Some(value.len())) + weigh(Some(detail.len())),
+            "one entry per column, shared by every table"
+        );
+    }
+
+    /// Projection trims the value after the row cache: two Gets naming
+    /// different fields answer different bytes from one entry holding the
+    /// whole value (RFD 024).
+    #[tokio::test]
+    async fn test_projection_trims_the_cached_value() {
+        let (fixture, all) = protobuf_fixture().await;
+        let config = TableConfig {
+            value_columns: vec![ValueColumnConfig::of(VALUE_COLUMN, ValueFormat::Protobuf)],
+            ..lenient(&fixture)
+        };
+        let (table, rows, _pages) = table_reading_rows(&fixture, config).await;
+        let key = Key::Long(all[0]);
+        let (value, key_record) = protobuf_value(all[0]);
+        let trimmed_to = |field: &'static [u32]| {
+            let table = &table;
+            let key = &key;
+            async move {
+                only_value(
+                    table
+                        .get(
+                            key,
+                            &[ColumnRead {
+                                name: VALUE_COLUMN,
+                                fields: field,
+                            }],
+                        )
+                        .await
+                        .unwrap()
+                        .row,
+                )
+                .unwrap()
+            }
+        };
+        let key_field = trimmed_to(&[KEY_FIELD]).await;
+        let filler_field = trimmed_to(&[FILLER_FIELD]).await;
+        assert_eq!(key_field, Bytes::copy_from_slice(&value[..key_record]));
+        assert_eq!(filler_field, Bytes::copy_from_slice(&value[key_record..]));
+        assert_eq!(
+            rows.usage(),
+            weigh(Some(value.len())),
+            "one entry, of the whole value"
+        );
+    }
+
+    /// A table whose entry sets `row_cache = false` reads every value from
+    /// its page: with the page cache emptied, a repeated Get reads its
+    /// value page again and is a cold hit, and the row cache holds nothing.
+    #[test]
+    fn test_row_cache_false_reads_pages_alone() {
+        let ((gets, usage), series) = recorded(async {
+            let fixture = one_file_fixture(WriterLayout::contract()).await;
+            let config = TableConfig {
+                row_cache: Some(false),
+                ..lenient(&fixture)
+            };
+            let (table, rows, pages) = table_reading_rows(&fixture, config).await;
+            let first = keys_from(0, FILE_KEYS)[0];
+            let read = [ColumnRead::whole(VALUE_COLUMN)];
+            let key = Key::Long(first);
+            assert_eq!(table.get(&key, &read).await.unwrap().row, present(first));
+            pages.clear();
+            let before = fixture.gets();
+            assert_eq!(table.get(&key, &read).await.unwrap().row, present(first));
+            table.publish_lookup_counts();
+            (fixture.gets() - before, rows.usage())
+        });
+        assert_eq!(gets, 1, "the value page is read again");
+        assert_eq!(usage, 0);
+        assert_eq!(lookups_counted(&series, LookupResult::ColdHit), 2);
     }
 
     /// Lookups spread over a multi-thread runtime's workers reach

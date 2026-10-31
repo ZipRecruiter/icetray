@@ -81,6 +81,14 @@ impl FileHandle {
         })
     }
 
+    /// The id the caches key the file's pages and rows by: its location as
+    /// the manifest recorded it, which names one file's bytes for as long
+    /// as the file exists, since Iceberg never rewrites a data file in
+    /// place.
+    pub(crate) fn file_id(&self) -> &Arc<str> {
+        &self.file_id
+    }
+
     /// The file's size in bytes, as the manifest recorded it.
     pub(crate) fn size(&self) -> u64 {
         self.size

@@ -97,6 +97,12 @@ const PARSE_CACHE_SHARDS: usize = 1;
 /// `lookups` level serves it and is flagged below its level (RFD 020).
 const DEFAULT_STRICT: bool = false;
 
+/// `row_cache` when a key-value table says nothing: on. Lookups are
+/// expected to be skewed, a small share of keys taking most of them, and a
+/// table whose callers keep their own cache in front of icetray turns it
+/// off (RFD 026).
+const DEFAULT_ROW_CACHE: bool = true;
+
 /// Residency when a table says nothing: `full`, RFD 017's fastest tier, one
 /// GET per hit and none per miss. The other tiers are chosen by the owner
 /// with the doctor's numbers in front of them, never silently. The one home
@@ -480,6 +486,17 @@ pub enum ConfigViolation {
         "tables[{index}].max_scan_rows is set, but the table sets no order_column, and only an ordered table is scanned"
     )]
     MaxScanRowsOnKeyValueTable {
+        /// The table's position in `tables`.
+        index: usize,
+    },
+    /// An ordered table sets `row_cache`, to either value: a Scan reads a
+    /// range of rows, which only the index and the pages can say is
+    /// complete, so an ordered table never reads through the row cache
+    /// (RFD 026).
+    #[error(
+        "tables[{index}].row_cache is set, but the table sets an order_column, and only a key-value table reads through the row cache"
+    )]
+    RowCacheOnOrderedTable {
         /// The table's position in `tables`.
         index: usize,
     },
@@ -945,11 +962,11 @@ impl Config {
         Ok(self)
     }
 
-    /// Whether any configured table reads through the row cache: a
-    /// key-value table, one that sets no `order_column`. The row cache's
-    /// part of the budget is zero when none does (`budget::resolve`).
+    /// Whether any configured table reads through the row cache
+    /// (`TableConfig::row_cache`). The row cache's part of the budget is
+    /// zero when none does (`budget::resolve`).
     pub(crate) fn reads_rows(&self) -> bool {
-        self.tables.iter().any(|table| table.order_column.is_none())
+        self.tables.iter().any(TableConfig::row_cache)
     }
 
     /// The settings outside `tables` whose value in `next` differs from
@@ -1168,8 +1185,8 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
 /// keep, value columns listed once each and apart from the key, an order
 /// column apart from both, a `max_scan_rows` only when it has an order
 /// column, above zero and within half of `max_multi_scan_values`, a
-/// `lookups` level its residency reaches, and a source whose settings
-/// `validate_source` accepts.
+/// `row_cache` only when it has none, a `lookups` level its residency
+/// reaches, and a source whose settings `validate_source` accepts.
 fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> {
     let mut names = HashSet::new();
     for (index, table) in config.tables.iter().enumerate() {
@@ -1202,6 +1219,9 @@ fn validate_tables(config: &Config) -> std::result::Result<(), ConfigViolation> 
         }
         table.check_columns(index)?;
         table.check_scan_rows(index, config.server.max_multi_scan_values)?;
+        if table.order_column.is_some() && table.row_cache.is_some() {
+            return Err(ConfigViolation::RowCacheOnOrderedTable { index });
+        }
         table.check_lookups(Some(index))?;
         validate_source(index, &table.source, &config.storage)?;
     }
@@ -1879,8 +1899,9 @@ impl Default for StorageConfig {
 }
 
 /// One served table. Two entries are equal when every setting is, `lookups`
-/// compared as `TableConfig::lookups` resolves it and `max_scan_rows` as
-/// `TableConfig::scan_rows` does, so an entry that spells out a default
+/// compared as `TableConfig::lookups` resolves it, `max_scan_rows` as
+/// `TableConfig::scan_rows` does, and `row_cache` as
+/// `TableConfig::row_cache` does, so an entry that spells out a default
 /// equals one that leaves it out, and `value_columns`
 /// compared as the set of columns it lists, each a name and a format, so a
 /// reordered list is no change.
@@ -1931,6 +1952,11 @@ pub struct TableConfig {
     /// The resident-bytes budget a `full` load is held to (RFD 017); only
     /// that tier takes one.
     pub resident_budget_bytes: Option<u64>,
+    /// Whether a key-value table's lookups read each value through the row
+    /// cache (RFD 026); set only on a key-value table. `None` there takes
+    /// `DEFAULT_ROW_CACHE` (`TableConfig::row_cache`). A change reloads the
+    /// table.
+    pub row_cache: Option<bool>,
 }
 
 /// One column a table serves (RFD 022), written in the file as its name
@@ -2259,6 +2285,13 @@ impl TableConfig {
                 }
     }
 
+    /// Whether the table's lookups read through the row cache: `row_cache`
+    /// or `DEFAULT_ROW_CACHE` when unset, on a key-value table; false on an
+    /// ordered table, whose Scans read pages.
+    pub fn row_cache(&self) -> bool {
+        self.order_column.is_none() && self.row_cache.unwrap_or(DEFAULT_ROW_CACHE)
+    }
+
     /// The most rows one Scan returns, `max_scan_rows` or
     /// `DEFAULT_MAX_SCAN_ROWS` when unset, on an ordered table; `None` on
     /// a key-value table, which is never scanned.
@@ -2347,6 +2380,7 @@ impl PartialEq for TableConfig {
             lookups: _,
             residency,
             resident_budget_bytes,
+            row_cache: _,
         } = self;
         *name == other.name
             && *source == other.source
@@ -2359,6 +2393,7 @@ impl PartialEq for TableConfig {
             && self.lookups() == other.lookups()
             && *residency == other.residency
             && *resident_budget_bytes == other.resident_budget_bytes
+            && self.row_cache() == other.row_cache()
     }
 }
 
@@ -3005,6 +3040,7 @@ value_columns = ["value"]
                 lookups: Some(Level::Balanced),
                 residency: Residency::Full,
                 resident_budget_bytes: Some(FIXTURE_RESIDENT_BUDGET_BYTES),
+                row_cache: None,
             },
             TableConfig {
                 name: "profiles".to_string(),
@@ -3023,6 +3059,7 @@ value_columns = ["value"]
                 lookups: None,
                 residency: Residency::Disk,
                 resident_budget_bytes: None,
+                row_cache: None,
             },
             TableConfig {
                 name: "sessions".to_string(),
@@ -3042,6 +3079,7 @@ value_columns = ["value"]
                 lookups: None,
                 residency: DEFAULT_RESIDENCY,
                 resident_budget_bytes: None,
+                row_cache: None,
             },
             TableConfig {
                 name: "events".to_string(),
@@ -3061,6 +3099,7 @@ value_columns = ["value"]
                 lookups: None,
                 residency: DEFAULT_RESIDENCY,
                 resident_budget_bytes: None,
+                row_cache: None,
             },
         ]
     }
@@ -3891,6 +3930,63 @@ locaton = "typo"
             violation(&text),
             ConfigViolation::MaxScanRowsOnKeyValueTable { index: 0 }
         );
+    }
+
+    /// An ordered table that sets `row_cache` is refused whichever value it
+    /// sets, since its Scans read pages (RFD 026).
+    #[test]
+    fn test_row_cache_on_an_ordered_table_is_refused() {
+        for value in [true, false] {
+            assert_eq!(
+                violation(&ordered(&format!("row_cache = {value}"))),
+                ConfigViolation::RowCacheOnOrderedTable { index: 0 },
+                "row_cache = {value}"
+            );
+        }
+        assert!(
+            Config::parse(&ordered("")).is_ok(),
+            "left unset it is valid"
+        );
+    }
+
+    /// `row_cache` defaults to on for a key-value table, reads off where an
+    /// entry sets it so, and is off for an ordered table; only tables with
+    /// it on read rows, so a server whose one key-value table sets it off
+    /// gives the row cache no part of the budget.
+    #[test]
+    fn test_parse_reads_row_cache_and_its_default() {
+        let defaulted = Config::parse(TOML_MINIMAL).unwrap();
+        assert_eq!(defaulted.tables[0].row_cache, None);
+        assert!(defaulted.tables[0].row_cache());
+        assert!(defaulted.reads_rows());
+        let off =
+            Config::parse(&format!("{}\nrow_cache = false\n", TOML_MINIMAL.trim_end())).unwrap();
+        assert_eq!(off.tables[0].row_cache, Some(false));
+        assert!(!off.tables[0].row_cache());
+        assert!(!off.reads_rows());
+        let ordered = Config::parse(&ordered("")).unwrap();
+        assert!(!ordered.tables[0].row_cache());
+        assert!(!ordered.reads_rows());
+    }
+
+    /// An entry that spells out `row_cache = true` equals one that leaves
+    /// it out, and one that turns it off is a changed entry, which a reload
+    /// loads anew rather than applying in place.
+    #[test]
+    fn test_a_changed_row_cache_is_a_changed_entry() {
+        let entry = Config::parse(TOML_MINIMAL).unwrap().tables[0].clone();
+        let spelled_out = TableConfig {
+            row_cache: Some(true),
+            ..entry.clone()
+        };
+        assert_eq!(entry, spelled_out);
+        let off = TableConfig {
+            row_cache: Some(false),
+            ..entry.clone()
+        };
+        assert_ne!(entry, off);
+        assert!(!entry.same_but_tuning(&off));
+        assert!(!off.same_but_tuning(&entry));
     }
 
     #[test]

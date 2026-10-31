@@ -1134,17 +1134,27 @@ async fn test_requests_total_counts_every_call() -> TestResult {
         approx::gauge(COUNTED_GETS + 1).to_bits(),
         "every lookup answered before the scrape is in it: {looked_up}"
     );
-    // On the Full tier each lookup takes its value page from the page
-    // cache once, a hit or a fetch.
-    let pages_served = |exposition: &str| {
-        series_sum(exposition, metric::PAGE_CACHE_HITS_TOTAL, &[])
-            + series_sum(exposition, metric::PAGE_CACHE_FETCHES_TOTAL, &[])
-    };
-    let served = pages_served(&after) - pages_served(&before);
+    // On the Full tier the first lookup of the key misses the row cache
+    // and takes its value page from the page cache once, a hit or a fetch;
+    // every later one is a row-cache hit.
+    let delta = |name: &str| series_sum(&after, name, &[]) - series_sum(&before, name, &[]);
+    let served = delta(metric::PAGE_CACHE_HITS_TOTAL) + delta(metric::PAGE_CACHE_FETCHES_TOTAL);
     assert_eq!(
         served.to_bits(),
-        approx::gauge(COUNTED_GETS + 1).to_bits(),
+        approx::gauge(1).to_bits(),
         "every page hit before the scrape is in it: {served}"
+    );
+    let row_misses = delta(metric::ROW_CACHE_MISSES_TOTAL);
+    assert_eq!(
+        row_misses.to_bits(),
+        approx::gauge(1).to_bits(),
+        "every row-cache miss before the scrape is in it: {row_misses}"
+    );
+    let row_hits = delta(metric::ROW_CACHE_HITS_TOTAL);
+    assert_eq!(
+        row_hits.to_bits(),
+        approx::gauge(COUNTED_GETS).to_bits(),
+        "every row-cache hit before the scrape is in it: {row_hits}"
     );
     let rss = series_value(&after, metric::PROCESS_RSS_BYTES, &[])
         .expect("the scrape samples the resident set size");

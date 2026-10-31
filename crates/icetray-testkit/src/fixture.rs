@@ -948,6 +948,7 @@ impl Fixture {
             lookups: None,
             residency,
             resident_budget_bytes: budget,
+            row_cache: None,
         }
     }
 

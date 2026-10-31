@@ -89,7 +89,7 @@ use icetray_core::{
     KeyType, Level, LocalDir, OrderValue, PageCache, ResidentParts, Row, RowCache, ScanBounds,
     Scanned, Storage, Table, TableHandles, TableSource,
 };
-use icetray_core::{approx, catalog, time};
+use icetray_core::{approx, budget, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, SECOND_VALUE_COLUMN, memory_catalog_local};
 use icetray_testkit::golden::{
     self, GoldenTable, REFERENCE_TIER_SAMPLES, REFERENCE_VALUE_BYTES, RowsTier,
@@ -1768,15 +1768,16 @@ fn local_path(location: &str) -> BenchResult<PathBuf> {
 // ---------------------------------------------------------------------------
 // Serving.
 
-/// The page cache of the warm and miss scenarios: large enough to hold
-/// every value page of a table of 100-byte values (about 200 MB) and,
-/// under the Bloom tier, every key page besides, so nothing is evicted. A
-/// table whose pages do not fit is not run warm (`fits_warm_cache`).
+/// The cache budget of the warm and miss scenarios: large enough that its
+/// row cache part holds every value of a table of 100-byte values (about
+/// 200 MB of value pages) and its page cache part, under the Bloom tier,
+/// every key page besides, so nothing is evicted. A table whose values do
+/// not fit is not run warm (`fits_warm_cache`).
 const WARM_CACHE_BYTES: usize = 1 << 30;
 
-/// The page cache of the cold-hit scenario: one mebibyte, about ten of a
-/// table's two thousand value pages, so nearly every uniformly random hit
-/// misses the cache, reads its page from the file, and decodes it. The run
+/// The cache budget of the cold-hit scenario: one mebibyte, about ten of
+/// a table's two thousand value pages, so nearly every uniformly random
+/// hit misses both caches, reads its page from the file, and decodes it. The run
 /// reports the page fetches it measured per lookup.
 const COLD_CACHE_BYTES: usize = 1 << 20;
 
@@ -1807,6 +1808,11 @@ struct Served {
     _local: Option<TempDir>,
 }
 
+/// The page cache shards `stack` resolves its budget for: one, the fewest,
+/// since `PageCache::new` holds no minimum and the cold scenario's page
+/// part is below the one a server's shards would hold it to.
+const BUDGET_SHARDS: usize = 1;
+
 /// What a process's tables are served over: the handles, and the local
 /// directory under the Disk tier, which must live as long as they do.
 struct Stack {
@@ -1816,8 +1822,10 @@ struct Stack {
 }
 
 /// The handles of a process serving over `storage` in `tier`, as
-/// `open_with` gives a process's tables: a `cache_bytes` page cache and a
-/// `cache_bytes` scan cache, the run's `--batch-fan-out` and
+/// `open_with` gives a process's tables: a cache budget of `cache_bytes`
+/// split between the row cache and the page cache as a server splits it
+/// with a table reading rows (`budget::resolve`), a `cache_bytes` scan
+/// cache, the run's `--batch-fan-out` and
 /// `server.max_multi_scan_values` (`Serving`), the server's defaults
 /// otherwise, and under Disk a local directory with no page-cache disk
 /// level, `reuse`'s when given (`local_for`).
@@ -1828,10 +1836,13 @@ async fn stack(
     reuse: Option<TempDir>,
 ) -> BenchResult<Stack> {
     let (local, dir) = local_for(tier, storage, reuse)?;
+    let mut server = ServerConfig::default();
+    server.cache_bytes = Some(approx::count(cache_bytes));
+    let budget = budget::resolve(&server, None, true, BUDGET_SHARDS)?;
     let handles = TableHandles {
         storage: Arc::clone(storage),
-        cache: PageCache::new(cache_bytes, None).await?,
-        row_cache: Some(RowCache::new(approx::count(cache_bytes))),
+        cache: PageCache::new(approx::length(budget.page_bytes), None).await?,
+        row_cache: Some(RowCache::new(budget.row_bytes)),
         local: local.clone(),
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
@@ -1951,6 +1962,7 @@ async fn table_over(
         lookups: prepared.shape.lookups(),
         residency: tier.residency(),
         resident_budget_bytes: None,
+        row_cache: None,
     };
     table_of(config, handles).await
 }

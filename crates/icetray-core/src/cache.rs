@@ -814,6 +814,13 @@ impl PageCache {
         self.spans.joined.load(Ordering::Relaxed)
     }
 
+    /// The page of `file` at `offset` when memory holds it, uncounted:
+    /// what a test compares a value's bytes against.
+    #[cfg(test)]
+    pub(crate) fn held_page(&self, file: &Arc<str>, offset: u64) -> Option<Bytes> {
+        self.in_memory(&PageKey(Arc::clone(file), offset))
+    }
+
     /// Fetch futures run, after coalescing: concurrent misses on one key run
     /// one and count one.
     pub fn fetches(&self) -> u64 {

@@ -2056,6 +2056,7 @@ mod tests {
             lookups: None,
             residency: crate::config::Residency::Full,
             resident_budget_bytes: None,
+            row_cache: None,
         }
     }
 

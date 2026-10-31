@@ -111,12 +111,24 @@ no column returns only the key's presence and reads no value. The
 table's owner decides how to split a row into columns, as
 [Value columns](table-layout.md#value-columns) describes.
 
+A key-value table serves a repeated hit from memory: the server keeps
+each value a lookup reads in its row cache, so a later lookup of the same
+key and column reads no value page and issues no value-page GET,
+whichever fields it projects. The first lookup of a key after a server
+starts, or after its row has left the cache, costs what a cold or warm
+hit does. A caller that keeps its own cache of icetray's answers can ask
+the table's owner to turn the row cache off for the table, so the
+server's memory goes to tables whose callers do not
+([The row cache](performance.md#the-row-cache)). A value a refresh
+deletes or rewrites is never answered from the cache.
+
 ## Projecting protobuf fields
 
 A column the table's owner declares `protobuf` holds serialized protobuf
 messages, and a request may project its value to a list of top-level
 field numbers, so the caller receives and decodes only those fields. The
-server projects a value after its page cache, so projection saves bytes
+server projects a value after its page cache and its row cache, so
+projection saves bytes
 on the wire and in the caller's decode, and costs the same GETs as
 reading the whole value:
 

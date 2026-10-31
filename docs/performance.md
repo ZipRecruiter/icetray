@@ -11,8 +11,9 @@ many lookups wait on a GET, and how much memory or local disk icetray
 spends serving the rest.
 
 Three outcomes recur below. A **cold hit** is a lookup that finds its key
-and fetches a value page from object storage. A **warm hit** is one whose
-value pages are all served from the page cache. A **miss** is one whose
+and fetches a value page from object storage. A **warm hit** is one that
+fetches none: each value it requests comes from the row cache or its
+value page from the page cache. A **miss** is one whose
 key is absent. Terms such as [residency](glossary.md), [key
 chunk](glossary.md), and [fence array](glossary.md) are defined in the
 glossary.
@@ -303,6 +304,45 @@ table a refresh can rewrite wholesale or a reload can change, plus the
 page cache and, on a replica serving an ordered table, the scan cache,
 plus a third of that total for the process.
 
+## The row cache
+
+A key-value table reads each value through the row cache: one value of
+one row, copied out of its page, keyed by the data file, the row's
+position in it, and the column. A repeated hit finds its values there and
+reads no value page, so it neither decompresses one nor waits on a GET.
+It still finds its key as any lookup does, through the resident key page
+under `full`, a local read under `disk`, and the key page's GET or the
+page cache under `bloom`. A miss in the row cache reads the page as
+before and caches the value, and a lookup that requests no column, or a
+column answered by its default, uses no entry.
+
+The same memory holds many more hot rows than pages: a value page holds a
+hot row beside every row stored next to it, so where hot keys are
+scattered through the key order, as hashed or arbitrarily assigned keys
+are, most of a cached page is rows nobody asked for. Each entry is charged
+its value at its allocation size plus 128 bytes of overhead, so rows of a
+few hundred bytes or more spend most of the budget on values. A value
+larger than one 64 KiB value page is not cached, and a row read once
+leaves before rows that keep being read.
+
+icetray decides which file and row a key reads, and whether a delete
+removes it, before it asks the row cache, so a deleted or rewritten row
+is never served from it, and nothing is ever invalidated. A refresh keeps
+the entries of every file the new snapshot still lists, and entries of
+files no snapshot lists age out. A restarted replica starts with an empty
+row cache and fills it from its traffic.
+
+The row cache holds `server.row_cache_share` of `server.cache_bytes`
+([Configuration](configuration.md#server)) when any table reads through
+it, and every key-value table does unless its entry sets `row_cache =
+false` ([Tables](configuration.md#tables)). Turn it off for a table whose
+callers keep their own cache in front of icetray, so its repeats rarely
+reach the server, or whose keys are read about evenly, so few rows repeat
+within the cache's reach; the budget then goes to the tables that reuse
+it. `icetray_row_cache_hits_total` against
+`icetray_row_cache_misses_total` gives its hit rate
+([Metrics](operating.md#metrics)).
+
 ## The page cache
 
 icetray caches value pages compressed, keyed by file and offset. Iceberg
@@ -497,6 +537,8 @@ read without blocking, so every local read there moves to another thread
   row across them.
 - [RFD 024](rfd/024-field-projection.md): field projection, and when to
   project within a column rather than split.
+- [RFD 026](rfd/026-row-cache.md): the row cache, what it is keyed by,
+  and why it is never invalidated.
 - [RFD 025](rfd/025-ordered-rows.md): ordered tables, what a `Scan`
   reads in each residency, the scan cache, and spreading a `MultiScan`
   across idle worker threads.

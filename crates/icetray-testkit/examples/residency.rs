@@ -393,6 +393,7 @@ async fn serve(cli: &Cli) -> SweepResult<Served> {
         lookups: None,
         residency: Residency::Disk,
         resident_budget_bytes: None,
+        row_cache: None,
     };
     let served = verify::build(
         storage,
