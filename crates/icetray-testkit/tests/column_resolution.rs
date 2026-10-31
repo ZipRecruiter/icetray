@@ -12,14 +12,14 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::TableIdent;
-use iceberg::spec::{FormatVersion, Literal, PrimitiveType, Struct};
+use iceberg::spec::{DataFile, FormatVersion, Literal, PrimitiveType, Struct};
 use icetray_core::ColumnRead;
 use icetray_core::approx::{self, count};
 use icetray_core::config::{Residency, TableConfig, ValueColumnConfig, ValueFormat};
 use icetray_core::metric::{self, LookupResult};
 use icetray_core::{
-    ColumnMismatch, Error, ErrorKind, FindingCode, Key, KeyType, Level, RefusalReason, Row,
-    TableFault, TableSource, TableState, diagnose, examine,
+    ColumnMismatch, ColumnSummary, Error, ErrorKind, FindingCode, Generation, Key, KeyType, Level,
+    RefusalReason, Row, TableFault, TableSource, TableState, diagnose, examine,
 };
 use icetray_testkit::fixture::{
     IDS_2K, KEY_FIELD_ID, NAMESPACE, OLD_ID, SECOND_VALUE_COLUMN, SECOND_VALUE_FIELD_ID, STRAY_IDS,
@@ -105,9 +105,12 @@ fn root_entry(fixture: &Fixture, columns: &[&str], residency: Residency) -> Tabl
 
 /// `fixture` served from its root in the Full tier serving `columns`.
 async fn serve_root(fixture: &Fixture, columns: &[&str]) -> Result<Served> {
-    let config = root_entry(fixture, columns, Residency::Full);
-    let source = TableSource::from_config(&config.source).await?;
-    verify::serve(config, source, verify::storage_config_for_tests()).await
+    verify::serve_root(
+        fixture,
+        fixture.config_serving(Residency::Full, columns),
+        false,
+    )
+    .await
 }
 
 /// The error the first load of `config` from `source` fails with; the
@@ -242,19 +245,21 @@ async fn test_a_rename_is_refused_under_either_name() -> Result<()> {
     Ok(())
 }
 
-/// Adds `SECOND_VALUE_COLUMN` stating `default` to `fixture` and commits
-/// files holding it for `STRAY_IDS` beside the first build's files, which
-/// predate it.
-async fn add_column_then_rows(fixture: &mut Fixture, default: StatedDefault) -> Result<Vec<u64>> {
+/// Adds `SECOND_VALUE_COLUMN` stating `default` to `fixture`'s schema,
+/// committing nothing.
+async fn add_column(fixture: &mut Fixture, default: StatedDefault) -> Result<()> {
     fixture
         .evolve(&[SchemaChange::Add {
             name: SECOND_VALUE_COLUMN.to_string(),
             ty: PrimitiveType::Binary,
             default,
         }])
-        .await?;
-    let later: Vec<u64> = STRAY_IDS.collect();
-    let written = fixture.write_rows(&later, FIRST_VERSION, "later").await?;
+        .await
+}
+
+/// Commits by hand, with no deletes, `fixture`'s files and `written`
+/// beside them.
+async fn commit_beside(fixture: &mut Fixture, written: Vec<DataFile>) -> Result<()> {
     let mut data = fixture.files().to_vec();
     data.extend(written);
     fixture
@@ -262,8 +267,29 @@ async fn add_column_then_rows(fixture: &mut Fixture, default: StatedDefault) -> 
             data,
             deletes: Vec::new(),
         })
-        .await?;
+        .await
+}
+
+/// Adds `SECOND_VALUE_COLUMN` stating `default` to `fixture` and commits
+/// files holding it for `STRAY_IDS` beside the first build's files, which
+/// predate it.
+async fn add_column_then_rows(fixture: &mut Fixture, default: StatedDefault) -> Result<Vec<u64>> {
+    add_column(fixture, default).await?;
+    let later: Vec<u64> = STRAY_IDS.collect();
+    let written = fixture.write_rows(&later, FIRST_VERSION, "later").await?;
+    commit_beside(fixture, written).await?;
     Ok(later)
+}
+
+/// The doctor's summaries of the two value columns `generation` serves,
+/// the added one first.
+fn two_column_summaries(generation: &Generation) -> [ColumnSummary; 2] {
+    let report = diagnose(generation, Level::Optimal, &ValueFormat::opaque, None);
+    report
+        .summary
+        .value_columns
+        .try_into()
+        .unwrap_or_else(|columns: Vec<ColumnSummary>| panic!("two columns: {columns:?}"))
 }
 
 /// Looks up every one of `ids` in `served` naming `columns`, asserting
@@ -386,7 +412,7 @@ async fn test_a_column_added_after_a_file_answers_null_there_with_no_get() -> Re
 
 /// The uncompressed chunk bytes of the value column at `column` in the files
 /// of `generation` that hold it, read from their footers.
-fn uncompressed_bytes_of(generation: &icetray_core::Generation, column: usize) -> u64 {
+fn uncompressed_bytes_of(generation: &Generation, column: usize) -> u64 {
     generation
         .files
         .iter()
@@ -415,10 +441,7 @@ async fn test_doctor_sums_a_column_s_bytes_over_the_files_that_hold_it() -> Resu
     add_column_then_rows(&mut fixture, StatedDefault::None).await?;
     let served = serve_root(&fixture, &[VALUE_COLUMN, SECOND_VALUE_COLUMN]).await?;
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
-    let [added, held] = report.summary.value_columns.as_slice() else {
-        panic!("two columns: {:?}", report.summary.value_columns);
-    };
+    let [added, held] = two_column_summaries(&generation);
     assert_eq!(added.column, SECOND_VALUE_COLUMN);
     assert_eq!(
         added.value_bytes,
@@ -438,26 +461,11 @@ async fn test_doctor_sums_a_column_s_bytes_over_the_files_that_hold_it() -> Resu
 async fn test_doctor_reports_no_bytes_for_a_column_every_file_predates() -> Result<()> {
     let (_dir, mut fixture) =
         two_bucket_fixture("kv_added_bytes", FormatVersion::V2, false).await?;
-    fixture
-        .evolve(&[SchemaChange::Add {
-            name: SECOND_VALUE_COLUMN.to_string(),
-            ty: PrimitiveType::Binary,
-            default: StatedDefault::None,
-        }])
-        .await?;
-    let data = fixture.files().to_vec();
-    fixture
-        .commit_by_hand(HandSnapshot {
-            data,
-            deletes: Vec::new(),
-        })
-        .await?;
+    add_column(&mut fixture, StatedDefault::None).await?;
+    commit_beside(&mut fixture, Vec::new()).await?;
     let served = serve_root(&fixture, &[VALUE_COLUMN, SECOND_VALUE_COLUMN]).await?;
     let generation = served.current();
-    let report = diagnose(&generation, Level::Optimal, &ValueFormat::opaque, None);
-    let [added, held] = report.summary.value_columns.as_slice() else {
-        panic!("two columns: {:?}", report.summary.value_columns);
-    };
+    let [added, held] = two_column_summaries(&generation);
     assert_eq!(added.column, SECOND_VALUE_COLUMN);
     assert_eq!(added.files_predating_column, generation.files.len());
     assert_eq!(added.value_bytes, 0);
@@ -596,14 +604,13 @@ async fn test_a_default_and_presence_alone_use_no_entry() -> Result<()> {
     let (_dir, mut fixture) =
         two_bucket_fixture("kv_added_row_cache", FormatVersion::V2, false).await?;
     add_column_then_rows(&mut fixture, StatedDefault::None).await?;
-    let config = root_entry(
+    let served = verify::serve_root(
         &fixture,
-        &[VALUE_COLUMN, SECOND_VALUE_COLUMN],
-        Residency::Full,
-    );
-    let source = TableSource::from_config(&config.source).await?;
-    let served = verify::serve_reading_rows(config, source).await?;
-    let rows = served.row_cache.as_ref().expect("served reading rows");
+        fixture.config_serving(Residency::Full, &[VALUE_COLUMN, SECOND_VALUE_COLUMN]),
+        true,
+    )
+    .await?;
+    let rows = served.rows();
     let key = fixture.key(FIRST_BUILD_SAMPLE[0]);
     assert_eq!(
         served.table.get(&key, &[]).await?.row,
@@ -740,20 +747,12 @@ async fn test_doctor_walks_a_protobuf_column_s_stated_default() -> Result<()> {
         protobuf::first_byte_fault(DEFAULT_BYTES).is_some(),
         "the text default is not protobuf"
     );
-    fixture
-        .evolve(&[SchemaChange::Add {
-            name: SECOND_VALUE_COLUMN.to_string(),
-            ty: PrimitiveType::Binary,
-            default: StatedDefault::Literal(Literal::binary(DEFAULT_BYTES.to_vec())),
-        }])
-        .await?;
-    let data = fixture.files().to_vec();
-    fixture
-        .commit_by_hand(HandSnapshot {
-            data,
-            deletes: Vec::new(),
-        })
-        .await?;
+    add_column(
+        &mut fixture,
+        StatedDefault::Literal(Literal::binary(DEFAULT_BYTES.to_vec())),
+    )
+    .await?;
+    commit_beside(&mut fixture, Vec::new()).await?;
     let scratch = tempfile::tempdir()?;
     let served = verify::serve_in(
         protobuf_default_entry(&fixture, Residency::Full),
@@ -798,13 +797,11 @@ async fn test_doctor_walks_a_protobuf_column_s_stated_default() -> Result<()> {
 async fn test_doctor_does_not_report_a_default_no_file_answers() -> Result<()> {
     let (_dir, mut fixture) =
         two_bucket_fixture("kv_default_unanswered", FormatVersion::V3, false).await?;
-    fixture
-        .evolve(&[SchemaChange::Add {
-            name: SECOND_VALUE_COLUMN.to_string(),
-            ty: PrimitiveType::Binary,
-            default: StatedDefault::Literal(Literal::binary(DEFAULT_BYTES.to_vec())),
-        }])
-        .await?;
+    add_column(
+        &mut fixture,
+        StatedDefault::Literal(Literal::binary(DEFAULT_BYTES.to_vec())),
+    )
+    .await?;
     let ids: Vec<u64> = fixture.ids().collect();
     let rewritten = fixture.write_rows(&ids, FIRST_VERSION, "rewritten").await?;
     fixture
@@ -847,13 +844,11 @@ async fn test_doctor_does_not_report_a_default_no_file_answers() -> Result<()> {
 #[tokio::test]
 async fn test_a_default_that_does_not_read_is_refused() -> Result<()> {
     let (_dir, mut fixture) = two_bucket_fixture("kv_unread", FormatVersion::V3, false).await?;
-    fixture
-        .evolve(&[SchemaChange::Add {
-            name: SECOND_VALUE_COLUMN.to_string(),
-            ty: PrimitiveType::Binary,
-            default: StatedDefault::Raw(serde_json::json!("not hex")),
-        }])
-        .await?;
+    add_column(
+        &mut fixture,
+        StatedDefault::Raw(serde_json::json!("not hex")),
+    )
+    .await?;
     let error = first_load_error(&fixture, SECOND_VALUE_COLUMN).await?;
     assert_eq!(
         mismatch_of(&error),
@@ -877,13 +872,11 @@ async fn test_a_default_that_does_not_read_is_refused_through_a_catalog() -> Res
         ..FixtureSpec::small("kv_unread_catalog", KeyType::Long)
     };
     let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
-    fixture
-        .evolve(&[SchemaChange::Add {
-            name: SECOND_VALUE_COLUMN.to_string(),
-            ty: PrimitiveType::Binary,
-            default: StatedDefault::Raw(serde_json::json!("not hex")),
-        }])
-        .await?;
+    add_column(
+        &mut fixture,
+        StatedDefault::Raw(serde_json::json!("not hex")),
+    )
+    .await?;
     // A by-hand commit leaves the catalog's record behind; a record of its
     // metadata file is the catalog serving it.
     let ident = TableIdent::new(

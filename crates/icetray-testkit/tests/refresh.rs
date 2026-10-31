@@ -64,16 +64,7 @@ const INTERLEAVED_WRITTEN: usize = 4_000;
 /// `fixture` served in the Full tier from its root, through the hint,
 /// under `strict`.
 async fn serve_root(fixture: &Fixture, strict: bool) -> Result<Served> {
-    let source = fixture.root_source();
-    verify::serve(
-        TableConfig {
-            source: source.clone(),
-            ..fixture.config(Residency::Full, strict)
-        },
-        TableSource::from_config(&source).await?,
-        verify::storage_config_for_tests(),
-    )
-    .await
+    verify::serve_root(fixture, fixture.config(Residency::Full, strict), false).await
 }
 
 #[tokio::test]
@@ -143,20 +134,6 @@ async fn test_refresh_follows_the_catalog_and_reuses_files() -> Result<()> {
     Ok(())
 }
 
-/// `fixture` served in the Full tier from its root, through the hint,
-/// reading through a row cache (`verify::serve_reading_rows`).
-async fn serve_root_reading_rows(fixture: &Fixture) -> Result<Served> {
-    let source = fixture.root_source();
-    verify::serve_reading_rows(
-        TableConfig {
-            source: source.clone(),
-            ..fixture.config(Residency::Full, false)
-        },
-        TableSource::from_config(&source).await?,
-    )
-    .await
-}
-
 /// A row cached from one file and rewritten into another by a
 /// copy-on-write commit with a new value is read from the new file after
 /// the refresh: the cache is keyed by file, so the new file's row is a
@@ -170,13 +147,11 @@ async fn test_a_rewritten_row_is_read_from_its_new_file() -> Result<()> {
     };
     let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     fixture.write_hint().await?;
-    let served = serve_root_reading_rows(&fixture).await?;
+    let served = verify::serve_root(&fixture, fixture.config(Residency::Full, false), true).await?;
+    verify::verify_hits(&served, &fixture, &[OLD_ID]).await?;
+    assert!(served.rows().usage() > 0, "the row is cached");
     let key = fixture.key(OLD_ID);
-    let read = [ColumnRead::whole(VALUE_COLUMN)];
-    let old = served.table.get(&key, &read).await?.row;
-    assert_eq!(old, fixture.expected(&key));
-    let rows = served.row_cache.as_ref().expect("served reading rows");
-    assert!(rows.usage() > 0, "the row is cached");
+    let old = fixture.expected(&key);
 
     let ids: Vec<u64> = fixture.ids().collect();
     let next = FIRST_VERSION + 1;
@@ -207,7 +182,14 @@ async fn test_a_rewritten_row_is_read_from_its_new_file() -> Result<()> {
         next,
     )))]);
     assert_ne!(new, old, "the rewrite changed the value");
-    assert_eq!(served.table.get(&key, &read).await?.row, new);
+    assert_eq!(
+        served
+            .table
+            .get(&key, &[ColumnRead::whole(VALUE_COLUMN)])
+            .await?
+            .row,
+        new
+    );
     Ok(())
 }
 
@@ -227,12 +209,7 @@ async fn test_a_reused_file_keeps_its_entries_across_refresh() -> Result<()> {
         fixture.catalog_source(Arc::clone(&catalog)),
     )
     .await?;
-    let key = fixture.key(OLD_ID);
-    let read = [ColumnRead::whole(VALUE_COLUMN)];
-    assert_eq!(
-        served.table.get(&key, &read).await?.row,
-        fixture.expected(&key)
-    );
+    verify::verify_hits(&served, &fixture, &[OLD_ID]).await?;
     let v1 = served.current();
 
     fixture
@@ -247,13 +224,11 @@ async fn test_a_reused_file_keeps_its_entries_across_refresh() -> Result<()> {
         "every file of the first generation is reused"
     );
     served.cache.clear();
-    let stats = served.storage.stats();
-    let before = stats.gets();
     assert_eq!(
-        served.table.get(&key, &read).await?.row,
-        fixture.expected(&key)
+        verify::verify_hits(&served, &fixture, &[OLD_ID]).await?,
+        0,
+        "no value page is read"
     );
-    assert_eq!(stats.gets() - before, 0, "no value page is read");
     Ok(())
 }
 

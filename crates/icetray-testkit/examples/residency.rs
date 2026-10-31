@@ -400,7 +400,7 @@ async fn serve(cli: &Cli) -> SweepResult<Served> {
         config,
         TableSource::from_config(&source).await?,
         Some(Arc::new(local)),
-        approx::length(FALLBACK_CACHE_BYTES),
+        FALLBACK_CACHE_BYTES,
     )
     .await?;
     Ok(served.load().await?)

@@ -458,7 +458,7 @@ async fn build(
         config,
         TableSource::from_config(source).await?,
         local,
-        approx::length(FALLBACK_CACHE_BYTES),
+        FALLBACK_CACHE_BYTES,
     )
     .await?)
 }

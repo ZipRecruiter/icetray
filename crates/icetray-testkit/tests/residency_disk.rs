@@ -38,7 +38,7 @@ const TABLE_B: &str = "b";
 /// The page cache's memory capacity in the disk-level test: a few contract
 /// pages of hundred-byte values, so the dozen distinct pages `SAMPLE`
 /// fetches overflow it and spill to the disk level.
-const SMALL_CACHE_BYTES: usize = 384 * 1024;
+const SMALL_CACHE_BYTES: u64 = 384 * 1024;
 
 #[tokio::test]
 async fn test_disk_cold_hit_is_one_get_and_one_local_read_miss_one_local_read() -> Result<()> {
@@ -508,7 +508,7 @@ async fn test_page_cache_disk_level_serves_evicted_pages_and_survives_restart() 
     let fetched_page_bytes =
         SAMPLE.len() * usize::try_from(PAGE_ROWS).unwrap() * fixture.spec().value_bytes;
     assert!(
-        fetched_page_bytes > SMALL_CACHE_BYTES,
+        count(fetched_page_bytes) > SMALL_CACHE_BYTES,
         "the sample's pages overflow memory, so the surplus reaches the disk level"
     );
     for id in SAMPLE {

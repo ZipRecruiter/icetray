@@ -92,6 +92,20 @@ async fn verify_bloom_hit_cost(tiers: &Tiers, fixture: &Fixture, ids: &[u64]) ->
     Ok(())
 }
 
+/// The key pages and the value pages a cold pass over `keys` reads, from
+/// the Full-tier oracle over `full`, which holds no overlapping bucket, so
+/// a Bloom-tier pass probes one candidate per key.
+fn single_probe_costs(full: &Generation, keys: &[Key]) -> Result<(u64, u64)> {
+    assert!(
+        full.overlapping_buckets().is_empty(),
+        "no other candidate to probe"
+    );
+    Ok((
+        verify::expected_key_pages(full, keys),
+        verify::expected_cold_gets(full, keys, &[VALUE_COLUMN])?,
+    ))
+}
+
 #[tokio::test]
 async fn test_bloom_cold_hit_is_two_gets_warm_none() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
@@ -103,13 +117,9 @@ async fn test_bloom_cold_hit_is_two_gets_warm_none() -> Result<()> {
     .await?;
     let tiers = serve_tiers(&fixture, &catalog).await?;
     let full = tiers.full.current();
-    assert!(
-        full.overlapping_buckets().is_empty(),
-        "no other candidate to probe"
-    );
     let keys = fixture.keys_at(&SAMPLE);
-    let expected = verify::expected_key_pages(&full, &keys)
-        + verify::expected_cold_gets(&full, &keys, &[VALUE_COLUMN])?;
+    let (key_pages, value_pages) = single_probe_costs(&full, &keys)?;
+    let expected = key_pages + value_pages;
     assert_eq!(
         expected,
         expected_bloom_cold_gets(&full, &tiers.bloom.current(), &keys)?
@@ -138,13 +148,7 @@ async fn test_a_bloom_row_cache_hit_still_reads_its_key_page() -> Result<()> {
     )
     .await?;
     let full = verify::serve_catalog(&fixture, &catalog, Residency::Full, false).await?;
-    let keys = fixture.keys_at(&SAMPLE);
-    assert!(
-        full.current().overlapping_buckets().is_empty(),
-        "one candidate per key"
-    );
-    let key_pages = verify::expected_key_pages(&full.current(), &keys);
-    let value_pages = verify::expected_cold_gets(&full.current(), &keys, &[VALUE_COLUMN])?;
+    let (key_pages, value_pages) = single_probe_costs(&full.current(), &fixture.keys_at(&SAMPLE))?;
     let cold = verify::verify_hits(&served, &fixture, &SAMPLE).await?;
     assert_eq!(cold, key_pages + value_pages, "a key page and a value page");
     served.cache.clear();
