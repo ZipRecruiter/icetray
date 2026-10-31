@@ -792,7 +792,15 @@ struct Cli {
     #[arg(
         long,
         value_name = "WAREHOUSE",
-        conflicts_with_all = ["scenario", "table", "values", "prepare", "rewrite", "row_group_rows"],
+        conflicts_with_all = [
+            "scenario",
+            "table",
+            "values",
+            "prepare",
+            "rewrite",
+            "row_group_rows",
+            "row_cache",
+        ],
     )]
     reference: Option<String>,
     /// The reference tables to serve: `ref_compacted`, `ref_appended`,

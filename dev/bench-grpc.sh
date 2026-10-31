@@ -52,10 +52,14 @@ FIXED_CONCURRENCY=64
 # Keys per MultiGet, the batch the in-process benchmark also measures.
 MULTI_GET_KEYS=100
 
-# The page cache: a gibibyte holds every value page of the four prepared
-# tables (about 200 MB each), so after the warm-up every hit is warm and no
-# run pays for a page read.
-PAGE_CACHE_BYTES=1073741824
+# The cache budget (`server.cache_bytes`): a gibibyte holds every value page
+# of the four prepared tables (about 200 MB each). The run sets
+# `server.row_cache_share = 0`, so the row cache is off and the page cache's
+# memory level holds the whole budget, as the in-process benchmark's
+# `--row-cache off` does and as docs/analysis/2026-09-26-performance-sweep.md
+# measured; after the warm-up every hit is warm and no run pays for a page
+# read.
+CACHE_BYTES=1073741824
 
 # Seconds to wait for /ready: the first loads of the four tables take well
 # under a second from local files; two minutes bounds a start that has
@@ -87,7 +91,7 @@ SERVER="target/$CARGO_PROFILE/icetray"
 BENCH="target/$CARGO_PROFILE/examples/bench"
 
 log "tables under $TABLES_DIR"
-# The four key-value tables of random and text values: the page cache above
+# The four key-value tables of random and text values: the cache budget above
 # is sized for them, the protobuf tables' second column is not served here,
 # and the ordered table needs an order column the entries below omit.
 "$BENCH" --prepare --table long,string --values random,text --data-dir "$TABLES_DIR" >"$OUT_DIR/tables.tsv"
@@ -97,7 +101,8 @@ CONFIG="$OUT_DIR/icetray.toml"
   echo "[server]"
   echo "listen = \"127.0.0.1:$GRPC_PORT\""
   echo "metrics_listen = \"127.0.0.1:$METRICS_PORT\""
-  echo "page_cache_bytes = $PAGE_CACHE_BYTES"
+  echo "cache_bytes = $CACHE_BYTES"
+  echo "row_cache_share = 0"
   while IFS=$'\t' read -r name _key_type _rows location; do
     echo
     echo "[[tables]]"
