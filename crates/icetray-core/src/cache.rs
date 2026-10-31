@@ -547,13 +547,17 @@ impl PageCache {
     /// neither `hits` nor `fetches`, so concurrent span reads that need one
     /// page issue one GET for it, as `get_or_fetch` coalesces a lookup's
     /// page (RFD 025, Caching and hedging); its fetch's failure is this
-    /// read's. Every maximal run of the remaining pages whose ranges meet
-    /// end to start is one call of `fetch` over the run's whole range, its
-    /// bytes split by page and each page inserted as its own entry, keyed
-    /// by `file` and the page's offset as `get_or_fetch` keys a page, so
-    /// that a later read of any one of them finds it alone, then handed to
-    /// every read waiting on it. The runs are fetched together, and the
-    /// waits run beside them.
+    /// read's. A page neither in memory nor in flight that the disk level
+    /// holds is read from it, the read's disk reads together, and counted
+    /// a hit and a local read as a lookup's disk hit is (RFD 027, A span
+    /// read); one the level fails to read is fetched (RFD 017). Every
+    /// maximal run of the remaining pages whose ranges meet end to start is
+    /// one call of `fetch` over the run's whole range, its bytes split by
+    /// page and each page inserted into memory as its own entry, keyed by
+    /// `file` and the page's offset as `get_or_fetch` keys a page, so that
+    /// a later read of any one of them finds it alone, and reaching the
+    /// disk level when it leaves memory, then handed to every read waiting
+    /// on it. The runs are fetched together, and the waits run beside them.
     /// Each run takes one permit of `issue` before it claims its pages as in
     /// flight and holds it until it ends, so none waits for a permit while
     /// it holds one (RFD 022), and no read waits on a run still queued for
@@ -571,10 +575,9 @@ impl PageCache {
     /// with it, releasing their pages as a dropped read does, so a read
     /// that joined one of those runs fetches its pages again. A read dropped
     /// before its runs end releases their pages unserved, and a read
-    /// waiting on one of them claims it again itself. The disk level is not
-    /// read, since the Scan cache has none. A run whose bytes come back
-    /// shorter than its range is `CacheError::Fetch` of a parquet
-    /// end-of-file error.
+    /// waiting on one of them claims it again itself, asking the disk level
+    /// first. A run whose bytes come back shorter than its range is
+    /// `CacheError::Fetch` of a parquet end-of-file error.
     pub(crate) async fn get_span<F, Fut>(
         &self,
         file: &Arc<str>,
@@ -589,7 +592,7 @@ impl PageCache {
         let mut served: Vec<Option<Bytes>> = vec![None; pages.len()];
         let mut from_outside = false;
         loop {
-            let Pending { runs, waits } = self.pending(file, pages, &mut served);
+            let Pending { runs, waits } = self.pending(file, pages, &mut served).await;
             if runs.is_empty() && waits.is_empty() {
                 break;
             }
@@ -696,16 +699,21 @@ impl PageCache {
 
     /// Takes stock of `pages` of `file` that `served` does not hold yet: a
     /// page in memory is served and counted a hit, a page another read is
-    /// fetching is joined and counted in `span_joins`, and every maximal run
+    /// fetching is joined and counted in `span_joins`, a page the disk
+    /// level holds is served from it (`read_disk`), and every maximal run
     /// of the rest whose ranges meet end to start is to be fetched. Memory
     /// is read first without the in-flight lock, since a page in memory is
     /// whole and final, so a read memory holds whole takes no lock; the
     /// lock of `file`'s shard is taken only for the pages memory lacks, and
     /// memory is read again under it for a page not in flight, whose fetch
-    /// may have inserted it and given up its claim in between. Nothing is
-    /// claimed here: a run claims its pages only once it holds its permit
-    /// (`claim_run`).
-    fn pending(
+    /// may have inserted it and given up its claim in between. The disk
+    /// level is asked only for the pages neither in memory nor in flight
+    /// under the lock, after it is released, so a page another read is
+    /// fetching is joined and never read from disk. Nothing is claimed
+    /// here: a run claims its pages only once it holds its permit
+    /// (`claim_run`), and so skips a page another read claimed while this
+    /// one read the disk level.
+    async fn pending(
         &self,
         file: &Arc<str>,
         pages: &[Range<u64>],
@@ -732,25 +740,66 @@ impl PageCache {
         }
         let mut waits = Vec::new();
         let mut wanted = vec![false; pages.len()];
-        let flights = self.spans.shard(file).lock();
-        for (at, page) in pages.iter().enumerate() {
-            if served[at].is_some() {
-                continue;
-            }
-            let key = PageKey(Arc::clone(file), page.start);
-            if let Some(flight) = flights.get(&key) {
-                self.spans.joined.fetch_add(1, Ordering::Relaxed);
-                waits.push((at, flight.clone()));
-            } else if let Some(held) = self.in_memory(&key) {
-                self.record_hit();
-                served[at] = Some(held);
-            } else {
-                wanted[at] = true;
+        {
+            let flights = self.spans.shard(file).lock();
+            for (at, page) in pages.iter().enumerate() {
+                if served[at].is_some() {
+                    continue;
+                }
+                let key = PageKey(Arc::clone(file), page.start);
+                if let Some(flight) = flights.get(&key) {
+                    self.spans.joined.fetch_add(1, Ordering::Relaxed);
+                    waits.push((at, flight.clone()));
+                } else if let Some(held) = self.in_memory(&key) {
+                    self.record_hit();
+                    served[at] = Some(held);
+                } else {
+                    wanted[at] = true;
+                }
             }
         }
+        self.read_disk(file, pages, &mut wanted, served).await;
         Pending {
             runs: wanted_runs(pages, &wanted),
             waits,
+        }
+    }
+
+    /// Serves from the disk level every page of `pages` of `file` that
+    /// `wanted` marks and the level holds, unmarking it: the pages' reads
+    /// run together, each through foyer's hybrid read, so it lands in
+    /// memory as a lookup's disk hit does, and concurrent reads of one page
+    /// share one local read. Each page is counted as `record` counts a
+    /// lookup served from the level, a hit and a local read of its length;
+    /// a page that reached memory before its read is a hit alone. A page
+    /// the level lacks, or fails to read, stays marked for the fetch, as
+    /// `get_or_fetch` moves on to the fetch (RFD 017: the directory is
+    /// disposable). A memory-only level has nothing to read.
+    async fn read_disk(
+        &self,
+        file: &Arc<str>,
+        pages: &[Range<u64>],
+        wanted: &mut [bool],
+        served: &mut [Option<Bytes>],
+    ) {
+        let (cache, stats) = match self.level.as_ref() {
+            Level::Memory(_) => return,
+            Level::Hybrid { cache, stats } => (cache, stats.as_ref()),
+        };
+        let reads = (0..pages.len()).filter(|at| wanted[*at]).map(|at| {
+            let key = PageKey(Arc::clone(file), pages[at].start);
+            async move { (at, cache.get(&key).await) }
+        });
+        for (at, read) in futures::future::join_all(reads).await {
+            // intentional: a page the level fails to read is fetched
+            // instead, since the directory is disposable (RFD 017).
+            let Ok(Some(entry)) = read else {
+                continue;
+            };
+            let page = entry.value().0.clone();
+            self.record(entry.source(), Some(stats), &page);
+            wanted[at] = false;
+            served[at] = Some(page);
         }
     }
 
@@ -758,8 +807,10 @@ impl PageCache {
     /// claimed twice, the first stretch of `run` of `pages` of `file` that is
     /// neither in memory nor in flight now; `None` when no page of `run` is.
     /// The pages of `run` before and after that stretch are left to the
-    /// read's next pass. Memory is checked under the lock, and a fetch
-    /// inserts its pages before it gives up its claim, so a page leaves the
+    /// read's next pass, which joins a page another read claimed since
+    /// `pending` took stock, while this read waited on the disk level or on
+    /// its permit. Memory is checked under the lock, and a fetch inserts
+    /// its pages before it gives up its claim, so a page leaves the
     /// in-flight set only once memory holds it.
     fn claim_run(
         &self,
@@ -2740,6 +2791,228 @@ mod tests {
         assert_eq!(second.fetches(), 1);
         assert_eq!(second.hits(), 0);
         assert_eq!(stats.local_reads(), 0);
+    }
+
+    /// The pages the disk-level span tests read: three that meet.
+    const DISK_SPAN: [Range<u64>; 3] = [0..10, 10..20, 20..30];
+
+    /// A hybrid cache with room in memory for every page, its disk level in
+    /// `dir`, holding `DISK_SPAN` of `file` on the disk level alone: the
+    /// span is fetched, then every page leaves memory for disk (`clear`),
+    /// and the level has written them. One fetch runs.
+    async fn span_on_disk(dir: &Path, id: &Arc<str>, file: &Bytes) -> (PageCache, Arc<IoStats>) {
+        let (level, stats) = disk_level(dir);
+        let cache = PageCache::new(ROOMY_BYTES, Some(level)).await.unwrap();
+        cache
+            .get_span(id, &DISK_SPAN, Issue::default(), |span| {
+                std::future::ready(Ok(span_bytes(file, &span)))
+            })
+            .await
+            .unwrap();
+        cache.clear();
+        hybrid(&cache).storage().wait().await;
+        for page in &DISK_SPAN {
+            assert_eq!(cache.held_page(id, page.start), None, "left memory");
+        }
+        assert_eq!(cache.fetches(), 1);
+        (cache, stats)
+    }
+
+    /// Drops the page of `id` at each of `offsets` from both levels.
+    async fn drop_from_both_levels(cache: &PageCache, id: &Arc<str>, offsets: &[u64]) {
+        for offset in offsets {
+            hybrid(cache).remove(&PageKey(Arc::clone(id), *offset));
+        }
+        hybrid(cache).storage().wait().await;
+    }
+
+    /// Reads `DISK_SPAN` of `file` through `cache`, recording every span its
+    /// fetch is called for, and returns what it served and those spans.
+    async fn read_recording(
+        cache: &PageCache,
+        id: &Arc<str>,
+        file: &Bytes,
+    ) -> ((Vec<Bytes>, PageOrigin), Vec<Range<u64>>) {
+        let spans = std::sync::Mutex::new(Vec::new());
+        let served = cache
+            .get_span(id, &DISK_SPAN, Issue::default(), |span| {
+                spans.lock().unwrap().push(span.clone());
+                std::future::ready(Ok(span_bytes(file, &span)))
+            })
+            .await
+            .unwrap();
+        (served, spans.into_inner().unwrap())
+    }
+
+    /// A span read takes the pages the disk level holds with local reads,
+    /// each counted a hit and a local read of its length, and fetches
+    /// nothing (RFD 027, A span read); the pages it read are in memory
+    /// after it, as foyer's hybrid read places them.
+    #[tokio::test]
+    async fn test_a_span_the_disk_level_holds_is_read_without_a_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let file = span_file();
+        let (cache, stats) = span_on_disk(dir.path(), &id, &file).await;
+        let hits = cache.hits();
+
+        let (served, origin) = cache
+            .get_span(&id, &DISK_SPAN, Issue::default(), |_| never())
+            .await
+            .unwrap();
+        assert_eq!(served, pages_of(&file, &DISK_SPAN));
+        assert_eq!(origin, PageOrigin::Cached);
+        assert_eq!(cache.fetches(), 1, "the first read's fetch alone");
+        assert_eq!(cache.hits() - hits, count(DISK_SPAN.len()));
+        assert_eq!(stats.local_reads(), count(DISK_SPAN.len()));
+        assert_eq!(
+            stats.local_bytes(),
+            DISK_SPAN
+                .iter()
+                .map(|page| page.end - page.start)
+                .sum::<u64>()
+        );
+        for (page, bytes) in DISK_SPAN.iter().zip(&served) {
+            assert_eq!(cache.held_page(&id, page.start).as_ref(), Some(bytes));
+        }
+    }
+
+    /// A span read whose middle page neither level holds fetches that page
+    /// alone and reads its neighbors from the disk level.
+    #[tokio::test]
+    async fn test_a_span_missing_one_page_from_both_levels_fetches_that_page_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let file = span_file();
+        let (cache, stats) = span_on_disk(dir.path(), &id, &file).await;
+        drop_from_both_levels(&cache, &id, &[DISK_SPAN[1].start]).await;
+        let hits = cache.hits();
+
+        let ((served, origin), spans) = read_recording(&cache, &id, &file).await;
+        assert_eq!(served, pages_of(&file, &DISK_SPAN));
+        assert_eq!(origin, PageOrigin::Fetched);
+        assert_eq!(spans, &DISK_SPAN[1..2], "the missing page alone");
+        assert_eq!(cache.fetches(), 2);
+        assert_eq!(cache.hits() - hits, 2, "the two pages on disk");
+        assert_eq!(stats.local_reads(), 2);
+    }
+
+    /// A span read whose first and last pages neither level holds fetches
+    /// each as a run of its own: the page on disk between them breaks the
+    /// run.
+    #[tokio::test]
+    async fn test_a_span_missing_its_ends_fetches_two_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let file = span_file();
+        let (cache, stats) = span_on_disk(dir.path(), &id, &file).await;
+        drop_from_both_levels(&cache, &id, &[DISK_SPAN[0].start, DISK_SPAN[2].start]).await;
+        let hits = cache.hits();
+
+        let ((served, origin), spans) = read_recording(&cache, &id, &file).await;
+        assert_eq!(served, pages_of(&file, &DISK_SPAN));
+        assert_eq!(origin, PageOrigin::Fetched);
+        assert_eq!(spans, [DISK_SPAN[0].clone(), DISK_SPAN[2].clone()]);
+        assert_eq!(cache.fetches(), 3, "one fetch per end");
+        assert_eq!(cache.hits() - hits, 1, "the middle page on disk");
+        assert_eq!(stats.local_reads(), 1);
+    }
+
+    /// Concurrent span reads of a page the disk level holds each read it
+    /// once, counted a hit and a local read apiece as coalesced lookups
+    /// are, and none fetches or joins a fetch. Deterministic on the
+    /// current-thread runtime for the same reason as `race`: every read
+    /// asks the level before its read runs.
+    #[tokio::test]
+    async fn test_concurrent_spans_over_a_page_on_disk_read_it_once_each_and_fetch_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (level, stats) = disk_level(dir.path());
+        let cache = PageCache::new(TINY_BYTES, Some(level)).await.unwrap();
+        let runs = Arc::new(AtomicU64::new(0));
+        evict_to_disk(&cache, &runs).await;
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let span = FIRST_OFFSET..FIRST_OFFSET + page_bytes(PAGE);
+        let page = std::slice::from_ref(&span);
+        let hits = cache.hits();
+
+        let reads =
+            (0..CONCURRENT).map(|_| cache.get_span(&id, page, Issue::default(), |_| never()));
+        for answer in join_all(reads).await {
+            let (served, origin) = answer.unwrap();
+            assert_eq!(served, [Bytes::from_static(PAGE)]);
+            assert_eq!(origin, PageOrigin::Cached);
+        }
+        assert_eq!(cache.fetches(), 2, "evict_to_disk's fetches alone");
+        assert_eq!(cache.span_joins(), 0);
+        assert_eq!(cache.hits() - hits, count(CONCURRENT));
+        assert_eq!(stats.local_reads(), count(CONCURRENT));
+    }
+
+    /// A page another span read claims while this read is asking the disk
+    /// level for it is joined, not fetched a second time: the run claims
+    /// only what is still neither in memory nor in flight once the disk
+    /// reads are done (`claim_run`). The other read's claim is made by hand
+    /// while this read waits on the level, and its outcome published as
+    /// `fetch_run` publishes one.
+    #[tokio::test]
+    async fn test_get_span_joins_a_page_claimed_while_it_read_the_disk_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let (level, stats) = disk_level(dir.path());
+        let cache = PageCache::new(ROOMY_BYTES, Some(level)).await.unwrap();
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let file = span_file();
+        let page = &SPAN[..1];
+        let mut reading = Box::pin(cache.get_span(&id, page, Issue::default(), |_| never()));
+        assert!(
+            futures::poll!(reading.as_mut()).is_pending(),
+            "it asks the disk level"
+        );
+        let claim = cache
+            .claim_run(&id, page, 0..page.len())
+            .expect("the page is neither in memory nor in flight");
+        let bytes = pages_of(&file, page);
+        let (answer, ()) = tokio::join!(reading, async {
+            joined(&cache, 1).await;
+            cache.insert(PageKey(Arc::clone(&id), page[0].start), bytes[0].clone());
+            claim.publish(&Ok(bytes.clone()));
+            drop(claim);
+        });
+        let (served, origin) = answer.unwrap();
+        assert_eq!(cache.span_joins(), 1);
+        assert_eq!(served, bytes);
+        assert_eq!(origin, PageOrigin::Fetched);
+        assert_eq!(cache.fetches(), 0);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(stats.local_reads(), 0);
+    }
+
+    /// `held_span` reads memory alone: a span the disk level holds is not
+    /// held, and nothing is counted or read; once a span read has brought
+    /// the pages into memory it is held, with no local read of its own.
+    #[tokio::test]
+    async fn test_held_span_still_reads_memory_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let file = span_file();
+        let (cache, stats) = span_on_disk(dir.path(), &id, &file).await;
+        let hits = cache.hits();
+
+        assert_eq!(cache.held_span(&id, &DISK_SPAN), None);
+        assert_eq!(cache.hits(), hits);
+        assert_eq!(stats.local_reads(), 0);
+
+        cache
+            .get_span(&id, &DISK_SPAN, Issue::default(), |_| never())
+            .await
+            .unwrap();
+        let reads = stats.local_reads();
+        let hits = cache.hits();
+        assert_eq!(
+            cache.held_span(&id, &DISK_SPAN),
+            Some(pages_of(&file, &DISK_SPAN))
+        );
+        assert_eq!(cache.hits() - hits, count(DISK_SPAN.len()));
+        assert_eq!(stats.local_reads(), reads);
     }
 
     /// A disk level of more blocks than `LOWERED_LIMIT` leaves descriptors
