@@ -609,6 +609,21 @@ pub enum ConfigViolation {
         /// The configured share.
         share: f64,
     },
+    /// The server serves a table reading through the row cache beside
+    /// tables reading pages alone, ordered tables or key-value tables with
+    /// `row_cache = false`, with no page-cache disk level (`storage.local`
+    /// with `page_cache_disk_bytes` above zero) and no `row_cache_share`
+    /// (RFD 028). Those tables' pages would then live in the page cache's
+    /// memory level alone, and no default share suits both kinds of table
+    /// there, so the file chooses.
+    #[error(
+        "the server has no page-cache disk level and serves tables reading through the row cache beside tables reading pages alone ({}); set storage.local with page_cache_disk_bytes above zero, or set server.row_cache_share",
+        pages_alone.join(", ")
+    )]
+    MixedServerNeedsShare {
+        /// The names of the tables reading pages alone, in file order.
+        pages_alone: Vec<String>,
+    },
     /// A page cache disk level smaller than its one block, which would hold
     /// nothing (RFD 017); zero turns the level off instead.
     #[error(
@@ -1165,7 +1180,32 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     if config.tables.is_empty() {
         return Err(ConfigViolation::NoTables);
     }
-    validate_tables(config)
+    validate_tables(config)?;
+    validate_split(config)
+}
+
+/// A server with no page-cache disk level that serves a table reading
+/// through the row cache beside tables reading pages alone sets
+/// `row_cache_share` (RFD 028).
+fn validate_split(config: &Config) -> std::result::Result<(), ConfigViolation> {
+    let disk_level = config
+        .storage
+        .local
+        .as_ref()
+        .is_some_and(|local| local.page_cache_disk_bytes > 0);
+    if disk_level || config.server.row_cache_share.is_some() || !config.reads_rows() {
+        return Ok(());
+    }
+    let pages_alone: Vec<String> = config
+        .tables
+        .iter()
+        .filter(|table| !table.row_cache())
+        .map(|table| table.name.clone())
+        .collect();
+    if pages_alone.is_empty() {
+        return Ok(());
+    }
+    Err(ConfigViolation::MixedServerNeedsShare { pages_alone })
 }
 
 /// Each table has a name of its own, a residency its settings fit, a key
@@ -3980,6 +4020,99 @@ locaton = "typo"
         assert_ne!(entry, off);
         assert!(!entry.same_but_tuning(&off));
         assert!(!off.same_but_tuning(&entry));
+    }
+
+    /// The name of the second table `mixed` serves.
+    const SECOND_TABLE: &str = "events";
+
+    /// `TOML_MINIMAL`'s key-value table, which reads through the row cache,
+    /// then a second key-value table named `SECOND_TABLE` with `second`
+    /// among its keys, then `tail`, a section of its own.
+    fn mixed(second: &str, tail: &str) -> String {
+        format!(
+            "{}\n\n[[tables]]\nname = \"{SECOND_TABLE}\"\nsource = {{ type = \"static\", location = \"s3://example-warehouse/db/events\" }}\nref = \"main\"\nkey_column = \"key\"\nvalue_columns = [\"value\"]\n{second}\n\n{tail}",
+            TOML_MINIMAL.trim_end()
+        )
+    }
+
+    /// The second table's key that makes it an ordered table.
+    const ORDERED_KEY: &str = "order_column = \"ts\"";
+
+    /// A `storage.local` with a page-cache disk level of `bytes`.
+    fn local_with_disk_level(bytes: u64) -> String {
+        format!("[storage.local]\ndir = \"/var/lib/icetray\"\npage_cache_disk_bytes = {bytes}\n")
+    }
+
+    /// The refusal of a mixed server whose second table reads pages alone.
+    fn second_reads_pages_alone() -> ConfigViolation {
+        ConfigViolation::MixedServerNeedsShare {
+            pages_alone: vec![SECOND_TABLE.to_string()],
+        }
+    }
+
+    /// A key-value table reading through the row cache beside an ordered
+    /// table, with no `storage.local` and no `row_cache_share`, is refused,
+    /// naming the ordered table.
+    #[test]
+    fn test_a_mixed_server_without_a_disk_level_is_refused() {
+        assert_eq!(
+            violation(&mixed(ORDERED_KEY, "")),
+            second_reads_pages_alone()
+        );
+    }
+
+    /// A local directory whose `page_cache_disk_bytes` is zero has no disk
+    /// level, so the mixed server is refused as without one.
+    #[test]
+    fn test_a_mixed_server_whose_disk_level_is_zero_is_refused() {
+        assert_eq!(
+            violation(&mixed(ORDERED_KEY, &local_with_disk_level(0))),
+            second_reads_pages_alone()
+        );
+    }
+
+    /// A key-value table with `row_cache = false` reads pages alone as an
+    /// ordered table does, so beside one that reads rows it is refused.
+    #[test]
+    fn test_a_mixed_server_with_a_row_cache_false_table_is_refused() {
+        assert_eq!(
+            violation(&mixed("row_cache = false", "")),
+            second_reads_pages_alone()
+        );
+    }
+
+    #[test]
+    fn test_a_mixed_server_setting_row_cache_share_is_accepted() {
+        let share = format!("[server]\nrow_cache_share = {FIXTURE_ROW_CACHE_SHARE}\n");
+        for second in [ORDERED_KEY, "row_cache = false"] {
+            let config = Config::parse(&mixed(second, &share)).unwrap();
+            assert_eq!(config.tables.len(), 2, "{second}");
+        }
+    }
+
+    #[test]
+    fn test_a_mixed_server_with_a_disk_level_is_accepted() {
+        let disk = local_with_disk_level(PAGE_CACHE_DISK_BLOCK_BYTES);
+        for second in [ORDERED_KEY, "row_cache = false"] {
+            let config = Config::parse(&mixed(second, &disk)).unwrap();
+            assert_eq!(config.tables.len(), 2, "{second}");
+        }
+    }
+
+    /// A server whose tables all read through the row cache, or all read
+    /// pages alone, has one kind of table for the split to suit.
+    #[test]
+    fn test_a_server_of_one_kind_of_table_needs_no_share() {
+        for second in ["", "row_cache = true"] {
+            Config::parse(&mixed(second, "")).unwrap();
+        }
+        let pages_alone = mixed(ORDERED_KEY, "").replacen(
+            "value_columns = [\"value\"]\n",
+            "value_columns = [\"value\"]\nrow_cache = false\n",
+            1,
+        );
+        let config = Config::parse(&pages_alone).unwrap();
+        assert!(!config.reads_rows());
     }
 
     #[test]

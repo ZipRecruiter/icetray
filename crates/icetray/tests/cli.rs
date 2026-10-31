@@ -669,6 +669,46 @@ fn ordered_config(dir: &Path, stem: &str, fixture: &Fixture) -> Result<String, B
     )
 }
 
+/// The doctor reads a file serving a key-value table, which reads through
+/// the row cache, beside an ordered table, with no page-cache disk level,
+/// through the checks `serve` does, and refuses it before reading any
+/// table (RFD 028): exit 1, the refusal on stderr, and no report. The same
+/// file setting `row_cache_share` is reported.
+#[tokio::test]
+async fn test_doctor_reports_the_mixed_server_refusal() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let kv = local_fixture(dir.path(), FixtureSpec::small("kv_mixed", KeyType::Long)).await?;
+    let events = local_fixture(dir.path(), ordered_spec("events_mixed", ORDER_STEP)).await?;
+    let tables = format!(
+        "{}\n{}",
+        toml_table(TABLE_A, &kv),
+        toml_ordered_table(TABLE_B, &events, None)
+    );
+    let mixed = write_file(dir.path(), "mixed.toml", &tables)?;
+    let output = run(&["doctor", "--config", &mixed], &[]);
+    assert_exit(&output, EXIT_FAILURE);
+    assert!(output.stdout.is_empty(), "{}", stderr(&output));
+    assert_plain_error(&output);
+
+    let shared = write_file(
+        dir.path(),
+        "shared.toml",
+        &format!("[server]\nrow_cache_share = 0.5\n\n{tables}"),
+    )?;
+    let output = run(&["doctor", "--config", &shared], &[]);
+    let report = lines(&output.stdout);
+    for name in [TABLE_A, TABLE_B] {
+        assert!(
+            report
+                .iter()
+                .any(|line| line["kind"] == "table" && line["table"] == name),
+            "{name}: {}",
+            stderr(&output)
+        );
+    }
+    Ok(())
+}
+
 /// The doctor reports an ordered table's order column on its `table` line
 /// and each file's order facts on its `file` line (RFD 025, Doctor): the
 /// column, its type, the effective `max_scan_rows`, and the longest run

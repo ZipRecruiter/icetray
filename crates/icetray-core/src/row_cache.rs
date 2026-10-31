@@ -9,6 +9,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
@@ -48,11 +49,11 @@ const ESTIMATED_ENTRY_BYTES: u64 = 256;
 /// rows from two kilobytes up.
 const GHOST_ITEMS_DIVISOR: u64 = 8;
 
-/// The part of the budget held back for the ghost list: the budget
-/// `RowCache::new` was given and the bytes held back from it. In each shard
+/// The part of the budget held back for the ghost list: the budget the
+/// cache was built for and the bytes held back from it. In each shard
 /// `quick_cache` keeps at most the shard's share of the expected entries,
 /// rounded up, times the ghost share, and a resize scales that count with
-/// the entries' capacity. So `new` holds back that many ghosts at
+/// the entries' capacity. So `Built::new` holds back that many ghosts at
 /// `ROW_ENTRY_OVERHEAD_BYTES` each, since a ghost keeps its entry's slot
 /// and hash while dropping its key and value, and every resize keeps the
 /// bytes held back in that ratio to the entries' capacity.
@@ -178,33 +179,15 @@ impl Weighter<RowKey, Option<Bytes>> for RowWeighter {
     }
 }
 
-/// The cache's state, shared by its clones.
-struct Inner {
+/// One `quick_cache` and the part of its budget its ghost list holds back.
+struct Built {
     cache: Cache<RowKey, Option<Bytes>, RowWeighter>,
     ghosts: GhostReserve,
-    hits: Tally,
-    misses: Tally,
 }
 
-/// The row cache (RFD 026): values keyed by file, row, and column,
-/// within a byte budget, evicting what is read least. A clone is another
-/// handle on the same cache.
-#[derive(Clone)]
-pub struct RowCache(Arc<Inner>);
-
-impl RowCache {
-    /// A cache whose entries, as `weigh` charges them, and ghost list
-    /// together take at most `capacity_bytes`: the ghost list's slots are
-    /// reserved out of it (`GhostReserve`) and the entries hold the rest.
-    /// Its hit and miss counters are registered at zero in the recorder
-    /// current now. It splits into shards chosen for `capacity_bytes` and
-    /// kept for its life, each holding its share of the entries' part, so
-    /// an entry is cached only when it fits its shard's share: a budget
-    /// under one `ROW_CACHE_MAX_VALUE_BYTES` value per shard caches only
-    /// smaller values, and a budget of zero, a server none of whose tables
-    /// reads through the cache, caches nothing.
-    #[must_use]
-    pub fn new(capacity_bytes: u64) -> Self {
+impl Built {
+    /// A cache for `capacity_bytes`, as `RowCache::new` describes.
+    fn new(capacity_bytes: u64) -> Self {
         let estimated_items = (capacity_bytes / ESTIMATED_ENTRY_BYTES).max(1);
         let options = OptionsBuilder::new()
             .estimated_items_capacity(approx::length(estimated_items))
@@ -223,20 +206,62 @@ impl RowCache {
             estimated_items,
             approx::count(cache.num_shards()),
         );
-        let cache = Self(Arc::new(Inner {
-            cache,
-            ghosts,
+        let built = Self { cache, ghosts };
+        built.set_capacity(capacity_bytes);
+        built
+    }
+
+    /// Sets the entries' capacity to what `capacity_bytes` leaves beside
+    /// the ghost list's reserve at its ratio (`GhostReserve::entries_within`),
+    /// rounded down to a multiple of the shards, evicting until what is
+    /// held fits.
+    fn set_capacity(&self, capacity_bytes: u64) {
+        let shards = approx::count(self.cache.num_shards());
+        let entries = self.ghosts.entries_within(capacity_bytes);
+        self.cache.set_capacity(entries / shards * shards);
+    }
+}
+
+/// The cache's state, shared by its clones.
+struct Inner {
+    /// The cache now, read once per call. A resize up from an entries'
+    /// capacity of zero replaces it whole (`RowCache::resize`); every
+    /// other resize changes it in place.
+    built: ArcSwap<Built>,
+    hits: Tally,
+    misses: Tally,
+}
+
+/// The row cache (RFD 026): values keyed by file, row, and column,
+/// within a byte budget, evicting what is read least. A clone is another
+/// handle on the same cache.
+#[derive(Clone)]
+pub struct RowCache(Arc<Inner>);
+
+impl RowCache {
+    /// A cache whose entries, as `weigh` charges them, and ghost list
+    /// together take at most `capacity_bytes`: the ghost list's slots are
+    /// reserved out of it (`GhostReserve`) and the entries hold the rest.
+    /// Its hit and miss counters are registered at zero in the recorder
+    /// current now. It splits into shards chosen for `capacity_bytes`, each
+    /// holding its share of the entries' part, so an entry is cached only
+    /// when it fits its shard's share: a budget under one
+    /// `ROW_CACHE_MAX_VALUE_BYTES` value per shard caches only smaller
+    /// values, and a budget of zero, a server none of whose tables reads
+    /// through the cache, caches nothing.
+    #[must_use]
+    pub fn new(capacity_bytes: u64) -> Self {
+        Self(Arc::new(Inner {
+            built: ArcSwap::from_pointee(Built::new(capacity_bytes)),
             hits: Tally::new(metrics::counter!(metric::ROW_CACHE_HITS_TOTAL)),
             misses: Tally::new(metrics::counter!(metric::ROW_CACHE_MISSES_TOTAL)),
-        }));
-        cache.resize(capacity_bytes);
-        cache
+        }))
     }
 
     /// What the cache holds at `key`. Counts a hit, for a null as for a
     /// value, or a miss on the calling thread's shard.
     pub(crate) fn get(&self, key: &RowKey) -> Cached {
-        match self.0.cache.get(key) {
+        match self.0.built.load().cache.get(key) {
             Some(Some(bytes)) => {
                 self.0.hits.increment();
                 Cached::Value(bytes)
@@ -259,26 +284,48 @@ impl RowCache {
         if value.is_some_and(|bytes| approx::count(bytes.len()) > ROW_CACHE_MAX_VALUE_BYTES) {
             return;
         }
-        self.0.cache.insert(key, value.map(Bytes::copy_from_slice));
+        self.0
+            .built
+            .load()
+            .cache
+            .insert(key, value.map(Bytes::copy_from_slice));
     }
 
     /// Sets the budget to `capacity_bytes`, evicting entries until what is
-    /// held fits: the entries hold what the ghost list's reserve at its
-    /// ratio leaves (`GhostReserve::entries_within`), rounded down to a
-    /// multiple of the shards. The shards stay those `new` chose, so a
-    /// budget shrunk under one `ROW_CACHE_MAX_VALUE_BYTES` value per shard
-    /// caches only smaller values until it grows again.
+    /// held fits (`Built::set_capacity`). The shards stay those chosen when
+    /// the cache was built, so a budget shrunk under one
+    /// `ROW_CACHE_MAX_VALUE_BYTES` value per shard caches only smaller
+    /// values until it grows again. A cache whose entries' capacity is zero
+    /// holds nothing, and `quick_cache` grows such a cache with no room for
+    /// a ghost list ever again, so growing it from zero builds the cache
+    /// `new` would for `capacity_bytes` in its place instead, which every
+    /// clone reads from its next call on.
     pub fn resize(&self, capacity_bytes: u64) {
-        let shards = approx::count(self.0.cache.num_shards());
-        let entries = self.0.ghosts.entries_within(capacity_bytes);
-        self.0.cache.set_capacity(entries / shards * shards);
+        let built = self.0.built.load();
+        if built.cache.capacity() > 0 {
+            built.set_capacity(capacity_bytes);
+        } else if capacity_bytes > 0 {
+            self.0.built.store(Arc::new(Built::new(capacity_bytes)));
+        }
+    }
+
+    /// How the cache is built now: what a test compares with a freshly
+    /// built cache's.
+    #[cfg(test)]
+    fn shape(&self) -> Shape {
+        let built = self.0.built.load();
+        Shape {
+            shards: built.cache.num_shards(),
+            entries_capacity: built.cache.capacity(),
+            ghost_bytes: built.ghosts.bytes,
+        }
     }
 
     /// Bytes charged against the budget now: each entry as `weigh` charges
     /// it.
     #[must_use]
     pub fn usage(&self) -> u64 {
-        self.0.cache.weight()
+        self.0.built.load().cache.weight()
     }
 
     /// Moves the hits and misses counted since the last call into
@@ -293,11 +340,21 @@ impl RowCache {
     }
 }
 
+/// How a cache is built: its shards, its entries' capacity, and the bytes
+/// its ghost list holds back.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+struct Shape {
+    shards: usize,
+    entries_capacity: u64,
+    ghost_bytes: u64,
+}
+
 impl fmt::Debug for RowCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RowCache")
             .field("usage", &self.usage())
-            .field("capacity", &self.0.cache.capacity())
+            .field("capacity", &self.0.built.load().cache.capacity())
             .finish_non_exhaustive()
     }
 }
@@ -328,6 +385,44 @@ mod tests {
 
     fn key(position: u64, leaf: usize) -> RowKey {
         RowKey::new(&file(), RowPosition(position), leaf)
+    }
+
+    /// Rows of a kibibyte inserted into one shard of a cache, the shard of
+    /// `key(0, 0)`, each at a position not inserted before: eviction is per
+    /// shard, so these rows displace one another and nothing else.
+    struct OneShard<'a> {
+        cache: &'a RowCache,
+        shard: usize,
+        /// The rows of a kibibyte the shard holds.
+        rows: u64,
+        next_position: u64,
+    }
+
+    impl<'a> OneShard<'a> {
+        fn of(cache: &'a RowCache) -> Self {
+            let built = cache.0.built.load();
+            Self {
+                cache,
+                shard: built.cache.shard_index(&key(0, 0)),
+                rows: built.cache.shard_capacity() / weigh(Some(KIB)),
+                next_position: 0,
+            }
+        }
+
+        /// Inserts `rows` new rows into the shard and returns their keys.
+        fn insert(&mut self, rows: u64) -> Vec<RowKey> {
+            let value = [0_u8; KIB];
+            let mut inserted = Vec::new();
+            while approx::count(inserted.len()) < rows {
+                self.next_position += 1;
+                let candidate = key(self.next_position, 0);
+                if self.cache.0.built.load().cache.shard_index(&candidate) == self.shard {
+                    self.cache.insert(candidate.clone(), Some(&value));
+                    inserted.push(candidate);
+                }
+            }
+            inserted
+        }
     }
 
     #[test]
@@ -413,27 +508,13 @@ mod tests {
     #[test]
     fn test_a_row_read_again_outlives_rows_read_once() {
         let cache = RowCache::new(SHARD_ROWS_ESTIMATE * weigh(Some(KIB)));
-        let value = vec![0_u8; KIB];
-        let shard = cache.0.cache.shard_index(&key(0, 0));
-        let shard_rows = cache.0.cache.shard_capacity() / weigh(Some(KIB));
-        let mut next_position = 0;
-        let mut insert_in_shard = |rows: u64| {
-            let mut inserted = Vec::new();
-            while approx::count(inserted.len()) < rows {
-                next_position += 1;
-                let candidate = key(next_position, 0);
-                if cache.0.cache.shard_index(&candidate) == shard {
-                    cache.insert(candidate.clone(), Some(&value));
-                    inserted.push(candidate);
-                }
-            }
-            inserted
-        };
-        insert_in_shard(shard_rows);
-        let [hit_again] = <[RowKey; 1]>::try_from(insert_in_shard(1)).unwrap();
+        let mut shard = OneShard::of(&cache);
+        let shard_rows = shard.rows;
+        shard.insert(shard_rows);
+        let [hit_again] = <[RowKey; 1]>::try_from(shard.insert(1)).unwrap();
         assert_ne!(cache.get(&hit_again), Cached::Absent);
-        let [read_once] = <[RowKey; 1]>::try_from(insert_in_shard(1)).unwrap();
-        let pass = insert_in_shard(2 * shard_rows);
+        let [read_once] = <[RowKey; 1]>::try_from(shard.insert(1)).unwrap();
+        let pass = shard.insert(2 * shard_rows);
         assert!(
             pass.iter().any(|row| cache.get(row) == Cached::Absent),
             "the shard held every row of the pass, so nothing was displaced"
@@ -475,38 +556,42 @@ mod tests {
         assert_eq!(cache.usage(), 0);
     }
 
-    /// A large cache shrunk to zero empties and caches nothing; at half of
-    /// one largest value per shard it caches small values and not the
-    /// largest; grown back it caches the largest again.
+    /// A large cache shrunk to zero empties and caches nothing, and grown
+    /// back it caches the largest value again; shrunk to half of one
+    /// largest value per shard it caches small values and not the largest,
+    /// and grown back it caches the largest again.
     #[test]
     fn test_resize_to_zero_and_back_caches_what_each_budget_holds() {
-        let cache = RowCache::new(ROOMY_BYTES);
         let largest = vec![0_u8; approx::length(ROW_CACHE_MAX_VALUE_BYTES)];
         let small = b"a value";
-        let shards = approx::count(cache.0.cache.num_shards());
+        let cache = RowCache::new(ROOMY_BYTES);
         cache.insert(key(1, 0), Some(&largest));
         assert_ne!(cache.get(&key(1, 0)), Cached::Absent);
-
         cache.resize(0);
         assert_eq!(cache.usage(), 0);
         cache.insert(key(2, 0), Some(small));
         assert_eq!(cache.get(&key(2, 0)), Cached::Absent);
+        cache.resize(ROOMY_BYTES);
+        cache.insert(key(3, 0), Some(&largest));
+        assert_ne!(cache.get(&key(3, 0)), Cached::Absent);
 
+        let cache = RowCache::new(ROOMY_BYTES);
+        let built = cache.0.built.load_full();
+        let shards = approx::count(built.cache.num_shards());
         let half_a_largest_per_shard = shards * weigh(Some(largest.len())) / 2;
         cache.resize(
-            half_a_largest_per_shard + cache.0.ghosts.beside(half_a_largest_per_shard) + shards,
+            half_a_largest_per_shard + built.ghosts.beside(half_a_largest_per_shard) + shards,
         );
-        cache.insert(key(3, 0), Some(&largest));
-        assert_eq!(cache.get(&key(3, 0)), Cached::Absent);
-        cache.insert(key(4, 0), Some(small));
+        cache.insert(key(4, 0), Some(&largest));
+        assert_eq!(cache.get(&key(4, 0)), Cached::Absent);
+        cache.insert(key(5, 0), Some(small));
         assert_eq!(
-            cache.get(&key(4, 0)),
+            cache.get(&key(5, 0)),
             Cached::Value(Bytes::from_static(small))
         );
-
         cache.resize(ROOMY_BYTES);
-        cache.insert(key(5, 0), Some(&largest));
-        assert_ne!(cache.get(&key(5, 0)), Cached::Absent);
+        cache.insert(key(6, 0), Some(&largest));
+        assert_ne!(cache.get(&key(6, 0)), Cached::Absent);
     }
 
     /// The ghost list's slots are reserved out of the budget at what
@@ -517,18 +602,21 @@ mod tests {
     #[test]
     fn test_the_ghost_list_is_reserved_out_of_the_budget() {
         let cache = RowCache::new(ROOMY_BYTES);
-        let shards = approx::count(cache.0.cache.num_shards());
+        let shards = approx::count(cache.0.built.load().cache.num_shards());
         let ghosts = (ROOMY_BYTES / ESTIMATED_ENTRY_BYTES + shards).div_ceil(GHOST_ITEMS_DIVISOR);
-        assert_eq!(cache.0.ghosts.bytes, ghosts * ROW_ENTRY_OVERHEAD_BYTES);
+        assert_eq!(
+            cache.0.built.load().ghosts.bytes,
+            ghosts * ROW_ENTRY_OVERHEAD_BYTES
+        );
         let under_a_fifteenth = 15;
         assert!(
-            cache.0.ghosts.bytes * under_a_fifteenth < ROOMY_BYTES,
+            cache.0.built.load().ghosts.bytes * under_a_fifteenth < ROOMY_BYTES,
             "the reserve is about a sixteenth of the budget"
         );
         for budget in [ROOMY_BYTES, ROOMY_BYTES / 2, 2 * ROOMY_BYTES] {
             cache.resize(budget);
-            let entries = cache.0.cache.capacity();
-            let held = entries + cache.0.ghosts.beside(entries);
+            let entries = cache.0.built.load().cache.capacity();
+            let held = entries + cache.0.built.load().ghosts.beside(entries);
             assert!(held <= budget, "{held} over {budget}");
             assert!(
                 budget - held <= shards,
@@ -537,15 +625,58 @@ mod tests {
         }
     }
 
-    /// A budget of zero reserves nothing, and its entries hold all of a
-    /// budget it is resized to.
+    /// A budget of zero reserves nothing: its cache holds nothing, and so
+    /// remembers none of what it evicts.
     #[test]
     fn test_a_zero_budget_reserves_no_ghosts() {
         let cache = RowCache::new(0);
-        assert_eq!(cache.0.ghosts.bytes, 0);
-        cache.resize(ROOMY_BYTES);
-        let shards = approx::count(cache.0.cache.num_shards());
-        assert_eq!(cache.0.cache.capacity(), ROOMY_BYTES / shards * shards);
+        assert_eq!(cache.0.built.load().ghosts.bytes, 0);
+    }
+
+    /// Whether `cache` remembers a row evicted from its cold queue: the row,
+    /// cached again soon after its eviction, comes back as hot and outlives
+    /// a pass of rows read once twice its shard's size, which a row cached
+    /// cold does not.
+    fn readmits_a_ghost_as_hot(cache: &RowCache) -> bool {
+        let mut shard = OneShard::of(cache);
+        let shard_rows = shard.rows;
+        shard.insert(shard_rows);
+        let [evicted] = <[RowKey; 1]>::try_from(shard.insert(1)).unwrap();
+        let mut pushed = 0;
+        while cache.0.built.load().cache.contains_key(&evicted) {
+            assert!(
+                pushed <= 2 * shard_rows,
+                "the row never left the cold queue"
+            );
+            shard.insert(1);
+            pushed += 1;
+        }
+        cache.insert(evicted.clone(), Some(&[0_u8; KIB]));
+        shard.insert(2 * shard_rows);
+        cache.0.built.load().cache.contains_key(&evicted)
+    }
+
+    /// A cache resized up from zero is the cache `new` builds for the new
+    /// budget: its shards, its entries' capacity, and its ghost list's
+    /// reserve, and its ghost list remembers evicted rows, whether it was
+    /// built at zero, as for a server whose tables read pages alone, or
+    /// shrunk to zero from a budget of its own.
+    #[test]
+    fn test_resize_from_zero_builds_the_cache_new_builds() {
+        let budget = SHARD_ROWS_ESTIMATE * weigh(Some(KIB));
+        let fresh = RowCache::new(budget);
+        assert!(
+            readmits_a_ghost_as_hot(&fresh),
+            "a fresh cache keeps ghosts"
+        );
+        let built_at_zero = RowCache::new(0);
+        let shrunk_to_zero = RowCache::new(budget);
+        shrunk_to_zero.resize(0);
+        for (grown, from) in [(built_at_zero, "built at zero"), (shrunk_to_zero, "shrunk")] {
+            grown.resize(budget);
+            assert_eq!(grown.shape(), RowCache::new(budget).shape(), "{from}");
+            assert!(readmits_a_ghost_as_hot(&grown), "{from}");
+        }
     }
 
     /// The counters are registered at zero when the cache is made, a scrape's

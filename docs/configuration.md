@@ -101,7 +101,7 @@ table = "profiles"
 | `metrics_listen` | address | `"127.0.0.1:9433"` | The HTTP listener for `/metrics` and `/ready`. |
 | `poll_interval` | duration | `"10s"` | How often each table's ref is re-resolved and the configuration file re-read. At least `"1s"` and at most `"24h"`. |
 | `cache_bytes` | bytes | half the memory limit, else `268435456` (256 MiB) | The memory the row cache and the page cache's memory level hold together. The page cache holds every table's pages, a key-value table's and an ordered table's alike. Unset, it is half the process's memory limit, the smaller of its cgroup's limit and the host's memory, and 256 MiB when neither can be read. See the note below. |
-| `row_cache_share` | number | `0.9` | The share of `cache_bytes` the row cache holds, in [0, 1]; the page cache's memory level holds the rest. When no table reads through the row cache, the page cache holds all of `cache_bytes`. A value outside the range is refused, as `server.row_cache_share 1.5 is not in [0, 1]`. |
+| `row_cache_share` | number | `0.9` | The share of `cache_bytes` the row cache holds, in [0, 1]; the page cache's memory level holds the rest. When no table reads through the row cache, the page cache holds all of `cache_bytes`. A server with no page-cache disk level that serves a table reading through the row cache beside one reading pages alone must set it; see the note below. A value outside the range is refused, as `server.row_cache_share 1.5 is not in [0, 1]`. |
 | `get_deadline` | duration | `"5s"` | The longest a `Get` may run, and the longest each page fetch of any lookup may run, in a `MultiGet` too. Past it the call fails with `DEADLINE_EXCEEDED`. |
 | `multi_get_deadline` | duration | `"15s"` | The longest a whole `MultiGet` may run, whatever its size. |
 | `max_in_flight` | count | `1024` | The most `Get`, `MultiGet`, `Scan`, and `MultiScan` calls in flight at once. icetray refuses one more immediately with `RESOURCE_EXHAUSTED`; calls are never queued. |
@@ -119,12 +119,14 @@ Every duration and every count must be above zero. The gRPC layer
 enforces a client's own deadline, and its expiry is reported as the
 client's.
 
-icetray sizes the caches once, as they open at start, and logs the
-result ([Operating icetray](operating.md#logs)). A key-value table reads
+icetray sizes the caches as they open at start, and logs the result
+([Operating icetray](operating.md#logs)). A key-value table reads
 through the row cache unless it sets `row_cache = false`, so on a server
 that serves one that does, the row cache holds `row_cache_share` of
 `cache_bytes`; on a server where no table does, the page cache holds all
-of it. The default follows the memory
+of it. A reload that changes whether any table served reads through the
+row cache resizes both caches to match, within the same `cache_bytes`;
+any other change to either setting applies on restart. The default follows the memory
 limit rather than the memory free, so every start of a replica gets the
 same budget, and the other half of the limit holds the resident indexes,
 a second generation while a refresh loads, and requests in flight
@@ -145,6 +147,19 @@ it was read. A file that still sets the removed `page_cache_bytes` or
 `server.scan_page_cache_bytes is no longer a setting; use server.cache_bytes`.
 The worker count is the number of cores the process sees, unless
 `TOKIO_WORKER_THREADS` sets it.
+
+A server with no page-cache disk level, which is `storage.local` with a
+`page_cache_disk_bytes` above zero, that serves a table reading through
+the row cache beside tables reading pages alone, ordered tables or
+key-value tables with `row_cache = false`, must set `row_cache_share`.
+Those tables' pages live in the page cache's memory level alone, and no
+default share suits both kinds of table there, so icetray refuses the
+file, naming the tables reading pages alone, as `the server has no
+page-cache disk level and serves tables reading through the row cache
+beside tables reading pages alone (events); set storage.local with
+page_cache_disk_bytes above zero, or set server.row_cache_share`. `serve`
+refuses it at start with exit 1, the doctor reports it the same way, and
+a reload to such a file is refused whole.
 
 ### `[server.log]`
 
@@ -238,7 +253,7 @@ storage ([Operating icetray](operating.md#the-local-directory)).
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `dir` | path | required | The directory. A relative path is taken from the working directory. |
-| `page_cache_disk_bytes` | bytes | required | The size bound of the page cache's disk level, which holds the pages of every table, key-value and ordered, that leave memory. `0` turns the level off; any other value is at least one 4 MiB block, 4194304. |
+| `page_cache_disk_bytes` | bytes | required | The size bound of the page cache's disk level, which holds the pages of every table, key-value and ordered, that leave memory. `0` turns the level off; any other value is at least one 4 MiB block, 4194304. Without the level, a server that serves tables reading through the row cache beside tables reading pages alone sets `server.row_cache_share` ([`[server]`](#server)). |
 | `index_budget_bytes` | bytes | unbounded | The bytes chunk files may occupy across every table. icetray checks it when a load begins and refuses a load that would exceed it as `over_budget`. The footer gives an ordered table's string and binary order fences only by estimate, so icetray reserves each of its chunk files at the exact length before it writes it, and refuses the load then when that length does not fit. |
 
 The disk level holds one open file descriptor per 4 MiB block, so
@@ -255,7 +270,7 @@ The disk level holds one open file descriptor per 4 MiB block, so
 | `value_columns` | list of strings or tables | required | The value columns icetray serves for the table. Each is a top-level field matched the same way, and icetray reads it only when a request lists it ([Value columns](table-layout.md#value-columns)). An entry is the column's name, `"payload"`, or a table of its `name` and its `format`, `{ name = "detail", format = "protobuf" }`; in JSON, `"payload"` or `{"name": "detail", "format": "protobuf"}`. `format` is `"opaque"`, the default, for bytes icetray returns as stored, or `"protobuf"`, for a serialized protobuf message that icetray can trim to the top-level fields a request lists ([Protobuf columns](table-layout.md#protobuf-columns)). An unknown key in the table form is a schema error reported at its path, as ``tables[0].value_columns[1].fromat: unknown field `fromat`, expected `name` or `format` ``, and so is an unknown format, as ``tables[0].value_columns[1].format: unknown variant `json`, expected `opaque` or `protobuf` ``. The list may be empty, `value_columns = []`, for a table served for key presence only. Each column must be of Iceberg type `binary`, `fixed`, or `string`, and a protobuf column of type `binary`; icetray refuses a snapshot that breaks this as `value_type_unsupported`, naming the column. Each name follows `key_column`'s rule, and a name outside it makes the file invalid, as `tables[0].value_columns names "user-id", ...`. An empty name makes the file invalid, as `tables[0].value_columns lists an empty name`; so does a name listed twice, as `tables[0].value_columns lists "payload" more than once`, and the key column, as `tables[0].value_columns lists the key column "key"`. The order of the list is not significant: a reload that only reorders it changes nothing, one that changes only formats applies to the serving snapshot in place, and one that changes the set of columns loads the table anew. |
 | `order_column` | string | none | The order column of an [ordered table](table-layout.md#ordered-tables): a top-level field of Iceberg type `int`, `long`, `date`, `timestamp`, `timestamptz`, `timestamp_ns`, `timestamptz_ns`, `string`, `binary`, or `fixed`, matched as `key_column` is and following its name rule, by which each key's rows are sorted after the key. A table that sets it is an ordered table, which `Scan` and `MultiScan` read; a table without it is a key-value table, which `Get` and `MultiGet` read. Naming the key column makes the file invalid, as `tables[0].order_column names the key column`, and so does listing it in `value_columns`, as `tables[0].value_columns lists the order column "ts"`. Setting, changing, or removing it loads the table anew. |
 | `max_scan_rows` | count | `1000` on an ordered table | The most rows one `Scan`, or one key of a `MultiScan`, returns, as long as the response fits `server.max_scan_bytes`; the doctor's `large_runs` advice names each file whose rows at this limit would not. A call sets its limit from 1 to this value: a limit of 0, or one above it, is `INVALID_ARGUMENT`. Set only on an ordered table: on a key-value table it makes the file invalid, as `tables[0].max_scan_rows is set, but the table sets no order_column, and only an ordered table is scanned`. Zero is invalid, and so is a value above half of `server.max_multi_scan_values`, so a `MultiScan` of one key at the full limit and one column is always valid. A change applies to the serving table in place. |
-| `row_cache` | boolean | `true` on a key-value table | Whether the table's lookups read each value through the row cache ([The row cache](performance.md#the-row-cache)), which keeps a repeated hit off its value page. Turn it off for a table whose callers keep their own cache in front of icetray, so the row cache's memory goes to tables that reuse it; such a table reads pages alone. Set only on a key-value table: on an ordered table it makes the file invalid, to either value, as `tables[0].row_cache is set, but the table sets an order_column, and only a key-value table reads through the row cache`. A change loads the table anew. The caches are sized at start, so a reload that turns the row cache on for a server that started with no table reading through it serves that table from a row cache of no bytes until the next start. |
+| `row_cache` | boolean | `true` on a key-value table | Whether the table's lookups read each value through the row cache ([The row cache](performance.md#the-row-cache)), which keeps a repeated hit off its value page. Turn it off for a table whose callers keep their own cache in front of icetray, so the row cache's memory goes to tables that reuse it; such a table reads pages alone. Set only on a key-value table: on an ordered table it makes the file invalid, to either value, as `tables[0].row_cache is set, but the table sets an order_column, and only a key-value table reads through the row cache`. A change loads the table anew. A reload that changes whether any table served reads through the row cache resizes the row cache and the page cache's memory level ([`[server]`](#server)). |
 | `source` | table | required | Where icetray reads the table's metadata from, below. |
 | `lookups` | string | the best level `residency` reaches | The lookup cost the owner accepts for the table: `"optimal"`, `"balanced"`, or `"permissive"`; see [Choosing a level](#choosing-a-level). `full` and `disk` default to `"optimal"` and `bloom` to `"balanced"`. A level the residency cannot reach makes the file invalid, as `tables[0].lookups optimal is above what tables[0].residency bloom reaches; bloom reaches balanced at best`. |
 | `strict` | boolean | `false` | Whether icetray refuses a snapshot whose layout falls below the table's `lookups` level. When a strict table's first snapshot is below its level, the start fails; icetray refuses a later one and [holds](glossary.md) the table, and the last snapshot that met the level keeps serving. With `strict` off, icetray serves the snapshot and flags the table below its level. |

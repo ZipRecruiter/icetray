@@ -19,10 +19,10 @@ use crate::approx;
 use crate::budget::{self, Budget};
 use crate::cache::{self, PageCache};
 use crate::catalog::TableSource;
-use crate::config::{Config, ConfigError, TableConfig};
+use crate::config::{Config, ConfigError, ServerConfig, TableConfig};
 use crate::error::{Error, Result};
 use crate::local::{ChunkRules, DataFileIdentity, LocalDir};
-use crate::memory;
+use crate::memory::{self, MemoryLimit};
 use crate::row_cache::RowCache;
 use crate::storage::Storage;
 use crate::table::{self, CallsInFlight, FindingLog, Table, TableHandles};
@@ -37,9 +37,16 @@ pub struct Opened {
     pub cache: PageCache,
     /// The row cache every key-value table shares (RFD 026).
     pub row_cache: RowCache,
-    /// What the row cache and the page cache's memory level were opened
-    /// with (RFD 028).
-    pub budget: Budget,
+    /// What the row cache and the page cache's memory level hold now (RFD
+    /// 028): what `open_with` resolved, until `fit_caches` changes the
+    /// split. Never held across an `await`.
+    budget: Mutex<Budget>,
+    /// The server settings the budget was resolved under, which a reload
+    /// cannot change (RFD 018).
+    server: ServerConfig,
+    /// The memory limit read when the caches opened: `fit_caches` resolves
+    /// under it, so the whole budget stays the one the server started with.
+    limit: Option<MemoryLimit>,
     /// The local directory (RFD 017), when `storage.local` is set.
     pub local: Option<Arc<LocalDir>>,
     /// The tables served, each in `Loading` until the caller loads it.
@@ -202,6 +209,47 @@ impl Opened {
             .and_then(|local| local.page_cache_level())
             .map_or(0, |level| level.capacity_bytes());
         files.values().sum::<u64>().saturating_add(disk_level)
+    }
+
+    /// What the row cache and the page cache's memory level hold now (RFD
+    /// 028).
+    pub fn budget(&self) -> Budget {
+        *self.budget.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Resizes the row cache and the page cache's memory level to the split
+    /// the tables served now call for (RFD 028): the budget resolved under
+    /// the settings and the memory limit the caches opened with, so its
+    /// whole is unchanged, with the row cache's part when a table served
+    /// reads through it and none otherwise. Nothing changes when the row
+    /// part is as it was. The cache that shrinks is resized first, so the
+    /// two never hold more than the whole between the resizes, and a resize
+    /// blocks until its evictions are done. A new page part under the
+    /// minimum for the page cache's shards is `Error::Config` with
+    /// `ConfigViolation::PageCacheTooSmall` and changes nothing; a failure
+    /// of the page cache's level is `CacheError::Backend`, after a row
+    /// cache that shrinks has shrunk, and leaves the split recorded as it
+    /// was, so the next call resizes again. The serve loop
+    /// calls it after every reload that applied, and the split is logged
+    /// as `cache budget` when it changes.
+    pub fn fit_caches(&self) -> Result<()> {
+        let rows_read = self.tables().iter().any(|table| table.config().row_cache());
+        let next = budget::resolve(&self.server, self.limit, rows_read, cache::memory_shards())
+            .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
+        let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+        if next.row_bytes == budget.row_bytes {
+            return Ok(());
+        }
+        if next.row_bytes < budget.row_bytes {
+            self.row_cache.resize(next.row_bytes);
+            self.cache.resize_memory(next.page_bytes)?;
+        } else {
+            self.cache.resize_memory(next.page_bytes)?;
+            self.row_cache.resize(next.row_bytes);
+        }
+        *budget = next;
+        log_budget(&next, self.limit);
+        Ok(())
     }
 
     /// Replaces the tables served with `configs`, all or nothing (RFD
@@ -443,14 +491,7 @@ pub async fn open_with(
     let shards = cache::memory_shards();
     let budget = budget::resolve(&config.server, limit, config.reads_rows(), shards)
         .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
-    tracing::info!(
-        cache_bytes = budget.row_bytes + budget.page_bytes,
-        row_bytes = budget.row_bytes,
-        page_bytes = budget.page_bytes,
-        limit = limit.map(|limit| limit.bytes),
-        limit_source = limit.map(|limit| tracing::field::display(limit.of)),
-        "cache budget"
-    );
+    log_budget(&budget, limit);
     let local = match &config.storage.local {
         Some(local) => Some(Arc::new(LocalDir::open(local, storage.stats())?)),
         None => None,
@@ -493,7 +534,9 @@ pub async fn open_with(
         storage,
         cache,
         row_cache,
-        budget,
+        budget: Mutex::new(budget),
+        server: config.server.clone(),
+        limit,
         local,
         tables: ArcSwap::from_pointee(Tables::new(tables)),
         pending: Mutex::new(Vec::new()),
@@ -503,6 +546,18 @@ pub async fn open_with(
         deadlines,
         complete,
     })
+}
+
+/// Logs `budget`, resolved under the memory `limit`, as `cache budget`.
+fn log_budget(budget: &Budget, limit: Option<MemoryLimit>) {
+    tracing::info!(
+        cache_bytes = budget.row_bytes + budget.page_bytes,
+        row_bytes = budget.row_bytes,
+        page_bytes = budget.page_bytes,
+        limit = limit.map(|limit| limit.bytes),
+        limit_source = limit.map(|limit| tracing::field::display(limit.of)),
+        "cache budget"
+    );
 }
 
 /// A table for `config` over `handles`, under `deadlines`, in `Loading` and
@@ -538,7 +593,7 @@ mod tests {
         ConfigError, ConfigViolation, DEFAULT_MAX_SCAN_ROWS, LocalConfig, Residency, ServerConfig,
         SourceConfig, StorageConfig, TableConfig,
     };
-    use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
+    use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
     use crate::error::{Budget, ErrorKind, RefusalReason};
     use crate::generation::testing::{
         E2E_KEYS, FIRST_SEQUENCE, FIRST_SNAPSHOT, FIRST_VERSION, KEY_STEP, POLL_GETS,
@@ -784,11 +839,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            opened.budget,
+            opened.budget(),
             budget::resolve(&config.server, None, true, cache::memory_shards()).unwrap()
         );
-        assert!(opened.budget.row_bytes > opened.budget.page_bytes);
+        assert!(opened.budget().row_bytes > opened.budget().page_bytes);
         assert!(opened.handles.row_cache.is_some());
+    }
+
+    /// A whole budget whose page part, at the default row share, holds
+    /// about one value page in each shard of the page cache's memory level,
+    /// and so ten times that once no table reads through the row cache.
+    fn tight_budget() -> u64 {
+        let pages_per_shard_without_rows = 10;
+        pages_per_shard_without_rows * cache::min_memory_bytes(cache::memory_shards())
+    }
+
+    /// `table` reading pages alone.
+    fn pages_alone(table: TableConfig) -> TableConfig {
+        TableConfig {
+            row_cache: Some(false),
+            ..table
+        }
+    }
+
+    /// Fills the page cache of `opened` with twice its whole budget of
+    /// value pages, under keys no table reads.
+    async fn fill_pages(opened: &Opened) {
+        let page = bytes::Bytes::from(vec![0_u8; approx::length(VALUE_PAGE_BYTES)]);
+        let twice_the_budget = 2 * tight_budget() / VALUE_PAGE_BYTES;
+        opened.cache.fill(0, twice_the_budget, &page).await;
+    }
+
+    /// Whether the row cache of `opened` keeps a value inserted into it.
+    fn row_cache_keeps_a_value(opened: &Opened) -> bool {
+        let file: Arc<str> = Arc::from("mem://w/db/t/data/rows.parquet");
+        let key = crate::row_cache::RowKey::new(&file, crate::index::RowPosition(0), 0);
+        opened.row_cache.insert(key.clone(), Some(b"a value"));
+        opened.row_cache.get(&key) != crate::row_cache::Cached::Absent
+    }
+
+    /// A reload that drops the last table reading through the row cache
+    /// gives the page cache's memory level the whole budget, which it then
+    /// fills past the part it had, and the row cache nothing.
+    #[tokio::test]
+    async fn test_a_reload_dropping_the_last_row_cache_table_gives_pages_the_budget() {
+        let fixture = two_file_fixture().await;
+        let first = named(FIRST_TABLE, &fixture, Residency::Full);
+        let mut config = config(vec![first.clone()]);
+        config.server.cache_bytes = Some(tight_budget());
+        let opened = loaded(&config).await;
+        let before = opened.budget();
+        assert!(before.row_bytes > 0, "the key-value table reads rows");
+        assert!(row_cache_keeps_a_value(&opened));
+
+        opened.apply(&[pages_alone(first)]).await.unwrap();
+        opened.fit_caches().unwrap();
+        assert_eq!(
+            opened.budget(),
+            budget::Budget {
+                row_bytes: 0,
+                page_bytes: tight_budget(),
+                derived_from: None,
+            }
+        );
+        fill_pages(&opened).await;
+        let held = approx::count(opened.cache.usage());
+        assert!(held > before.page_bytes, "{held} within the part pages had");
+        assert!(held <= tight_budget(), "{held} over the whole budget");
+        assert_eq!(opened.row_cache.usage(), 0);
+        assert!(!row_cache_keeps_a_value(&opened));
+    }
+
+    /// A reload that serves the first table reading through the row cache,
+    /// on a server whose tables read pages alone until then, gives the row
+    /// cache its share, which caches again, and the page cache the rest.
+    #[tokio::test]
+    async fn test_a_reload_adding_the_first_row_cache_table_gives_rows_their_share() {
+        let fixture = two_file_fixture().await;
+        let first = named(FIRST_TABLE, &fixture, Residency::Full);
+        let mut config = config(vec![pages_alone(first.clone())]);
+        config.server.cache_bytes = Some(tight_budget());
+        let opened = loaded(&config).await;
+        assert_eq!(opened.budget().row_bytes, 0);
+        assert!(!row_cache_keeps_a_value(&opened));
+
+        opened.apply(&[first]).await.unwrap();
+        opened.fit_caches().unwrap();
+        let shards = cache::memory_shards();
+        assert_eq!(
+            opened.budget(),
+            budget::resolve(&config.server, None, true, shards).unwrap()
+        );
+        assert!(row_cache_keeps_a_value(&opened));
+        fill_pages(&opened).await;
+        let held = approx::count(opened.cache.usage());
+        assert!(
+            held <= opened.budget().page_bytes,
+            "{held} over the page part"
+        );
     }
 
     /// A call in flight on one table is counted where every other table

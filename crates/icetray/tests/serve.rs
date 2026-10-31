@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::StatusCode;
+use icetray::cli::{ConfigPath, PathOrigin};
+use icetray::error::ConfigRejected;
 use icetray::listen::{METRICS_PATH, NOT_READY_BODY, READY_BODY, READY_PATH};
 use icetray::reload::{ConfigSource, Digest, Reading, Reload, ReloadResult};
 use icetray::serve::{OVERALL_SERVICE, PeriodicTask};
@@ -2742,14 +2744,28 @@ struct Versions {
     current: std::sync::Mutex<(u64, Config)>,
     /// Reads the daemon made.
     reads: std::sync::atomic::AtomicU64,
+    /// Whether a read holds each version to every rule `Config::parse`
+    /// checks, as a read of the file does. Off, a test reaches what
+    /// validation refuses, such as the poll interval its stack runs under.
+    validated: bool,
 }
 
 impl Versions {
-    /// Version 0, `config`.
+    /// Version 0, `config`, each version read as it was set.
     fn new(config: Config) -> Arc<Self> {
         Arc::new(Self {
             current: std::sync::Mutex::new((0, config)),
             reads: std::sync::atomic::AtomicU64::new(0),
+            validated: false,
+        })
+    }
+
+    /// Version 0, `config`, each version validated as it is read.
+    fn validated(config: Config) -> Arc<Self> {
+        Arc::new(Self {
+            current: std::sync::Mutex::new((0, config)),
+            reads: std::sync::atomic::AtomicU64::new(0),
+            validated: true,
         })
     }
 
@@ -2794,9 +2810,26 @@ impl ConfigSource for Versions {
             .lock()
             .expect("no test panics holding it")
             .clone();
+        if !self.validated {
+            return Ok(Reading {
+                digest: Self::digest(version),
+                config: Ok(config),
+            });
+        }
         Ok(Reading {
             digest: Self::digest(version),
-            config: Ok(config),
+            config: config.validated().map_err(|error| {
+                let icetray_core::Error::Config(source) = error else {
+                    panic!("validation fails with a configuration error, got {error}");
+                };
+                ConfigRejected {
+                    file: ConfigPath {
+                        path: PathBuf::from("versions.toml"),
+                        origin: PathOrigin::Flag,
+                    },
+                    source,
+                }
+            }),
         })
     }
 }
@@ -2814,10 +2847,32 @@ async fn following() -> Result<(Stack, Arc<Versions>), BoxError> {
 /// A stack over `specs`, serving the first alone and following `Versions`
 /// from there, loaded.
 async fn following_over(specs: Vec<FixtureSpec>) -> Result<(Stack, Arc<Versions>), BoxError> {
+    following_with(specs, Versions::new).await
+}
+
+/// `following_over` with every version validated as it is read. The
+/// test poll interval is under validation's minimum, so the stack polls at
+/// the default interval instead, and a test that waits for a reload
+/// requests it.
+async fn following_validated(specs: Vec<FixtureSpec>) -> Result<(Stack, Arc<Versions>), BoxError> {
+    following_with(specs, |mut config| {
+        config.server.poll_interval = ServerConfig::default().poll_interval;
+        Versions::validated(config)
+    })
+    .await
+}
+
+/// `following_over` with the versions `versions` makes of the stack's
+/// configuration.
+async fn following_with(
+    specs: Vec<FixtureSpec>,
+    versions: impl FnOnce(Config) -> Arc<Versions>,
+) -> Result<(Stack, Arc<Versions>), BoxError> {
     let mut followed = None;
     let mut stack = Stack::start_with(specs, async |setup| {
         setup.config.tables.truncate(1);
-        let versions = Versions::new(setup.config.clone());
+        let versions = versions(setup.config.clone());
+        setup.config.server = versions.config().server;
         setup.options.reload = Some(versions.reload());
         followed = Some(versions);
         Ok(())
@@ -3105,6 +3160,72 @@ async fn test_reload_refuses_a_strict_change_the_serving_snapshot_is_below() -> 
     assert!(!table.config().strict, "the refused entry is not taken");
     assert_eq!(stack.pending().await?, Some(1.0));
     stack.table_info(TABLE).await?;
+    Ok(())
+}
+
+/// A reload that serves an ordered table beside a key-value table reading
+/// through the row cache, on a server with no page-cache disk level and no
+/// `row_cache_share`, fails validation and is refused whole (RFD 028): the
+/// ordered table is not served, the key-value table serves on, and the
+/// caches keep their split.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_reload_adding_an_ordered_table_to_a_row_server_without_disk_is_refused()
+-> TestResult {
+    let _serial = SERIAL.lock().await;
+    let (mut stack, versions) = following_validated(vec![
+        FixtureSpec::small(TABLE, KeyType::Long),
+        ordered_spec(ORDERED_TABLE),
+    ])
+    .await?;
+    let budget = stack.serving.opened().budget();
+    let before = stack.reloads(ReloadResult::Refused).await?;
+    let mut next = versions.config();
+    next.tables
+        .push(stack.ordered().config(Residency::Full, false));
+    versions.set(next);
+    stack.serving.reload();
+    stack.reloaded(ReloadResult::Refused, before).await?;
+
+    assert_eq!(
+        code_of(stack.table_info(ORDERED_TABLE).await),
+        Code::NotFound
+    );
+    stack.table_info(TABLE).await?;
+    assert_eq!(stack.pending().await?, Some(1.0));
+    assert_eq!(stack.serving.opened().budget(), budget);
+    Ok(())
+}
+
+/// A reload that turns the row cache off for the last table reading
+/// through it gives the page cache's memory level the whole budget, and one
+/// that turns it on again gives the row cache its share back.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_reload_that_changes_whether_rows_are_read_resizes_the_caches() -> TestResult {
+    let _serial = SERIAL.lock().await;
+    let (stack, versions) = following().await?;
+    let opened = Arc::clone(stack.serving.opened());
+    let split = opened.budget();
+    assert!(split.row_bytes > 0, "the key-value table reads rows");
+    let whole = split.row_bytes + split.page_bytes;
+
+    let mut pages_alone = versions.config();
+    pages_alone.tables[0].row_cache = Some(false);
+    versions.set(pages_alone);
+    stack.serving.reload();
+    poll_until(REFRESH_WAIT, "the page cache given the whole", async || {
+        Ok((opened.budget().row_bytes == 0).then_some(()))
+    })
+    .await?;
+    assert_eq!(opened.budget().page_bytes, whole);
+
+    let mut rows = versions.config();
+    rows.tables[0].row_cache = None;
+    versions.set(rows);
+    stack.serving.reload();
+    poll_until(REFRESH_WAIT, "the row cache given its share", async || {
+        Ok((opened.budget() == split).then_some(()))
+    })
+    .await?;
     Ok(())
 }
 

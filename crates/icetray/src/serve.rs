@@ -491,8 +491,9 @@ impl Run {
     /// periodic task that panics before the shutdown aborts it, a pending
     /// shutdown included, ends the run as `Periodic`, so the process exits
     /// non-zero instead of serving on with nothing refreshing. A reload
-    /// that applies stops the refreshes of the tables it dropped and
-    /// starts those of the tables it added, then runs retention; a
+    /// that applies stops the refreshes of the tables it dropped, starts
+    /// those of the tables it added, and resizes the caches to the split
+    /// the tables now served call for, then runs retention; a
     /// shutdown drops a reload in flight, which swaps nothing in.
     async fn run(mut self) -> Result<(), ServeError> {
         // Biased, the loads first: when they have ended and a shutdown is
@@ -551,6 +552,7 @@ impl Run {
                     for table in &applied.started {
                         periodic.spawn_refresh(table, &self.opened, self.poll_interval);
                     }
+                    fit_caches(&self.opened);
                     tokio::select! {
                         () = retain(&self.opened) => {}
                         () = stop(self.shutdown.subscribe()) => break None,
@@ -695,6 +697,19 @@ pub(crate) async fn retain(opened: &Opened) {
         Err(error) => {
             tracing::warn!(reason = %error.kind(), %error, "chunk file retention failed");
         }
+    }
+}
+
+/// Resizes the caches to the split the tables a reload swapped in call
+/// for (`Opened::fit_caches`). A refusal is logged and leaves both caches
+/// as they were: the tables serve on, the row cache at the part it had.
+fn fit_caches(opened: &Opened) {
+    if let Err(error) = opened.fit_caches() {
+        tracing::error!(
+            reason = %error.kind(),
+            %error,
+            "caches not resized for the tables reloaded"
+        );
     }
 }
 

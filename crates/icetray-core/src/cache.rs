@@ -898,6 +898,23 @@ impl PageCache {
         }
     }
 
+    /// Sets the memory level's budget to `bytes`, split evenly over its
+    /// shards as `new` splits it, evicting in each shard until what it
+    /// holds fits: a memory-only cache drops what it evicts, and a cache
+    /// with a disk level writes it there. The disk level is unchanged. The
+    /// call blocks until every shard has evicted. `Opened::fit_caches`
+    /// checks the budget against `min_memory_bytes` first; a smaller one
+    /// given here directly is taken as it is. A failure of the level is
+    /// `CacheError::Backend`.
+    pub fn resize_memory(&self, bytes: u64) -> Result<()> {
+        let bytes = approx::length(bytes);
+        match self.level.as_ref() {
+            Level::Memory(cache) => cache.resize(bytes),
+            Level::Hybrid { cache, .. } => cache.memory().resize(bytes),
+        }
+        .map_err(backend)
+    }
+
     /// Evicts every page memory holds, as eviction does: a memory-only
     /// cache drops it, so the next request for it fetches it again, and a
     /// cache with a disk level writes it there. What a benchmark's cold read
@@ -907,6 +924,22 @@ impl PageCache {
         match self.level.as_ref() {
             Level::Memory(cache) => cache.evict_all(),
             Level::Hybrid { cache, .. } => cache.memory().evict_all(),
+        }
+    }
+
+    /// Fetches `pages` copies of `page` into the cache, keyed under one
+    /// file no table reads at offsets from `from` on: what a test fills
+    /// memory with to see how much it holds.
+    #[cfg(test)]
+    pub(crate) async fn fill(&self, from: u64, pages: u64, page: &Bytes) {
+        let file: Arc<str> = Arc::from("mem://w/db/t/data/filler.parquet");
+        for offset in from..from + pages {
+            let page = page.clone();
+            self.get_or_fetch((Arc::clone(&file), offset), Issue::default(), || async {
+                Ok(page)
+            })
+            .await
+            .expect("a fetch that answers at once fills the cache");
         }
     }
 
@@ -2325,6 +2358,53 @@ mod tests {
             !buffer.as_ptr_range().contains(&page.as_ptr()),
             "the cached page points into the fetch's buffer"
         );
+    }
+
+    /// A page of a kibibyte, which the resize test fills memory with.
+    const KIB_PAGE: &[u8] = &[0; 1024];
+
+    /// Resizing the memory level bounds what memory holds by the new
+    /// budget: shrunk, it evicts down to it at once and holds no more
+    /// after, and grown, it holds more than the smaller budget, for a
+    /// memory-only cache and one over a disk level alike.
+    #[tokio::test]
+    async fn test_resize_memory_bounds_what_memory_holds() {
+        let large = ROOMY_BYTES;
+        let small = ROOMY_BYTES / 8;
+        let pages_past_large = 2 * count(large) / page_bytes(KIB_PAGE);
+        let dir = tempfile::tempdir().unwrap();
+        for disk in [None, Some(disk_level(dir.path()).0)] {
+            let hybrid = disk.is_some();
+            let cache = PageCache::new(large, disk).await.unwrap();
+            cache
+                .fill(0, pages_past_large, &Bytes::from_static(KIB_PAGE))
+                .await;
+            assert!(cache.usage() > small, "hybrid {hybrid}: filled past small");
+            assert!(cache.usage() <= large, "hybrid {hybrid}");
+
+            cache.resize_memory(count(small)).unwrap();
+            assert!(cache.usage() <= small, "hybrid {hybrid}: {}", cache.usage());
+            cache
+                .fill(
+                    pages_past_large,
+                    pages_past_large,
+                    &Bytes::from_static(KIB_PAGE),
+                )
+                .await;
+            assert!(cache.usage() <= small, "hybrid {hybrid}: {}", cache.usage());
+
+            cache.resize_memory(count(large)).unwrap();
+            cache
+                .fill(
+                    2 * pages_past_large,
+                    pages_past_large,
+                    &Bytes::from_static(KIB_PAGE),
+                )
+                .await;
+            assert!(cache.usage() > small, "hybrid {hybrid}: grew past small");
+            assert!(cache.usage() <= large, "hybrid {hybrid}");
+            cache.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

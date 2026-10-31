@@ -292,9 +292,14 @@ Events worth knowing:
 - `cache budget`, at start, with `cache_bytes`, the whole budget, split
   into `row_bytes` for the row cache and `page_bytes` for the page
   cache's memory level, and the memory `limit` with its `limit_source`
-  (`cgroup` or `host`), both absent when no limit can be read. The
+  (`cgroup` or `host`), both absent when no limit can be read; and again
+  after a reload that changes the split
+  ([Refresh and reload](#refresh-and-reload)). The
   budget is derived from the limit unless `server.cache_bytes` sets it
   ([Configuration](configuration.md#server)).
+- `caches not resized for the tables reloaded`, at `error`, with the
+  `reason` and the `error`, when the page cache's new part after a reload
+  is below its minimum; both caches keep the split they had.
 - `listening`, with both addresses and the table count; then
   `table serving` for each table as its first load completes.
 - `swapped in a generation`, with the snapshot id and the files reused,
@@ -550,6 +555,16 @@ restart ([RFD 018](rfd/018-configuration-reload.md)).
   retuned tables take their new entries in the same swap. A request for a
   removed table then returns `NOT_FOUND`. icetray logs the outcome as
   `configuration reloaded` ([Logs](#logs)).
+- When the swap changes whether any table served reads through the row
+  cache, icetray resizes the row cache and the page cache's memory level
+  within the same `server.cache_bytes`: the last such table gone, the
+  page cache holds the whole budget and the row cache nothing; the first
+  one added, the row cache takes `server.row_cache_share` of it, and the
+  page cache evicts down to the rest, writing what it evicts to the disk
+  level when there is one. icetray logs the new split as `cache budget`.
+  A file that mixes the two kinds of table with no page-cache disk level
+  and no `row_cache_share` fails validation, so such a reload is refused
+  ([Configuration](configuration.md#server)).
 - icetray refuses a reload whole when any of those tables fails to load
   or a retuned table is refused, when the file does not parse or fails
   validation (a file that lists no table fails it), or when any setting
