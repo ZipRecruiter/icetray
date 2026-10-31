@@ -336,8 +336,8 @@ pub struct PageCache {
 /// The pages span reads of one cache are fetching (`PageCache::get_span`),
 /// split by file over `shard::count()` shards, so that span reads of
 /// different files, and so of different tables, mostly take different
-/// locks; and the count of pages a span read found in flight and waited
-/// for.
+/// locks; and the count of pages a span read found in flight, here or as
+/// a lookup's fetch (`PageCache::read_disk`), and waited for.
 struct SpanFlights {
     shards: Sharded<FlightShard>,
     /// Picks a file's shard from its id.
@@ -550,7 +550,9 @@ impl PageCache {
     /// read's. A page neither in memory nor in flight that the disk level
     /// holds is read from it, the read's disk reads together, and counted
     /// a hit and a local read as a lookup's disk hit is (RFD 027, A span
-    /// read); one the level fails to read is fetched (RFD 017). Every
+    /// read); one the level fails to read is fetched (RFD 017), and one a
+    /// lookup is fetching is served from that fetch, counted as a page
+    /// joined in flight is and from outside (`read_disk`). Every
     /// maximal run of the remaining pages whose ranges meet end to start is
     /// one call of `fetch` over the run's whole range, its bytes split by
     /// page and each page inserted into memory as its own entry, keyed by
@@ -592,7 +594,12 @@ impl PageCache {
         let mut served: Vec<Option<Bytes>> = vec![None; pages.len()];
         let mut from_outside = false;
         loop {
-            let Pending { runs, waits } = self.pending(file, pages, &mut served).await;
+            let Pending {
+                runs,
+                waits,
+                joined_fetch,
+            } = self.pending(file, pages, &mut served).await;
+            from_outside |= joined_fetch;
             if runs.is_empty() && waits.is_empty() {
                 break;
             }
@@ -736,6 +743,7 @@ impl PageCache {
             return Pending {
                 runs: Vec::new(),
                 waits: Vec::new(),
+                joined_fetch: false,
             };
         }
         let mut waits = Vec::new();
@@ -758,10 +766,11 @@ impl PageCache {
                 }
             }
         }
-        self.read_disk(file, pages, &mut wanted, served).await;
+        let joined_fetch = self.read_disk(file, pages, &mut wanted, served).await;
         Pending {
             runs: wanted_runs(pages, &wanted),
             waits,
+            joined_fetch,
         }
     }
 
@@ -775,17 +784,25 @@ impl PageCache {
     /// the level lacks, or fails to read, stays marked for the fetch, as
     /// `get_or_fetch` moves on to the fetch (RFD 017: the directory is
     /// disposable). A memory-only level has nothing to read.
+    /// foyer's read of a page a `get_or_fetch` lookup is fetching waits on
+    /// that lookup's flight, and a lookup of a page this read is asking the
+    /// level for joins this read's, its fetch run if the level lacks the
+    /// page: either way such a page comes from object storage, under the
+    /// lookup's one counted fetch. It is counted as a page joined in
+    /// flight is, in `span_joins` and neither `hits` nor `fetches`, and
+    /// `true` is returned so the read is labelled `PageOrigin::Fetched`.
     async fn read_disk(
         &self,
         file: &Arc<str>,
         pages: &[Range<u64>],
         wanted: &mut [bool],
         served: &mut [Option<Bytes>],
-    ) {
+    ) -> bool {
         let (cache, stats) = match self.level.as_ref() {
-            Level::Memory(_) => return,
+            Level::Memory(_) => return false,
             Level::Hybrid { cache, stats } => (cache, stats.as_ref()),
         };
+        let mut joined_fetch = false;
         let reads = (0..pages.len()).filter(|at| wanted[*at]).map(|at| {
             let key = PageKey(Arc::clone(file), pages[at].start);
             async move { (at, cache.get(&key).await) }
@@ -797,10 +814,19 @@ impl PageCache {
                 continue;
             };
             let page = entry.value().0.clone();
-            self.record(entry.source(), Some(stats), &page);
+            match entry.source() {
+                Source::Outer => {
+                    self.spans.joined.fetch_add(1, Ordering::Relaxed);
+                    joined_fetch = true;
+                }
+                source @ (Source::Memory | Source::Disk) => {
+                    self.record(source, Some(stats), &page);
+                }
+            }
             wanted[at] = false;
             served[at] = Some(page);
         }
+        joined_fetch
     }
 
     /// Claims as in flight, under the lock of `file`'s shard so no page is
@@ -858,8 +884,9 @@ impl PageCache {
         self.hits.publish();
     }
 
-    /// Pages a span read found another span read fetching and waited for
-    /// rather than fetching again: what the coalescing tests observe.
+    /// Pages a span read found another read fetching, a span read or a
+    /// lookup, and waited for rather than fetching again: what the
+    /// coalescing tests observe.
     #[cfg(test)]
     pub(crate) fn span_joins(&self) -> u64 {
         self.spans.joined.load(Ordering::Relaxed)
@@ -1009,10 +1036,13 @@ fn wanted_runs(pages: &[Range<u64>], wanted: &[bool]) -> Vec<Range<usize>> {
 
 /// What one pass of `PageCache::get_span` takes on: the runs of pages, by
 /// position, it is to fetch, and the pages, by position, whose fetch by
-/// another read it waits for.
+/// another read it waits for; and whether a page it served already came
+/// from a lookup's fetch it joined on the way to the disk level
+/// (`read_disk`).
 struct Pending {
     runs: Vec<Range<usize>>,
     waits: Vec<(usize, watch::Receiver<Option<SpanOutcome>>)>,
+    joined_fetch: bool,
 }
 
 /// A run of pages one span read claimed as in flight: the run's positions
@@ -2984,6 +3014,94 @@ mod tests {
         assert_eq!(cache.fetches(), 0);
         assert_eq!(cache.hits(), 0);
         assert_eq!(stats.local_reads(), 0);
+    }
+
+    /// Checks a span read of `PAGE` that shared a lookup's fetch of it:
+    /// both are served the lookup's fetch, the read labelled fetched and
+    /// counted as a join, with one fetch run between them and nothing read
+    /// from the disk level or counted a hit.
+    fn assert_shared_the_lookups_fetch(
+        cache: &PageCache,
+        stats: &IoStats,
+        runs: &AtomicU64,
+        looked_up: Result<(Bytes, PageOrigin)>,
+        read: Result<(Vec<Bytes>, PageOrigin)>,
+    ) {
+        assert_eq!(
+            looked_up.unwrap(),
+            (Bytes::from_static(PAGE), PageOrigin::Fetched)
+        );
+        let (served, origin) = read.unwrap();
+        assert_eq!(served, [Bytes::from_static(PAGE)]);
+        assert_eq!(origin, PageOrigin::Fetched, "the page came from outside");
+        assert_eq!(cache.span_joins(), 1, "the read joined the lookup's fetch");
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.fetches(), 1);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(stats.local_reads(), 0);
+    }
+
+    /// A span read of a page a lookup is fetching joins the lookup's fetch
+    /// on its way to the disk level, since memory does not show foyer's
+    /// flights: the page is fetched once, and the read is labelled fetched
+    /// and counted as a join. The lookup's fetch is held behind `gate`
+    /// until both wait on it.
+    #[tokio::test]
+    async fn test_get_span_of_a_page_a_lookup_is_fetching_joins_that_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (level, stats) = disk_level(dir.path());
+        let cache = PageCache::new(ROOMY_BYTES, Some(level)).await.unwrap();
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let span = FIRST_OFFSET..FIRST_OFFSET + page_bytes(PAGE);
+        let page = std::slice::from_ref(&span);
+        let runs = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(Notify::new());
+        let mut lookup = Box::pin(cache.get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+            gated(PAGE, &runs, &gate)
+        }));
+        assert!(
+            futures::poll!(lookup.as_mut()).is_pending(),
+            "the lookup's flight is open"
+        );
+        let mut reading = Box::pin(cache.get_span(&id, page, Issue::default(), |_| never()));
+        assert!(
+            futures::poll!(reading.as_mut()).is_pending(),
+            "the read waits on the lookup's flight"
+        );
+        gate.notify_one();
+        let (looked_up, read) = tokio::join!(lookup, reading);
+        assert_shared_the_lookups_fetch(&cache, &stats, &runs, looked_up, read);
+    }
+
+    /// A lookup of a page a span read is asking the disk level for joins
+    /// the read's flight with its fetch, which runs when the level lacks
+    /// the page: the read is served that fetch, labelled fetched and
+    /// counted as a join, and the page is fetched once.
+    #[tokio::test]
+    async fn test_get_span_of_a_page_a_lookup_joins_on_disk_is_served_its_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (level, stats) = disk_level(dir.path());
+        let cache = PageCache::new(ROOMY_BYTES, Some(level)).await.unwrap();
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let span = FIRST_OFFSET..FIRST_OFFSET + page_bytes(PAGE);
+        let page = std::slice::from_ref(&span);
+        let runs = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(Notify::new());
+        let mut reading = Box::pin(cache.get_span(&id, page, Issue::default(), |_| never()));
+        assert!(
+            futures::poll!(reading.as_mut()).is_pending(),
+            "the read asks the disk level"
+        );
+        let mut lookup = Box::pin(cache.get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
+            gated(PAGE, &runs, &gate)
+        }));
+        assert!(
+            futures::poll!(lookup.as_mut()).is_pending(),
+            "the lookup joins the read's flight"
+        );
+        gate.notify_one();
+        let (looked_up, read) = tokio::join!(lookup, reading);
+        assert_shared_the_lookups_fetch(&cache, &stats, &runs, looked_up, read);
     }
 
     /// `held_span` reads memory alone: a span the disk level holds is not
