@@ -54,11 +54,12 @@ MULTI_GET_KEYS=100
 
 # The cache budget (`server.cache_bytes`): a gibibyte holds every value page
 # of the four prepared tables (about 200 MB each). The run sets
-# `server.row_cache_share = 0`, so the row cache is off and the page cache's
-# memory level holds the whole budget, as the in-process benchmark's
-# `--row-cache off` does and as docs/analysis/2026-09-26-performance-sweep.md
-# measured; after the warm-up every hit is warm and no run pays for a page
-# read.
+# `server.row_cache_share = 0`, which gives the row cache no part of the
+# budget: every table skips the row cache, so no lookup reads or fills it,
+# and the page cache's memory level holds the whole budget, as under the
+# in-process benchmark's `--row-cache off` and as
+# docs/analysis/2026-09-26-performance-sweep.md measured; after the warm-up
+# every hit is warm and no run pays for a page read.
 CACHE_BYTES=1073741824
 
 # Seconds to wait for /ready: the first loads of the four tables take well
