@@ -31,7 +31,7 @@ use crate::descriptors;
 use crate::error::{Error, Recurrence, Recurs, Result};
 use crate::local::DiskLevel;
 use crate::metric::{self, CacheName};
-use crate::shard::{self, Sharded};
+use crate::shard::{self, Sharded, Tally};
 use crate::storage::IoStats;
 
 /// The name foyer files its own log lines under. Its metrics stay on its
@@ -319,7 +319,7 @@ pub struct PageCache {
     /// Which cache this is, the `cache` label of its series.
     name: CacheName,
     level: Arc<Level>,
-    hits: Arc<Hits>,
+    hits: Arc<Tally>,
     fetches: Arc<Fetches>,
     /// The pages span reads are fetching now, which another span read
     /// that needs one of them waits for rather than fetching it again
@@ -446,7 +446,10 @@ impl PageCache {
         Self {
             name,
             level: Arc::new(level),
-            hits: Arc::new(Hits::new(name)),
+            hits: Arc::new(Tally::new(metrics::counter!(
+                metric::PAGE_CACHE_HITS_TOTAL,
+                metric::LABEL_CACHE => name.to_string()
+            ))),
             fetches: Arc::new(Fetches::new(name)),
             spans: Arc::new(SpanFlights::new()),
             fetch_deadline: None,
@@ -905,7 +908,7 @@ impl PageCache {
 
     /// One page served without a fetch.
     fn record_hit(&self) {
-        self.hits.shards.mine().fetch_add(1, Ordering::Relaxed);
+        self.hits.increment();
     }
 
     /// What a fetch for `page` runs with through this handle: its permit
@@ -1038,69 +1041,6 @@ impl Fetches {
     fn record(&self) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total.increment(1);
-    }
-}
-
-/// A cache's hits, counted on the calling thread's shard so concurrent hits
-/// on different workers write different lines, and published into
-/// `page_cache_hits_total` through a handle registered once in
-/// `PageCache::new`, with the recorder current then, so a hit looks up no
-/// series.
-struct Hits {
-    /// Each shard's hits since the cache opened; they only grow.
-    shards: Sharded<AtomicU64>,
-    /// The shards' sum as of the last `publish`, what the counter has been
-    /// given so far.
-    published: AtomicU64,
-    total: Counter,
-}
-
-impl Hits {
-    fn new(name: CacheName) -> Self {
-        Self {
-            shards: Sharded::new(),
-            published: AtomicU64::new(0),
-            total: metrics::counter!(
-                metric::PAGE_CACHE_HITS_TOTAL,
-                metric::LABEL_CACHE => name.to_string()
-            ),
-        }
-    }
-
-    /// The hits counted so far, summed over the shards.
-    fn counted(&self) -> u64 {
-        self.shards
-            .iter()
-            .map(|shard| shard.load(Ordering::Relaxed))
-            .sum()
-    }
-
-    /// Adds to the counter what the shards have counted beyond what it was
-    /// given. `published` only rises, by `fetch_max`, and the counter is
-    /// given the rise alone, so two publishes at once give it each hit
-    /// once between them.
-    fn publish(&self) {
-        let counted = self.counted();
-        let given = self.published.fetch_max(counted, Ordering::Relaxed);
-        if counted > given {
-            self.total.increment(counted - given);
-        }
-    }
-}
-
-impl Drop for Hits {
-    /// Publishes the hits counted since the last `publish`, so a cache
-    /// dropped between scrapes loses none of its counts.
-    fn drop(&mut self) {
-        self.publish();
-    }
-}
-
-impl fmt::Debug for Hits {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Hits")
-            .field("counted", &self.counted())
-            .finish_non_exhaustive()
     }
 }
 

@@ -24,6 +24,12 @@ pub const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
 /// Page fetches a page cache ran, after coalescing, by `cache`: a span
 /// fetch of the scan cache counts once however many pages it holds.
 pub const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
+/// Value reads the row cache served without reading a page (RFD 026),
+/// a cached null included.
+pub const ROW_CACHE_HITS_TOTAL: &str = "icetray_row_cache_hits_total";
+/// Value reads the row cache did not hold (RFD 026), each then read from
+/// the page cache.
+pub const ROW_CACHE_MISSES_TOTAL: &str = "icetray_row_cache_misses_total";
 /// Lookups answered, by `table` and `result`.
 pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
 /// Value-page GETs lookups and Scans issued to object storage, by `table`
@@ -105,6 +111,9 @@ pub const ALLOCATOR_RESIDENT_BYTES: &str = "icetray_allocator_resident_bytes";
 pub const ALLOCATOR_RETAINED_BYTES: &str = "icetray_allocator_retained_bytes";
 /// Bytes a page cache holds in memory, by `cache`.
 pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
+/// Bytes the row cache holds against its budget (RFD 026): each entry's
+/// value at its allocation size plus the per-entry overhead.
+pub const ROW_CACHE_BYTES: &str = "icetray_row_cache_bytes";
 /// Findings the doctor raised on the serving generation, by `table` and
 /// `code`, and by `column` for a code about one value column (RFD 022,
 /// `FindingCode::per_column`).
@@ -201,7 +210,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 54] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 57] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -241,6 +250,16 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 54] = [
         PAGE_CACHE_FETCHES_TOTAL,
         Kind::Counter,
         "Page fetches a page cache ran, after coalescing, by cache.",
+    ),
+    (
+        ROW_CACHE_HITS_TOTAL,
+        Kind::Counter,
+        "Value reads the row cache served without reading a page, cached nulls included.",
+    ),
+    (
+        ROW_CACHE_MISSES_TOTAL,
+        Kind::Counter,
+        "Value reads the row cache did not hold and the page cache then served.",
     ),
     (
         LOOKUPS_TOTAL,
@@ -356,6 +375,11 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 54] = [
         PAGE_CACHE_BYTES,
         Kind::Gauge,
         "Bytes a page cache holds in memory against its budget, by cache.",
+    ),
+    (
+        ROW_CACHE_BYTES,
+        Kind::Gauge,
+        "Bytes the row cache holds against its budget.",
     ),
     (
         FINDINGS,

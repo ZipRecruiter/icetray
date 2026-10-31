@@ -29,6 +29,7 @@ pub mod open;
 pub mod order;
 mod parquet_io;
 mod projection;
+mod row_cache;
 mod scan;
 mod shard;
 mod snapshot;
@@ -74,6 +75,7 @@ pub use order::{
     Direction, OrderColumnLayout, OrderFacts, OrderType, OrderValue, OrderVariant, ScanBounds,
 };
 pub use projection::{MAX_FIELD_NUMBER, Malformed, WIRE_TYPE_BITS, WIRE_TYPE_MASK, Wire};
+pub use row_cache::RowCache;
 pub use scan::{
     BoundSide, Fits, MultiScanLookup, Oversize, ScanLookup, ScanRequestFault, ScanRow, Scanned,
     check_scan_request, next_bound,

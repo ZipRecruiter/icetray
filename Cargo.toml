@@ -87,6 +87,7 @@ parquet = { version = "58", features = ["async"] }
 pin-project-lite = "0.2.17"
 prost = "0.14.4"
 protoc-bin-vendored = "3.2.0"
+quick_cache = "0.7.0"
 rand = "0.10.2"
 roaring = "0.11.5"
 s3s = "0.16.1"

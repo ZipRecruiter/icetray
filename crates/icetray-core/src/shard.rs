@@ -3,8 +3,11 @@
 //! writes, so lookups running on different workers do not contend for one
 //! cache line or one lock.
 
+use std::fmt;
 use std::num::NonZero;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use metrics::Counter;
 
 /// The threads that run lookups: the worker threads of the tokio runtime
 /// the caller runs on, or the machine's available parallelism when called
@@ -90,6 +93,71 @@ impl<T> Sharded<T> {
     /// Every shard, for a reader that sums or takes them.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         self.shards.iter().map(|line| &line.0)
+    }
+}
+
+/// A count of events, kept on the calling thread's shard so concurrent
+/// events on different workers write different lines, and published into a
+/// counter handle registered once by the owner, with the recorder current
+/// then, so an event looks up no series.
+pub(crate) struct Tally {
+    /// Each shard's events since the tally was made; they only grow.
+    shards: Sharded<AtomicU64>,
+    /// The shards' sum as of the last `publish`, what the counter has been
+    /// given so far.
+    published: AtomicU64,
+    total: Counter,
+}
+
+impl Tally {
+    /// A tally of no events that publishes into `total`.
+    pub(crate) fn new(total: Counter) -> Self {
+        Self {
+            shards: Sharded::new(),
+            published: AtomicU64::new(0),
+            total,
+        }
+    }
+
+    /// Counts one event on the calling thread's shard.
+    pub(crate) fn increment(&self) {
+        self.shards.mine().fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The events counted so far, summed over the shards.
+    pub(crate) fn counted(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Adds to the counter what the shards have counted beyond what it was
+    /// given. `published` only rises, by `fetch_max`, and the counter is
+    /// given the rise alone, so two publishes at once give it each event
+    /// once between them.
+    pub(crate) fn publish(&self) {
+        let counted = self.counted();
+        let given = self.published.fetch_max(counted, Ordering::Relaxed);
+        if counted > given {
+            self.total.increment(counted - given);
+        }
+    }
+}
+
+impl Drop for Tally {
+    /// Publishes the events counted since the last `publish`, so an owner
+    /// dropped between scrapes loses none of its counts.
+    fn drop(&mut self) {
+        self.publish();
+    }
+}
+
+impl fmt::Debug for Tally {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tally")
+            .field("counted", &self.counted())
+            .finish_non_exhaustive()
     }
 }
 

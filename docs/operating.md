@@ -103,6 +103,8 @@ Counters and histograms:
 | `icetray_hedges_total` | | yes | Second GETs issued because a lookup GET or a `Scan`'s span GET was slow. |
 | `icetray_page_cache_hits_total` | `cache` | every cache | Pages served from the page cache without a fetch. |
 | `icetray_page_cache_fetches_total` | `cache` | every cache | Page fetches the page cache ran, after coalescing. The scan cache counts a span GET once, however many pages it holds. |
+| `icetray_row_cache_hits_total` | | yes | Value reads the row cache served without reading a page, a cached null included (RFD 026). |
+| `icetray_row_cache_misses_total` | | yes | Value reads the row cache did not hold, each then read from the page cache. |
 | `icetray_lookups_total` | `table`, `result` | every table and result | Lookups that completed. |
 | `icetray_value_page_gets_total` | `table`, `column` | every table and value column, and an ordered table's order column | Value-page, dictionary-page, and span GETs issued for the column by lookups and Scans, each counted once when it is issued, whether or not its call succeeds. An ordered table's order column counts its GETs under its own name. A fetch another lookup joins is not counted again, and hedges are counted in `icetray_hedges_total`. A caller budgets a column's GETs, and a Scan's, by this counter. |
 | `icetray_value_bytes_read_total` | `table`, `column` | every table and value column | Bytes of the column's values that each completed lookup read: a present value as its page stores it, a default as its bytes, and a null or a miss as zero. A lookup that fails counts nothing; a failed `MultiGet` counts the keys it completed before the failure, as `icetray_lookups_total` does. |
@@ -162,6 +164,7 @@ Gauges, written at each scrape:
 | `icetray_findings` | `table`, `code`, and `column` for a code about one value column | The number of findings of each code that icetray raised on the serving generation, 0 for a code not raised. A code about one value column has one series per configured column. |
 | `icetray_index_bytes` | `table` | The resident index's live bytes. |
 | `icetray_page_cache_bytes` | `cache` | Bytes a page cache's memory level holds after evictions: the lookup cache against `server.page_cache_bytes`, the scan cache against `server.scan_page_cache_bytes`. |
+| `icetray_row_cache_bytes` | | Bytes the row cache holds after evictions: each entry's value at its allocation size plus the per-entry overhead. |
 | `icetray_config_pending` | | 1 while the configuration file differs from the configuration applied, else 0. |
 | `icetray_process_rss_bytes` | | The process's resident set size. |
 | `icetray_allocator_allocated_bytes`, `_active_bytes`, `_metadata_bytes`, `_resident_bytes`, `_retained_bytes` | | jemalloc's own counts, which split the resident set. `allocated` is live data; `active` minus `allocated` is free space inside pages in use; `resident` minus `active` and `metadata` is freed memory not yet returned to the operating system; `retained` is address space only. |
