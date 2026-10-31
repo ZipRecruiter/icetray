@@ -202,7 +202,7 @@ pub fn budget_needed(indexes: &[u64], budget: u64) -> u64 {
 
 /// `held` bytes and the process's own share beside them, a third of
 /// `held` (`PROCESS_SHARE_DENOMINATOR`): what a process holding them needs.
-pub fn with_process_share(held: u64) -> u64 {
+pub(crate) fn with_process_share(held: u64) -> u64 {
     held.saturating_add(held / PROCESS_SHARE_DENOMINATOR)
 }
 
@@ -411,13 +411,14 @@ mod tests {
         assert_eq!(budget_needed(&[GIB, 3 * GIB], 4 * GIB), needed);
     }
 
-    /// One table of a gibibyte, held twice, and a budget of one need four;
-    /// a budget alone of three needs a third more; nothing held needs
-    /// nothing.
+    /// One table of a gibibyte, held twice, and a budget of one hold three
+    /// gibibytes, as a budget alone of three does, and need the process's
+    /// share more; nothing held needs nothing.
     #[test]
     fn test_budget_needed_of_a_table_a_budget_and_nothing() {
-        assert_eq!(budget_needed(&[GIB], GIB), 4 * GIB);
-        assert_eq!(budget_needed(&[], 3 * GIB), 4 * GIB);
+        let three_held = with_process_share(3 * GIB);
+        assert_eq!(budget_needed(&[GIB], GIB), three_held);
+        assert_eq!(budget_needed(&[], 3 * GIB), three_held);
         assert_eq!(budget_needed(&[], 0), 0);
     }
 

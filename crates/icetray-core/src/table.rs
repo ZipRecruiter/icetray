@@ -2872,7 +2872,7 @@ mod tests {
 
     use bytes::Bytes;
     use iceberg::io::FileIO;
-    use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
+    use metrics_util::debugging::Snapshotter;
 
     use object_store::local::LocalFileSystem;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
@@ -5927,86 +5927,79 @@ mod tests {
     fn test_publish_lookup_counts_moves_every_task_count_once() {
         let workers = 4;
         let lookups_per_task = 8;
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers)
-            .enable_all()
-            .build()
-            .unwrap();
-        let result =
-            |result: LookupResult| [table_label(), (metric::LABEL_RESULT, result.to_string())];
-        let column = [
-            table_label(),
-            (metric::LABEL_COLUMN, VALUE_COLUMN.to_string()),
-        ];
-        let published = || {
-            let series = Series::of(&snapshotter);
-            let counter = |name, labels: &[(&str, String)]| series.counter(name, labels);
-            (
-                counter(metric::LOOKUPS_TOTAL, &result(LookupResult::Miss)),
-                counter(metric::LOOKUPS_TOTAL, &result(LookupResult::ColdHit))
-                    + counter(metric::LOOKUPS_TOTAL, &result(LookupResult::WarmHit)),
-                counter(metric::VALUE_BYTES_READ_TOTAL, &column),
-                counter(metric::VALUE_BYTES_RETURNED_TOTAL, &column),
-            )
-        };
-        metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(async {
-                let (fixture, all) = protobuf_fixture().await;
-                let config = TableConfig {
-                    value_columns: vec![ValueColumnConfig::of(VALUE_COLUMN, ValueFormat::Protobuf)],
-                    ..fixture.config(Residency::Full, None)
-                };
-                let table = Arc::new(table_over(&fixture, config).await);
-                table.load().await.unwrap();
-                let absent = Key::Long(all.iter().max().unwrap() + 1);
-                let present = all[0];
-                let (value, key_record) = protobuf_value(present);
-                let tasks: Vec<_> = (0..workers)
-                    .map(|_| {
-                        let table = Arc::clone(&table);
-                        let absent = absent.clone();
-                        tokio::spawn(async move {
-                            misses_then_a_projected_hit(&table, &absent, lookups_per_task, present)
-                                .await
-                        })
+        let mut runtime = tokio::runtime::Builder::new_multi_thread();
+        runtime.worker_threads(workers);
+        recorded_on(runtime, |snapshotter| async move {
+            let result =
+                |result: LookupResult| [table_label(), (metric::LABEL_RESULT, result.to_string())];
+            let column = [
+                table_label(),
+                (metric::LABEL_COLUMN, VALUE_COLUMN.to_string()),
+            ];
+            let published = || {
+                let series = Series::of(&snapshotter);
+                let counter = |name, labels: &[(&str, String)]| series.counter(name, labels);
+                (
+                    counter(metric::LOOKUPS_TOTAL, &result(LookupResult::Miss)),
+                    counter(metric::LOOKUPS_TOTAL, &result(LookupResult::ColdHit))
+                        + counter(metric::LOOKUPS_TOTAL, &result(LookupResult::WarmHit)),
+                    counter(metric::VALUE_BYTES_READ_TOTAL, &column),
+                    counter(metric::VALUE_BYTES_RETURNED_TOTAL, &column),
+                )
+            };
+            let (fixture, all) = protobuf_fixture().await;
+            let config = TableConfig {
+                value_columns: vec![ValueColumnConfig::of(VALUE_COLUMN, ValueFormat::Protobuf)],
+                ..fixture.config(Residency::Full, None)
+            };
+            let table = Arc::new(table_over(&fixture, config).await);
+            table.load().await.unwrap();
+            let absent = Key::Long(all.iter().max().unwrap() + 1);
+            let present = all[0];
+            let (value, key_record) = protobuf_value(present);
+            let tasks: Vec<_> = (0..workers)
+                .map(|_| {
+                    let table = Arc::clone(&table);
+                    let absent = absent.clone();
+                    tokio::spawn(async move {
+                        misses_then_a_projected_hit(&table, &absent, lookups_per_task, present)
+                            .await
                     })
-                    .collect();
-                for task in tasks {
-                    assert_eq!(task.await.unwrap(), Some(key_record));
-                }
-                assert_eq!(
-                    published(),
-                    (0, 0, 0, 0),
-                    "counted on the shards until published"
-                );
-                table.publish_lookup_counts();
-                let workers_count = approx::count(workers);
-                assert_eq!(
-                    published(),
-                    (
-                        approx::count(workers * lookups_per_task),
-                        workers_count,
-                        workers_count * approx::count(value.len()),
-                        workers_count * approx::count(key_record),
-                    ),
-                    "a miss reads no bytes; a projected hit reads its value and returns the field"
-                );
-                table.publish_lookup_counts();
-                assert_eq!(published(), (0, 0, 0, 0), "nothing is published twice");
-                table
-                    .get(&Key::Long(present), &[ColumnRead::whole(VALUE_COLUMN)])
-                    .await
-                    .unwrap();
-                drop(table);
-                let whole = approx::count(value.len());
-                assert_eq!(
-                    published(),
-                    (0, 1, whole, whole),
-                    "a dropped table publishes what it counted, a whole read as read"
-                );
-            });
+                })
+                .collect();
+            for task in tasks {
+                assert_eq!(task.await.unwrap(), Some(key_record));
+            }
+            assert_eq!(
+                published(),
+                (0, 0, 0, 0),
+                "counted on the shards until published"
+            );
+            table.publish_lookup_counts();
+            let workers_count = approx::count(workers);
+            assert_eq!(
+                published(),
+                (
+                    approx::count(workers * lookups_per_task),
+                    workers_count,
+                    workers_count * approx::count(value.len()),
+                    workers_count * approx::count(key_record),
+                ),
+                "a miss reads no bytes; a projected hit reads its value and returns the field"
+            );
+            table.publish_lookup_counts();
+            assert_eq!(published(), (0, 0, 0, 0), "nothing is published twice");
+            table
+                .get(&Key::Long(present), &[ColumnRead::whole(VALUE_COLUMN)])
+                .await
+                .unwrap();
+            drop(table);
+            let whole = approx::count(value.len());
+            assert_eq!(
+                published(),
+                (0, 1, whole, whole),
+                "a dropped table publishes what it counted, a whole read as read"
+            );
         });
     }
 

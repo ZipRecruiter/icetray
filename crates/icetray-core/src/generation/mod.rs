@@ -542,8 +542,8 @@ impl Generation {
     /// checked against the deletes once whatever the columns (RFD 021); a
     /// deleted row is passed over with no value page read. Then each column
     /// named is read from `rows`, the row cache, when given and not off
-    /// (`RowCache::is_off`, a budget of zero) as the lookup starts (RFD 026), at
-    /// the key of the file, the row, and the column's leaf there
+    /// (`RowCache::is_off`, a budget of zero) as the lookup starts (RFD
+    /// 026), at the key of the file, the row, and the column's leaf there
     /// (`FileIndex::row_key`), so the index has chosen the file and row,
     /// and the deletes have spoken, before the cache is asked: a row
     /// deleted or rewritten into another file is never served from it. A
@@ -2431,6 +2431,7 @@ pub(crate) mod testing {
 
     use super::{Generation, Planned, Row};
     use crate::approx::count;
+    use crate::approx::units::MIB;
     use crate::cache::PageCache;
     use crate::catalog::{TableFault, TableSource, VERSION_HINT, hint_location};
     use crate::config::{
@@ -2453,7 +2454,7 @@ pub(crate) mod testing {
     /// The memory budget of a test page cache or row cache: every page or
     /// value a test touches fits, so no test sees an eviction it did not
     /// ask for.
-    pub(crate) const CACHE_BYTES: u64 = 64 * 1024 * 1024;
+    pub(crate) const CACHE_BYTES: u64 = 64 * MIB;
     /// The branch the fixture tables are followed on.
     pub(crate) const MAIN: &str = iceberg::spec::MAIN_BRANCH;
     /// The step between written long keys, so the key after any written key

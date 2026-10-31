@@ -674,7 +674,8 @@ pub(crate) mod testing {
             Self(snapshotter.snapshot().into_vec())
         }
 
-        pub(crate) fn find(&self, name: &str, labels: &[(&str, String)]) -> &DebugValue {
+        /// The one series named `name` with exactly `labels`.
+        fn find(&self, name: &str, labels: &[(&str, String)]) -> &DebugValue {
             let found: Vec<&DebugValue> = self
                 .0
                 .iter()
@@ -685,6 +686,7 @@ pub(crate) mod testing {
             found[0]
         }
 
+        /// The value of the counter `name` with exactly `labels`.
         pub(crate) fn counter(&self, name: &str, labels: &[(&str, String)]) -> u64 {
             match self.find(name, labels) {
                 DebugValue::Counter(value) => *value,
@@ -692,6 +694,7 @@ pub(crate) mod testing {
             }
         }
 
+        /// The value of the gauge `name` with exactly `labels`.
         pub(crate) fn gauge(&self, name: &str, labels: &[(&str, String)]) -> f64 {
             match self.find(name, labels) {
                 DebugValue::Gauge(value) => value.into_inner(),
@@ -727,6 +730,8 @@ pub(crate) mod testing {
                 .count()
         }
 
+        /// How many samples the histogram `name` with exactly `labels`
+        /// recorded.
         pub(crate) fn samples(&self, name: &str, labels: &[(&str, String)]) -> usize {
             match self.find(name, labels) {
                 DebugValue::Histogram(values) => values.len(),
@@ -736,7 +741,7 @@ pub(crate) mod testing {
     }
 
     /// Whether `key` is `name` with exactly `labels`.
-    pub(crate) fn labeled(key: &MetricKey, name: &str, labels: &[(&str, String)]) -> bool {
+    fn labeled(key: &MetricKey, name: &str, labels: &[(&str, String)]) -> bool {
         key.name() == name
             && key.labels().count() == labels.len()
             && labels.iter().all(|(label, value)| {
@@ -752,8 +757,7 @@ pub(crate) mod testing {
     }
 
     /// `recorded`, with `body` given a snapshotter of the same recorder, to
-    /// read the series while it runs. A snapshot zeroes every series it
-    /// reads, so a later one holds only what was written after it.
+    /// read the series while it runs (`Series::of`).
     pub(crate) fn recorded_with<T, F: Future<Output = T>>(
         body: impl FnOnce(Snapshotter) -> F,
     ) -> (T, Series) {

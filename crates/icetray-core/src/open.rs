@@ -927,13 +927,16 @@ mod tests {
         assert!(usage > 0, "the value is cached at the default share");
     }
 
-    /// A row share that leaves pages a tenth of the budget beside a table
-    /// reading rows.
-    const PAGES_A_TENTH: f64 = 0.9;
-    /// The parts of a budget `PAGES_A_TENTH` gives pages one of.
+    /// The parts of a budget `pages_a_tenth` gives pages one of.
     const TENTHS: u64 = 10;
 
-    /// A whole budget whose page part, at `PAGES_A_TENTH`, holds about one
+    /// A row share that leaves pages one of `TENTHS` parts of the budget
+    /// beside a table reading rows.
+    fn pages_a_tenth() -> f64 {
+        1.0 - approx::ratio(1, TENTHS)
+    }
+
+    /// A whole budget whose page part, at `pages_a_tenth`, holds about one
     /// value page in each shard of the page cache's memory level, and so
     /// `TENTHS` times that once no table reads through the row cache.
     fn tight_budget() -> u64 {
@@ -964,6 +967,14 @@ mod tests {
         opened.row_cache.get(&key) != crate::row_cache::Cached::Absent
     }
 
+    /// `opened` after a reload to `tables`: the tables applied, then the
+    /// caches fitted to the split they give.
+    async fn reload(opened: &Opened, tables: &[TableConfig]) {
+        let split = opened.check_split(tables).unwrap();
+        opened.apply(tables).await.unwrap();
+        opened.fit_caches(split).unwrap();
+    }
+
     /// A reload that drops the last table reading through the row cache
     /// gives the page cache's memory level the whole budget, which it then
     /// fills past the part it had, and the row cache nothing.
@@ -973,16 +984,13 @@ mod tests {
         let first = named(FIRST_TABLE, &fixture, Residency::Full);
         let mut config = config(vec![first.clone()]);
         config.server.cache_bytes = Some(tight_budget());
-        config.server.row_cache_share = Some(PAGES_A_TENTH);
+        config.server.row_cache_share = Some(pages_a_tenth());
         let opened = loaded(&config).await;
         let before = opened.budget();
         assert!(before.row_bytes > 0, "the key-value table reads rows");
         assert!(row_cache_keeps_a_value(&opened));
 
-        let tables = [pages_alone(first)];
-        let split = opened.check_split(&tables).unwrap();
-        opened.apply(&tables).await.unwrap();
-        opened.fit_caches(split).unwrap();
+        reload(&opened, &[pages_alone(first)]).await;
         assert_eq!(
             opened.budget(),
             budget::Budget {
@@ -1008,15 +1016,12 @@ mod tests {
         let first = named(FIRST_TABLE, &fixture, Residency::Full);
         let mut config = config(vec![pages_alone(first.clone())]);
         config.server.cache_bytes = Some(tight_budget());
-        config.server.row_cache_share = Some(PAGES_A_TENTH);
+        config.server.row_cache_share = Some(pages_a_tenth());
         let opened = loaded(&config).await;
         assert_eq!(opened.budget().row_bytes, 0);
         assert!(!row_cache_keeps_a_value(&opened));
 
-        let tables = [first];
-        let split = opened.check_split(&tables).unwrap();
-        opened.apply(&tables).await.unwrap();
-        opened.fit_caches(split).unwrap();
+        reload(&opened, &[first]).await;
         let shards = cache::memory_shards();
         assert_eq!(
             opened.budget(),
@@ -1031,8 +1036,41 @@ mod tests {
         );
     }
 
+    /// After a reload that gives the row cache a budget it had none of, a
+    /// Get through a table reading rows misses once and caches its value,
+    /// and the next Get of the key hits.
+    #[test]
+    fn test_a_reload_growing_the_row_budget_from_zero_makes_gets_hit_the_row_cache() {
+        let (usage, series) = recorded(async {
+            let (fixture, all) = two_bucket_table().await;
+            let first = named(FIRST_TABLE, &fixture, Residency::Full);
+            let mut config = config(vec![pages_alone(first.clone())]);
+            config.server.cache_bytes = Some(tight_budget());
+            config.server.row_cache_share = Some(pages_a_tenth());
+            let opened = loaded(&config).await;
+            assert_eq!(opened.budget().row_bytes, 0);
+
+            reload(&opened, &[first]).await;
+            assert!(opened.budget().row_bytes > 0);
+            let table = loaded_first(&opened).await;
+            assert!(table.config().row_cache(), "the table reads rows");
+            for _ in 0..2 {
+                let lookup = table
+                    .get(&Key::Long(all[0]), &[ColumnRead::whole(VALUE_COLUMN)])
+                    .await
+                    .unwrap();
+                assert!(matches!(lookup.row, crate::Row::Present(_)));
+            }
+            opened.row_cache.publish();
+            opened.row_cache.usage()
+        });
+        assert_eq!(series.counter(metric::ROW_CACHE_MISSES_TOTAL, &[]), 1);
+        assert_eq!(series.counter(metric::ROW_CACHE_HITS_TOTAL, &[]), 1);
+        assert!(usage > 0, "the value is cached");
+    }
+
     /// A budget whose page part beside a row-reading table at
-    /// `PAGES_A_TENTH`, one and a half shards' minimum, holds one shard's
+    /// `pages_a_tenth`, one and a half shards' minimum, holds one shard's
     /// minimum and not two shards', which parsing admits and a two-worker
     /// runtime refuses; whole, it holds two shards' minimum.
     fn one_shard_s_tenth() -> u64 {
@@ -1051,7 +1089,7 @@ mod tests {
         let first = named(FIRST_TABLE, &fixture, Residency::Full);
         let mut config = config(vec![pages_alone(first.clone())]);
         config.server.cache_bytes = Some(one_shard_s_tenth());
-        config.server.row_cache_share = Some(PAGES_A_TENTH);
+        config.server.row_cache_share = Some(pages_a_tenth());
         let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();

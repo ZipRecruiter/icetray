@@ -906,8 +906,7 @@ impl PageCache {
     /// call blocks until every shard has evicted. `Opened::check_split`
     /// checks the budget `Opened::fit_caches` gives it against
     /// `min_memory_bytes` first; a smaller one given here directly is taken
-    /// as it is. A failure of the level is
-    /// `CacheError::Backend`.
+    /// as it is. A failure of the level is `CacheError::Backend`.
     pub(crate) fn resize_memory(&self, bytes: u64) -> Result<()> {
         let bytes = approx::length(bytes);
         match self.level.as_ref() {
@@ -1401,13 +1400,14 @@ mod tests {
 
     use super::*;
     use crate::approx::count;
+    use crate::approx::units::MIB;
     use crate::config::LocalConfig;
     use crate::generation::testing::TABLE;
     use crate::local::LocalDir;
     use crate::metric::testing::{Series, recorded, recorded_on, recorded_with};
 
     /// A memory budget with room for every page a test inserts.
-    const ROOMY_BYTES: u64 = 1024 * 1024;
+    const ROOMY_BYTES: u64 = MIB;
     /// A memory budget below one page's weight: an insert evicts whatever
     /// its shard held, so a page leaves memory as soon as the next page
     /// lands in its shard.

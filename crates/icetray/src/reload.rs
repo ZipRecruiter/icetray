@@ -264,13 +264,14 @@ impl Reloader {
 
     /// Waits for polls and requests until one reload applies, then returns
     /// what it changed and the split its tables take
-    /// (`Opened::check_split`), for `Opened::fit_caches`. A read that finds the configuration applied, or on
-    /// a poll the one last refused, does nothing further; a refused reload
-    /// is logged and counted, and the wait goes on. A read that fails is
-    /// no reload: it is logged when the file becomes unreadable, and
-    /// neither counted nor reflected in `config_pending`, since whether the
-    /// file differs is unknown. Dropping the future
-    /// drops a reload in flight, which swaps nothing in.
+    /// (`Opened::check_split`), for `Opened::fit_caches`. A read that finds
+    /// the configuration applied, or on a poll the one last refused, does
+    /// nothing further; a refused reload is logged and counted, and the
+    /// wait goes on. A read that fails is no reload: it is logged when the
+    /// file becomes unreadable, and neither counted nor reflected in
+    /// `config_pending`, since whether the file differs is unknown.
+    /// Dropping the future drops a reload in flight, which swaps nothing
+    /// in.
     pub(crate) async fn next(&mut self, opened: &Opened) -> (Applied, Budget) {
         loop {
             let requested = tokio::select! {

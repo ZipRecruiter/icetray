@@ -1867,7 +1867,7 @@ impl LocalConfig {
     /// Whether the page cache has a disk level here: `page_cache_disk_bytes`
     /// is above zero.
     #[must_use]
-    pub fn has_page_cache_level(&self) -> bool {
+    pub(crate) fn has_page_cache_level(&self) -> bool {
         self.page_cache_disk_bytes > 0
     }
 }

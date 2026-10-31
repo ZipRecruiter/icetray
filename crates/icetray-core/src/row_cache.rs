@@ -396,14 +396,14 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::approx::units::KIB;
+    use crate::approx::units::{GIB, KIB};
     use crate::index::RowPosition;
     use crate::metric::testing::{Series, recorded_with};
 
     const FILE: &str = "s3://bucket/data/a.parquet";
     /// A budget that holds every entry a test makes, in each of the shards
     /// it splits into.
-    const ROOMY_BYTES: u64 = 1 << 30;
+    const ROOMY_BYTES: u64 = GIB;
     /// Entries of 1 KiB values a cache sized to hold this many rows of
     /// them is told to expect, so it splits into several shards.
     const SHARD_ROWS_ESTIMATE: u64 = 4096;
