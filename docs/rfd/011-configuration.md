@@ -26,6 +26,15 @@
 > `max_multi_scan_values`, `max_scan_bytes`, `scan_deadline`,
 > `multi_scan_deadline`, and `scan_page_cache_bytes`. See RFD 025.
 
+> Updated 2026-10-30: the server's `cache_bytes`, by default a share of
+> the process's memory limit, and `row_cache_share` replace
+> `page_cache_bytes` and `scan_page_cache_bytes`, and a file that sets
+> either is refused (RFD 027, RFD 028). A key-value table entry may set
+> `row_cache`, which on an ordered table is invalid (RFD 026). A file
+> with no page-cache disk level that serves a table reading through the
+> row cache beside one reading pages alone must set `row_cache_share`
+> (RFD 028).
+
 ## Problem
 
 icetray owns the format of three kinds of bytes: configuration a person
@@ -59,7 +68,8 @@ contract) says where the path comes from.
 
 The configuration covers the server, storage, and tables. For the server
 it holds the listen addresses, the interval at which RFD 005 (Generations
-and refresh) polls the ref, the page cache budget, the MultiGet
+and refresh) polls the ref, the cache budget and the row cache's share
+of it (RFD 028 (Cache budget)), the MultiGet
 limit `server.max_multi_get_values` of RFD 010 (Transport and client
 contract), which must be above zero, and the scan settings of RFD 025
 (Ordered rows per key). For storage it
@@ -70,10 +80,11 @@ optional local directory of RFD 012 (Deployment contract). Tables are a
 list of at least one, and each entry has a name, a source, a ref, a key
 column, `value_columns`, `lookups` and `strict` (whose meanings are RFD
 020 (Lookup levels)), the `residency` and resident-bytes budget of RFD
-017 (Residency tiers), and for an ordered table `order_column` and
-`max_scan_rows` (RFD 025). `value_columns` is a required list of the columns
-the table serves (RFD 022 (Value columns)). It may be empty, for a
-table that answers only whether a key is present. Each entry is a
+017 (Residency tiers), for a key-value table `row_cache` (RFD 026 (Row
+cache)), and for an ordered table `order_column` and `max_scan_rows`
+(RFD 025). `value_columns` is a required list of the columns the table
+serves (RFD 022 (Value columns)). It may be empty, for a table that
+answers only whether a key is present. Each entry is a
 column's name, or a table of its `name` and its `format`, `opaque` by
 default or `protobuf` (RFD 024 (Field projection)), so
 `{ name = "detail", format = "protobuf" }`; a key the table form does not

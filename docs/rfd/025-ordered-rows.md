@@ -56,6 +56,14 @@
 > command does not apply `server.max_scan_bytes`, which bounds a gRPC
 > response.
 
+> Updated 2026-10-30: an ordered table's pages are cached in the one page
+> cache every table shares, and a span read takes each page from memory,
+> then from the disk level, fetching only the runs neither holds;
+> `server.scan_page_cache_bytes` is removed. A cache of ordered tables'
+> pages alone, kept out of the disk level, joins the rejected
+> alternatives, since a key-value table's hot rows now sit in the row
+> cache (RFD 026). See RFD 027.
+
 ## Problem
 
 icetray serves tables with at most one row per key, and that remains its
@@ -307,9 +315,9 @@ direction under a limit and optional bounds on the order value.
   key-page GETs first under `bloom`, and its bytes grow with the limit
   and the values' size.
 - **Caching and hedging.** Each page a span GET fetches is cached as its
-  own entry, keyed by file and offset, in a memory cache for ordered
-  tables, bounded by `server.scan_page_cache_bytes`, and kept out of the
-  disk level, so a scan evicts only other scans' pages. Concurrent Scans
+  own entry, keyed by file and offset, in the page cache every table
+  shares, and a span read takes a page the disk level holds from it
+  before it fetches (RFD 027 (One page cache)). Concurrent Scans
   that need one page issue one GET for it, as concurrent lookups do. A
   span GET takes its fan-out slot before it claims its pages, as a
   lookup's GET does, so a Scan of another call waits only on pages a GET
@@ -471,8 +479,11 @@ One GET per page in place of span GETs. Rejected because a full run of
 small values spans dozens of value pages, and each GET is a round trip
 billed on its own.
 
-A shared page cache. Rejected because a long run would evict a key-value
-table's hot pages.
+A memory cache of ordered tables' pages alone, kept out of the disk
+level, so a long run could not evict a key-value table's hot pages.
+Chosen first, and rejected by RFD 027 once those tables' hot rows moved
+to the row cache of RFD 026 (Row cache): it kept Scans off the local
+disk to protect key-value pages whose hot rows the row cache holds.
 
 A re-merge of every overlap group that gains a file, as a key-value
 table's refresh does. Rejected because appends make every file in a
@@ -533,12 +544,12 @@ as a call of its own or an extension of these.
 ## Consequences
 
 A key-value table keeps every check, layout requirement, and cost per
-call. The ordered rules run only for a table with an order column, its
-pages use a cache of their own, and its chunk files are named by the
-ordered rules they were verified under. A process that serves both kinds
-shares `server.max_in_flight`, its GET throughput, and resident memory
-across them, and one `server.batch_fan_out` setting governs both. A
-regression benchmark of warm and cold Get, MultiGet, and misses, on a
+call. The ordered rules run only for a table with an order column, and
+its chunk files are named by the ordered rules they were verified under.
+A process that serves both kinds shares `server.max_in_flight`, its GET
+throughput, its page cache (RFD 027), and resident memory across them,
+and one `server.batch_fan_out` setting governs both. A regression
+benchmark of warm and cold Get, MultiGet, and misses, on a
 process serving key-value tables alone and on one serving both kinds,
 holds the key-value path to its current costs.
 
