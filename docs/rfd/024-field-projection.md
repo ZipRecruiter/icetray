@@ -1,5 +1,10 @@
 # Field projection
 
+> Updated 2026-10-30: a key-value lookup reads each value from the row
+> cache before the page cache, and the trim follows both, so the row
+> cache keeps each value whole and callers naming different fields share
+> one entry. See RFD 026.
+
 ## Problem
 
 RFD 002 (Serving layout) recommends packing a row into one
@@ -17,14 +22,15 @@ The protobuf wire format can be trimmed without its schema. Every
 field begins with a tag carrying its number and wire type, and the wire
 type gives the field's length, so the top-level fields of a message can
 be walked, kept, or skipped by number alone. Icetray already holds the
-value's bytes after the page cache, before it answers.
+value's bytes after the row cache or the page cache, before it answers.
 
 ## Decision
 
 Callers that read a few fields of a protobuf value will be served by
 trimming, at request time, the value of a column declared protobuf to
-the top-level field numbers the request names, after the page cache,
-with the whole value returned when the request names none.
+the top-level field numbers the request names, after the row cache and
+the page cache, with the whole value returned when the request names
+none.
 
 - **Declared per column.** A `binary` column's entry in `value_columns`
   may declare `format = "protobuf"`; on a `fixed` or `string` column the
@@ -89,8 +95,9 @@ with the whole value returned when the request names none.
 - **The rest of a value.** A null stays null, and a value holding none
   of the named fields is present with zero bytes, distinct from null. A
   default RFD 023 (Column resolution) answers is projected as a value.
-- **After the cache.** The page cache keeps pages as the store returned
-  them, so every caller shares them whatever fields it names. A
+- **After the cache.** The row cache keeps each value whole (RFD 026
+  (Row cache)) and the page cache keeps pages as the store returned
+  them, so every caller shares both whatever fields it names. A
   projection changes no GET, no level, and no lookup-cost gauge.
 - **Counted.** `icetray_value_bytes_read_total` and
   `icetray_value_bytes_returned_total` count, by table and column, the

@@ -27,6 +27,13 @@
 > setting, changing, or removing `order_column` loads the table anew;
 > the new scan settings take a restart. See RFD 025.
 
+> Updated 2026-10-30: a reload that changes whether any table served
+> reads through the row cache resizes the row cache and the page cache's
+> memory level within the same budget, and one whose split a start with
+> its file would refuse is refused; `server.cache_bytes` and
+> `server.row_cache_share` still apply on restart. A reload that applies
+> checks the budget against the memory limit again. See RFD 028.
+
 ## Problem
 
 The tables a server serves are fixed when it starts. Adding one, removing
@@ -63,10 +70,15 @@ server. A poll does not try a refused file again until its bytes change,
 but SIGHUP does, because a table's load can fail for a reason that has
 since passed.
 
-A reload applies the tables only. A listener, the page cache, and the
+A reload applies the tables only. A listener, the caches, and the
 storage client are built once at start, so a file whose server, storage,
 or log settings differ from the running ones is refused as a whole, with a
-reason that names the setting and says a restart applies it.
+reason that names the setting and says a restart applies it. The caches
+keep the budget `server.cache_bytes` gave them, but a reload that changes
+whether any table served reads through the row cache moves that budget
+between the row cache and the page cache's memory level as a start with
+the file would split it, and is refused when a start would refuse that
+split (RFD 028 (Cache budget)).
 
 Tables are matched by name. A table whose entry is equal in every field
 keeps its generation, its refresh, and its reservations untouched.
@@ -154,7 +166,9 @@ and a restart is needed only for server, storage, and log settings.
 
 A replica must have the memory for a reload's new tables beside the
 serving ones, the same headroom RFD 012 sizes for a refresh that rewrites
-a table. A reload that exceeds the memory limit ends the process. Every
+a table, and after each reload that applies icetray checks that room
+against the memory limit again and warns of a shortfall (RFD 028). A
+reload that exceeds the memory limit ends the process. Every
 replica reads the same file, so every replica reloads at once, and the
 restart that follows loads the same file: an oversized table crash-loops
 the fleet just as it would have on a restart. The doctor's predicted

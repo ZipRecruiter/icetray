@@ -13,6 +13,13 @@
 > rows of an ordered table as `get` reads keys of a key-value table, and
 > a located table can name its order column. See RFD 025.
 
+> Updated 2026-10-30: the memory limit is set first and the cache
+> budget, by default a share of it, follows. The sizing rule counts the
+> largest table's resident bytes once more in place of doubling each
+> table a refresh can rewrite, and icetray checks it against the limit
+> once the tables load, warning of a shortfall and holding the bytes
+> missing in a gauge exposed from the start. See RFD 028.
+
 ## Problem
 
 icetray is open source and meant to be run by organizations other than
@@ -103,8 +110,9 @@ A series an alert keys on is exposed from the start, at zero for a
 counter, so the alert has data before the first event rather than only
 after it: request counts of every call under every status code, lookups
 of every table and result, swaps of every table, reloads of every result,
-the page cache's fetches, hits, and bytes, and the in-flight gauges. A table a
-reload adds gets its series when it is added. Refresh errors are the
+the page cache's fetches, hits, and bytes, the cache budget's shortfall
+(RFD 028 (Cache budget)), and the in-flight gauges. A table a reload adds
+gets its series when it is added. Refresh errors are the
 exception: their reason has a value per error kind and refusal, too many to
 expose per table, so a refresh error's series appears with the first
 failure, and the table's degraded state, exposed from the start, is the
@@ -155,15 +163,19 @@ of linked code in a tool that prints JSON.
 A deployment without a mesh needs a sidecar or a private network; the port
 is never safe to expose directly.
 
-A replica runs under a memory limit its deployer sets. The limit is sized
-from the doctor's predicted resident bytes for each table's tier, doubled
-for a table a refresh can rewrite wholesale since the new generation loads
-beside the serving one, plus the page cache's memory budget, plus a margin
-of a third of that total for the process, requests in flight, a load's
-transient chunks, and the allocator's fragmentation and bookkeeping. A
-quarter was the first margin and proved too small: with the page cache
-full, the process held about a third more than the cache and index
-together, most of it allocator overhead on the cache's small pages.
+A replica runs under a memory limit its deployer sets first, and the
+cache budget, by default a share of the limit, follows it (RFD 028
+(Cache budget)). The limit holds the doctor's predicted resident bytes
+for each table's tier, the largest table's once more since a refresh
+that rewrites it wholesale loads its next generation beside the serving
+one, plus the cache budget, plus a margin of a third of that total for
+the process, requests in flight, a load's transient chunks, and the
+allocator's fragmentation and bookkeeping. Once the tables load, icetray
+checks that sum against the limit and, when it does not fit, logs a
+warning and holds the bytes missing in a gauge. A quarter was the first
+margin and proved too small: with the page cache full, the process held
+about a third more than the cache and index together, most of it
+allocator overhead on the cache's small pages.
 
 The limit backs up the load checks without replacing them, catching the
 allocations they do not cover. RFD 004 (Resident key-chunk index)

@@ -55,6 +55,10 @@
 > describe. A build from before the marker, rolled back to, writes cache
 > files the newer marker does not describe; see Operating icetray.
 
+> Updated 2026-10-30: the page cache's disk level holds the pages of
+> every table, ordered tables' included, and a Scan's span read takes
+> each page it holds as a local read in place of a GET. See RFD 027.
+
 ## Problem
 
 The resident index of RFD 004 (Resident key-chunk index) costs anything
@@ -155,11 +159,12 @@ the blocking pool.
 The local directory is optional and disposable. Everything in it is
 rebuilt from object storage, so it needs capacity and nothing else, and
 how a deployer supplies its path is RFD 012 (Deployment contract). Beside
-the chunk files it holds the page cache's disk level, whose value pages
-are evicted by size and never for staleness: a page is keyed by file and
-offset, and a file never changes. That level survives a restart, and a patch release, of the minor
-version that wrote it, so repeated cold reads become local reads instead
-of GETs.
+the chunk files it holds the page cache's disk level, whose pages, of
+key-value and ordered tables alike (RFD 027 (One page cache)), are
+evicted by size and never for staleness: a page is keyed by file and
+offset, and a file never changes. That level survives a restart, and a
+patch release, of the minor version that wrote it, so repeated cold
+reads, a lookup's or a Scan's, become local reads instead of GETs.
 
 Anything in the local directory that does not match the running build
 in every respect is treated as absent and rebuilt from object storage: a

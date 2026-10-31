@@ -41,6 +41,15 @@
 > bloom findings divide a row group's filter bits by its distinct keys.
 > See RFD 025.
 
+> Updated 2026-10-30: the doctor reads a configuration file through the
+> checks `serve` applies, so it refuses as `serve` does a file with no
+> page-cache disk level that serves a table reading through the row
+> cache beside one reading pages alone and sets no
+> `server.row_cache_share`, before a deploy; and the table's report
+> gives each value column's bytes in the snapshot, from the footers it
+> already reads, so an owner can compare a table's hot share with the
+> cache budget. See RFD 028.
+
 ## Problem
 
 RFD 002 (Serving layout) leaves to this RFD what the doctor
@@ -93,7 +102,9 @@ names no column. Each column has a level, its own findings' caps with
 the row's and the residency's best level; the table's level is the
 dearest column's, since any column may be asked for, and a table of no
 value columns has the level of finding the row. The table's report lists
-each configured column with its level and cost, and the per-file report
+each configured column with its level, its cost, and its bytes in the
+snapshot, summed from the footers, which an owner compares with the
+cache budget (RFD 028 (Cache budget)), and the per-file report
 lists each column's value pages and whether the file answers it by its
 default. The table's report gives each column's format as its entry
 declares it (RFD 024 (Field projection)).
@@ -152,9 +163,14 @@ then matches a closed set of rules, and a new error kind lands under
 configuration file is judged under its configured `strict`, as `serve`
 judges it: a strict table below its level is reported with every
 finding and then refused as `below_level`, with exit 1, so the doctor
-never passes with 2 a table that `serve` refuses. A table located
-directly, with no configuration, declares the best level its residency
-reaches and is never strict, since nothing configures it to be.
+never passes with 2 a table that `serve` refuses. The file itself goes
+through the checks `serve` applies before any table loads, so a file
+`serve` refuses, such as one mixing tables that read through the row
+cache with tables that read pages alone, with no page-cache disk level
+and no `server.row_cache_share` (RFD 028), is refused by the doctor
+too. A table located directly, with no configuration, declares the best
+level its residency reaches and is never strict, since nothing
+configures it to be.
 
 Only the doctor checks every key's bucket. After the load it decodes every
 key of every bucketed file, hashes it under the file's own bucketing, and

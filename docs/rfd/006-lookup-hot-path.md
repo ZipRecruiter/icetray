@@ -25,6 +25,11 @@
 > reads every other page, and any page the plain reader cannot read
 > exactly. See RFD 025.
 
+> Updated 2026-10-30: a key-value lookup reads each value it names from
+> the row cache before the page cache, and a hit reads no value page.
+> The open question of a decompressed-page cache is answered by caching
+> rows instead. See RFD 026.
+
 ## Problem
 
 RFD 004 (Resident key-chunk index) settles what stays in memory for each
@@ -64,21 +69,25 @@ The path is the same for every table whose key chunks are resident:
    either finds the row or answers the miss. A miss ends here, before any
    value page is read, and so does a presence-only lookup, which names no
    column.
-3. For each column the lookup names (RFD 022 (Value columns)), that
+3. For each column the lookup names (RFD 022 (Value columns)), a
+   key-value table's row cache supplies the value when it holds the row's
+   value for that column (RFD 026 (Row cache)), and otherwise that
    column's offset index locates its value page and the page cache
    supplies it, the columns concurrently. A cold read costs one GET per
    column, a warm one costs none, and concurrent lookups for one page
    share one GET. A column the file answers by its default (RFD 023
    (Column resolution)) reads nothing.
-4. One row is decoded from each page, by the plain reader for a page of
-   plain byte arrays in a column neither nested nor repeated and with no
-   dictionary page, and by the column reader for every other page, and
-   the values return in the order the lookup named their columns.
+4. One row is decoded from each page read, by the plain reader for a
+   page of plain byte arrays in a column neither nested nor repeated and
+   with no dictionary page, and by the column reader for every other
+   page, and its value is inserted into the row cache; the values return
+   in the order the lookup named their columns.
 5. A value whose read names fields of a column declared protobuf (RFD
    024 (Field projection)) is walked over its top-level fields and
-   trimmed to the ones named, after the page cache, so the cached page
-   stays whole for every caller. The walk is linear in the value's bytes
-   and costs no read; a value it cannot walk fails the lookup.
+   trimmed to the ones named, after the row cache and the page cache, so
+   the cached value and page stay whole for every caller. The walk is
+   linear in the value's bytes and costs no read; a value it cannot walk
+   fails the lookup.
 
 Two more segments are intended reads, counted as reads rather than raised
 as errors. One is a value column's dictionary page when one exists, which
@@ -119,9 +128,10 @@ cheaper than another.
 ## Consequences
 
 Per-lookup CPU is one key page decoded and one value page decompressed per
-named column, and, for a projected read, a walk of the one value, small
-beside the page it came from. On a warm hit of one column nearly all of the
-time goes to decoding those two pages, and little to the lookup itself;
+named column the row cache does not hold, and, for a projected read, a
+walk of the one value, small beside the page it came from. On a warm hit
+of one column from the page cache nearly all of the time goes to decoding
+those two pages, and little to the lookup itself;
 which page dominates depends on whether the values compress ([prototype
 findings, finding
 4](../analysis/2026-09-10-prototype-findings.md#4-lookup-latency)). That is
@@ -133,13 +143,14 @@ A layout the resident index does not cover fails loudly, as an error in
 the counting tests of RFD 014 (Test layering), instead of showing up as an
 unexplained GET in production.
 
-Open question: a decompressed-page cache level. The case for it is that
-decompression is most of a warm hit, so caching decompressed pages would
-bring a repeated hit down to the lookup logic alone. The case against is
-that a decompressed page costs its compression ratio in extra memory, so
-the same budget holds fewer pages. Whether hot pages repeat often enough
-to pay for that depends on the page cache's hit-rate curve under a skewed
-key distribution, and that curve is the unknown the question turns on
+This RFD left open a decompressed-page cache level, and RFD 026 (Row
+cache) answers it with a cache of rows instead. The case for the level
+was that decompression is most of a warm hit, so caching decompressed
+pages would bring a repeated hit down to the lookup logic alone. The
+case against was that a decompressed page costs its compression ratio in
+extra memory, so the same budget holds fewer pages. Whether hot pages
+repeat often enough to pay for that depended on the page cache's
+hit-rate curve under a skewed key distribution
 ([prototype findings, what was not verified](../analysis/2026-09-10-prototype-findings.md#what-was-not-verified)).
 
 Decompression is over half of a warm hit in the Full tier when the values
@@ -162,10 +173,8 @@ tenth of a second for a file not read recently
 against tens of microseconds that the level saves on one warm hit of
 compressible values. One extra cold hit undoes more than a thousand warm
 hits' savings, so the level pays only while it turns well under one lookup
-in a thousand into an extra cold hit. A small decompressed level in front
-of the compressed cache, holding only the hottest pages, is one possible
-arrangement. The question stays open on the hit-rate curve. A production
-replica's `icetray_page_cache_hits_total` and
-`icetray_page_cache_fetches_total` give its hit rate at the budget it
-runs, and the same counters on a replica whose budget is divided by its
-tables' value compression ratio give the rate the level would leave it.
+in a thousand into an extra cold hit. A row cache skips the same
+decompression on a hit and keeps a hot row without its cold neighbors, so
+the same memory holds more of the hot set than pages, decompressed or
+not, and a hit-rate curve under skewed keys showed rows ahead of pages at
+every budget tried (RFD 028 (Cache budget)).

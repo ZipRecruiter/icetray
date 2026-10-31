@@ -20,6 +20,11 @@
 > `balanced`, and icetray publishes `icetray_table_gets_per_scan` for it
 > in place of the per-hit and per-miss gauges. See RFD 025.
 
+> Updated 2026-10-30: the check at load of the room `disk` tables' chunk
+> files need under the memory limit counts the cache budget the caches
+> have not filled yet, so they count at their budget and not at their
+> current fill. See RFD 028.
+
 ## Problem
 
 RFD 007 (Serving tiers) sorts what the doctor finds into refusals,
@@ -170,12 +175,14 @@ server condition a level depends on today:
   itself. The sample decides; when residency cannot be observed, this
   condition is not judged and the table reads the level of its layout.
 - At load, icetray compares what every `disk` table's chunk files and the
-  page cache's disk level need with the room under the memory limit (the
-  cgroup's, or the host's) less the process's resident set. A shortfall
-  is logged as a warning naming the bytes missing, so an undersized
-  deployment is reported at start, before the sample sees it. Each chunk
-  file is counted once, however many generations or reloaded entries
-  share it.
+  page cache's disk level need, plus the part of the cache budget the
+  caches have not filled yet, with the room under the memory limit (the
+  cgroup's, or the host's) less the process's resident set, so the
+  caches count at their budget and not at their current fill (RFD 028
+  (Cache budget)). A shortfall is logged as a warning naming the bytes
+  missing, so an undersized deployment is reported at start, before the
+  sample sees it. Each chunk file is counted once, however many
+  generations or reloaded entries share it.
 
 ### States and alerts
 
