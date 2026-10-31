@@ -350,6 +350,43 @@ it. `icetray_row_cache_hits_total` against
 `icetray_row_cache_misses_total` gives its hit rate
 ([Metrics](operating.md#metrics)).
 
+### Skewed keys, measured
+
+The benchmark program's `skewed-hit` scenario asks keys drawn from a Zipf
+distribution of exponent 0.9 over the 2,000,000 keys of its `long`
+table, under which the hottest one percent of keys take about half the
+lookups. The keys are ranked in a random order, so the hot ones are
+scattered through the key order and so through the value pages, and the
+table's 100-byte values sit about a thousand to a page. The scenario
+serves the table under `full` through a 32 MiB cache budget, about a
+sixth of its 200 MB of value pages, fills the caches with a pass of keys
+of the same distribution, and then measures fresh draws. With
+`--row-cache on` the budget is split by the default `row_cache_share`;
+with `--row-cache off` the page cache holds all of it. The table is on
+the local filesystem, so each value-page GET it counts is a file read;
+against object storage each would be a GET of tens of milliseconds.
+
+```sh
+cargo run --release -p icetray-testkit --example bench -- \
+  --scenario skewed-hit --tier full --table long --values random \
+  --mode single,multi --duration 5 --row-cache on
+```
+
+One run on an Apple M3 Pro laptop with 11 cores, five seconds per mode,
+gave the figures below. They show what the row cache changes on this
+workload; they are not a guarantee for another table, machine, or skew.
+
+| | Value-page GETs per lookup | Lookups/s, 1 task | Lookups/s, 11 tasks | Median latency, 1 task |
+|---|---|---|---|---|
+| Row cache off | 0.68 | 20,900 | 72,100 | 61 µs |
+| Row cache on | 0.39 | 33,300 | 137,800 | 10 µs |
+
+The row cache held about one row in sixteen and still served about 61
+percent of lookups, where the page cache alone, holding about one page
+in six, served about 32 percent: each cached page held a few hot rows
+among a thousand cold ones. A table's own gain depends on its skew, its
+row size, and its budget, and its hit rate is the one to watch.
+
 ## The page cache
 
 icetray caches value pages compressed, keyed by file and offset. Iceberg

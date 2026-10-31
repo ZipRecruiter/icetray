@@ -29,7 +29,11 @@
 //! over the chunk files a Disk load left (a restart), and of a refresh,
 //! with an ordered table's rounds of GETs and the bytes its uniqueness
 //! merge held and had in flight, the resident index's bytes by part, and
-//! the chunk files' bytes.
+//! the chunk files' bytes. Key-value tables read through the row cache
+//! (RFD 026) under `--row-cache on` and through the page cache alone under
+//! `off`, the default; `skewed-hit` asks keys drawn from a Zipf
+//! distribution through a cache budget smaller than the table, and is
+//! meant to be run both ways.
 //! Results print as a table and are written as JSON under `--out-dir`. Run
 //! with `cargo run -p icetray-testkit --example bench --release -- --help`;
 //! a profile of one scenario narrows `--scenario`, `--tier`, `--table`,
@@ -113,6 +117,7 @@ use object_store::ObjectStore;
 use parquet::file::page_index::offset_index::PageLocation;
 use parquet::file::reader::{FileReader as _, SerializedFileReader};
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom as _;
 use rand::{RngExt, SeedableRng};
 use serde_json::{Value as Json, json};
 use tempfile::TempDir;
@@ -243,10 +248,20 @@ impl Allocations {
 /// What to measure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Scenario {
-    /// A hit whose value page the page cache holds.
+    /// A hit whose value the warm cache budget holds: its row in the row
+    /// cache under `--row-cache on`, its value page in the page cache
+    /// under `off`.
     WarmHit,
-    /// A hit whose value page the page cache does not hold.
+    /// A hit whose value neither cache holds.
     ColdHit,
+    /// A hit whose key is drawn from a Zipf distribution of exponent
+    /// `ZIPF_EXPONENT` over the table's keys, ranked in a seeded random
+    /// order so the hot keys lie scattered through the key order, through
+    /// the `SKEWED_CACHE_BYTES` budget, which holds a share of the table's
+    /// values, filled by a pass of the scenario's own keys before it is
+    /// measured; through the row cache or the page cache alone as
+    /// `--row-cache` says.
+    SkewedHit,
     /// A key inside the table's range that no file holds.
     Miss,
     /// A `MultiGet` of 100 hits, warm.
@@ -370,6 +385,7 @@ impl Scenario {
         match self {
             Self::WarmHit => Traits::warm("warm-hit"),
             Self::ColdHit => Traits::cold("cold-hit"),
+            Self::SkewedHit => Traits::of("skewed-hit", Cache::Skewed),
             Self::Miss => Traits::unread("miss"),
             Self::MultiGet100 => Traits::warm("multi-get-100"),
             Self::MultiGet1000 => Traits::warm("multi-get-1000"),
@@ -440,7 +456,7 @@ struct Traits {
 }
 
 /// The cache budget a scenario measures, split between the row cache and
-/// the page cache as a server splits it (`stack`).
+/// the page cache as `--row-cache` says (`stack`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cache {
     /// The `WARM_CACHE_BYTES` budget, primed to hold every value, which
@@ -449,6 +465,9 @@ enum Cache {
     /// The `COLD_CACHE_BYTES` budget, which holds almost none of the
     /// table's values.
     Cold,
+    /// The `SKEWED_CACHE_BYTES` budget, which holds a share of the table's
+    /// values, filled by the scenario's own skewed keys.
+    Skewed,
     /// None it depends on: a miss, served warm, reads no value page, and a
     /// load or a refresh reads none through it.
     Unread,
@@ -556,7 +575,8 @@ enum TableName {
     /// A table shaped like a serving table: random-looking string keys,
     /// 4 KiB random values in 64 KiB value pages, and about 37,500 rows per
     /// file. Runs only when named, and only its load, refresh, cold-hit,
-    /// and miss scenarios: its value pages outrun the warm cache.
+    /// miss, and skewed-hit scenarios: its value pages outrun the warm
+    /// cache.
     Scattered,
     /// Long keys of `ORDERED_ROWS_PER_KEY` rows each by a timestamp order
     /// column, contract layout: the table the first Scan and `MultiScan`
@@ -664,6 +684,26 @@ impl Mode {
     }
 }
 
+/// Whether the run's key-value tables read through the row cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RowCacheFlag {
+    /// Every key-value table reads through the row cache, which holds the
+    /// default `server.row_cache_share` of each budget.
+    On,
+    /// Every key-value table sets `row_cache = false`, so the page cache
+    /// holds the whole budget.
+    Off,
+}
+
+impl RowCacheFlag {
+    fn is_on(self) -> bool {
+        match self {
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
+
 /// The benchmark's command line. Every list flag takes comma-separated
 /// values and, when absent, means all of them.
 #[derive(Parser, Debug)]
@@ -738,6 +778,12 @@ struct Cli {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
     )]
     batch_fan_out: usize,
+    /// Whether the key-value tables of the run read through the row cache
+    /// (RFD 026). Off by default, so the warm scenarios measure the page
+    /// cache holding the whole budget and compare with the published
+    /// sweeps; `skewed-hit` is meant to be run both ways.
+    #[arg(long, value_enum, default_value_t = RowCacheFlag::Off)]
+    row_cache: RowCacheFlag,
     /// Serve the golden reference tables under WAREHOUSE, a location whose
     /// `db/` holds them, in place of the program's own tables, which are
     /// neither written nor read (the module doc's Reference mode). A copy
@@ -779,7 +825,8 @@ struct Cli {
 /// defaults with the run's `--rewrite-location` rules, under the run's
 /// `--batch-fan-out`, and each reference table at the run's
 /// `--reference-max-scan-rows`, under the `server.max_multi_scan_values`
-/// that admits it.
+/// that admits it, and each key-value table through the row cache when
+/// the run's `--row-cache` is on.
 #[derive(Clone, Debug)]
 struct Serving {
     storage: StorageConfig,
@@ -787,6 +834,8 @@ struct Serving {
     /// A reference table's `max_scan_rows`; the default when `None`.
     reference_max_scan_rows: Option<u32>,
     max_multi_scan_values: usize,
+    /// Whether a key-value table reads through the row cache.
+    row_cache: bool,
 }
 
 impl Default for Serving {
@@ -797,6 +846,7 @@ impl Default for Serving {
             batch_fan_out: server.batch_fan_out,
             reference_max_scan_rows: None,
             max_multi_scan_values: server.max_multi_scan_values,
+            row_cache: false,
         }
     }
 }
@@ -805,9 +855,10 @@ impl Default for Serving {
 static SERVING: OnceLock<Serving> = OnceLock::new();
 
 /// Sets `SERVING` from `cli`'s `--rewrite-location` rules,
-/// `--batch-fan-out`, and `--reference-max-scan-rows`, once: under the
-/// last, `server.max_multi_scan_values` is its default or, when that is
-/// lower, the least a table at that `max_scan_rows` is valid under.
+/// `--batch-fan-out`, `--row-cache`, and `--reference-max-scan-rows`,
+/// once: under the last, `server.max_multi_scan_values` is its default
+/// or, when that is lower, the least a table at that `max_scan_rows` is
+/// valid under.
 fn set_serving(cli: &Cli) {
     let defaults = Serving::default();
     let max_multi_scan_values = match cli.reference_max_scan_rows {
@@ -825,6 +876,7 @@ fn set_serving(cli: &Cli) {
             batch_fan_out: cli.batch_fan_out,
             reference_max_scan_rows: cli.reference_max_scan_rows,
             max_multi_scan_values,
+            row_cache: cli.row_cache.is_on(),
         })
         .expect("main sets the serving configuration once");
 }
@@ -1770,11 +1822,12 @@ fn local_path(location: &str) -> BenchResult<PathBuf> {
 // ---------------------------------------------------------------------------
 // Serving.
 
-/// The cache budget of the warm and miss scenarios: large enough that its
-/// row cache part holds every value of a table of 100-byte values (about
-/// 200 MB of value pages) and its page cache part, under the Bloom tier,
-/// every key page besides, so nothing is evicted. A table whose values do
-/// not fit is not run warm (`fits_warm_cache`).
+/// The cache budget of the warm and miss scenarios: large enough that,
+/// under `--row-cache off`, the page cache holds every value page of a
+/// table of 100-byte values (about 200 MB) and, under the Bloom tier,
+/// every key page besides, and under `on` that its row cache part holds
+/// every such value, so nothing is evicted. A table whose values do not
+/// fit is not run warm (`fits_warm_cache`).
 const WARM_CACHE_BYTES: usize = 1 << 30;
 
 /// The cache budget of the cold-hit scenario: one mebibyte, about ten of
@@ -1782,6 +1835,13 @@ const WARM_CACHE_BYTES: usize = 1 << 30;
 /// hit misses both caches, reads its page from the file, and decodes it.
 /// The run reports the page fetches it measured per lookup.
 const COLD_CACHE_BYTES: usize = 1 << 20;
+
+/// The cache budget of the skewed scenario: 32 MiB, about a sixth of a
+/// table of 100-byte values' 200 MB of value pages and, at the row
+/// cache's charge for such a row, room for about one row in sixteen, so
+/// neither cache holds the whole table and the skew decides which rows
+/// each serves.
+const SKEWED_CACHE_BYTES: usize = 1 << 25;
 
 /// One table served over storage of its own, so its counters are its own,
 /// beside at most one other table over the same handles, and a local
@@ -1826,7 +1886,8 @@ struct Stack {
 /// `open_with` gives a process's tables: a cache budget of `cache_bytes`
 /// split between the row cache and the page cache as a server splits it
 /// (`budget::resolve`), the row cache's share held only when `rows_read`,
-/// some table served reading through it; the run's `--batch-fan-out` and
+/// some table served reading through it, and the whole budget the page
+/// cache's otherwise; the run's `--batch-fan-out` and
 /// `server.max_multi_scan_values` (`Serving`), the server's defaults
 /// otherwise, and under Disk a local directory with no page-cache disk
 /// level, `reuse`'s when given (`local_for`).
@@ -1948,8 +2009,9 @@ fn local_for(
 
 /// `prepared` as a `Table` in `tier` from `source`, strict at its shape's
 /// level (`TableShape::lookups`), over `handles`, with the default
-/// deadlines, an ordered table with its order column at the default
-/// `max_scan_rows`.
+/// deadlines, a key-value table reading through the row cache as the
+/// run's `--row-cache` says, an ordered table, which sets no `row_cache`,
+/// with its order column at the default `max_scan_rows`.
 async fn table_over(
     prepared: &Prepared,
     tier: Tier,
@@ -1968,7 +2030,11 @@ async fn table_over(
         lookups: prepared.shape.lookups(),
         residency: tier.residency(),
         resident_budget_bytes: None,
-        row_cache: None,
+        row_cache: prepared
+            .shape
+            .ordered
+            .is_none()
+            .then_some(serving().row_cache),
     };
     table_of(config, handles).await
 }
@@ -1990,12 +2056,13 @@ async fn table_of(config: TableConfig, handles: TableHandles) -> BenchResult<Tab
 }
 
 /// Whether `prepared` or the table served `beside` it reads through the
-/// row cache: a key-value table does, as `table_over` configures it, and
-/// an ordered table never does.
+/// row cache: a key-value table does when the run's `--row-cache` is on,
+/// as `table_over` configures it, and an ordered table never does.
 fn reads_rows(prepared: &Prepared, beside: Option<&Prepared>) -> bool {
-    std::iter::once(prepared)
-        .chain(beside)
-        .any(|served| served.shape.ordered.is_none())
+    serving().row_cache
+        && std::iter::once(prepared)
+            .chain(beside)
+            .any(|served| served.shape.ordered.is_none())
 }
 
 /// The first build's metadata file, which never advances.
@@ -2038,6 +2105,82 @@ fn hit_ids(shape: TableShape) -> Vec<u64> {
     (0..KEY_POOL)
         .map(|_| rng.random_range(0..shape.rows))
         .collect()
+}
+
+/// The exponent of the skewed scenario's Zipf distribution: the key of
+/// rank `r`, from one, is drawn in proportion to `1 / r^ZIPF_EXPONENT`.
+/// At 0.9 over a table of `ROWS` keys, the hottest one percent of keys
+/// take about half the lookups.
+const ZIPF_EXPONENT: f64 = 0.9;
+
+/// The seed of the skewed pools' ranking and draws, fixed so every run
+/// asks the same keys.
+const SKEW_SEED: u64 = 0x1ce7_4a7b_e4c4_0003;
+
+/// Keys in the skewed scenario's measured pool: four times `KEY_POOL`, so
+/// a run of both modes at the default duration asks each draw once and
+/// never wraps. A wrapped pool would ask its first draws again a pool's
+/// length later, which a cache serves better than it would fresh draws
+/// of the same distribution.
+const SKEWED_POOL: usize = 4 * KEY_POOL;
+
+/// The skewed scenario's pools over `shape`'s key space: the `KEY_POOL`
+/// keys of the pass that fills its caches (`fill_from`), then the
+/// `SKEWED_POOL` keys it measures, independent draws of one distribution,
+/// so the measured keys reach a cache already holding what that
+/// distribution reads most and not the very keys it is about to ask. Each
+/// draw is a Zipf rank by inverse CDF over the precomputed cumulative
+/// weights, the rank the id it holds in a seeded shuffle of the first
+/// build's ids, so the hot keys lie scattered through the key order and
+/// so through the value pages.
+fn skewed_pools(shape: TableShape) -> (Arc<Vec<Key>>, Arc<Vec<Key>>) {
+    let mut rng = StdRng::seed_from_u64(SKEW_SEED);
+    let mut by_rank: Vec<u64> = (0..shape.rows).collect();
+    by_rank.shuffle(&mut rng);
+    let mut total = 0.0;
+    let cumulative: Vec<f64> = (1..=shape.rows)
+        .map(|rank| {
+            total += approx::ratio(1, rank).powf(ZIPF_EXPONENT);
+            total
+        })
+        .collect();
+    let last = by_rank.len() - 1;
+    let mut draws = |count: usize| -> Arc<Vec<Key>> {
+        Arc::new(
+            (0..count)
+                .map(|_| {
+                    let drawn = rng.random_range(0.0..total);
+                    let rank = cumulative.partition_point(|&sum| sum <= drawn).min(last);
+                    shape.key(by_rank[rank])
+                })
+                .collect(),
+        )
+    };
+    let fill = draws(KEY_POOL);
+    (fill, draws(SKEWED_POOL))
+}
+
+/// Runs operations `0..ops` of `op`, `tasks` at a time, outside any
+/// measured window: one pass over the skewed scenario's fill pool
+/// (`skewed_pools`), which fills its caches with the rows and pages its
+/// distribution reads most.
+async fn fill_from(served: &Served, op: &Op, tasks: usize, ops: usize) -> BenchResult<()> {
+    let handles: Vec<tokio::task::JoinHandle<BenchResult<()>>> = (0..tasks)
+        .map(|task| {
+            let table = Arc::clone(&served.table);
+            let op = op.clone();
+            tokio::spawn(async move {
+                for i in (task..ops).step_by(tasks) {
+                    op.run(&table, i).await?;
+                }
+                Ok(())
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.await??;
+    }
+    Ok(())
 }
 
 /// Pools of hits and misses over `shape`'s key space: the `hit_ids` as
@@ -2636,12 +2779,13 @@ enum Pace {
 /// recorded, and the value bytes they read and returned.
 type Done = (usize, Vec<Duration>, ValueBytes);
 
-/// One task's share of a run: operations `task`, `task + tasks`, ... until
-/// `until`, each timed into `samples` when it is given.
+/// One task's share of a run whose operations start at `first`:
+/// operations `first + task`, `first + task + tasks`, ... until `until`,
+/// each timed into `samples` when it is given.
 async fn task_loop(
     table: Arc<Table>,
     op: Op,
-    (task, tasks): (usize, usize),
+    (first, task, tasks): (usize, usize, usize),
     pace: Pace,
     until: Instant,
     mut samples: Option<Vec<Duration>>,
@@ -2649,7 +2793,7 @@ async fn task_loop(
     let mut done = 0;
     let mut bytes = ValueBytes::default();
     while Instant::now() < until {
-        let i = done * tasks + task;
+        let i = first + done * tasks + task;
         op.before();
         let started = Instant::now();
         let op_bytes = op.run(&table, i).await?;
@@ -2668,12 +2812,13 @@ async fn task_loop(
 /// The task loops of a run, as they are spawned.
 type Loops = Vec<tokio::task::JoinHandle<BenchResult<Done>>>;
 
-/// `tasks` task loops of `op` over `table` at `pace` until `until`, each
-/// reserving `reserve` samples when recording, spawned and not yet joined.
+/// `tasks` task loops of `op` over `table` at `pace` from operation
+/// `first` until `until`, each reserving `reserve` samples when
+/// recording, spawned and not yet joined.
 fn spawn_loops(
     table: &Arc<Table>,
     (op, pace): (&Op, Pace),
-    tasks: usize,
+    (first, tasks): (usize, usize),
     until: Instant,
     reserve: Option<usize>,
 ) -> Loops {
@@ -2682,7 +2827,7 @@ fn spawn_loops(
             tokio::spawn(task_loop(
                 Arc::clone(table),
                 op.clone(),
-                (task, tasks),
+                (first, task, tasks),
                 pace,
                 until,
                 reserve.map(Vec::with_capacity),
@@ -2691,13 +2836,13 @@ fn spawn_loops(
         .collect()
 }
 
-/// `tasks` task loops for `length`, each reserving `reserve` samples when
-/// recording; the operations done, the samples, and the value bytes,
-/// merged.
+/// `tasks` task loops from operation `first` for `length`, each
+/// reserving `reserve` samples when recording; the operations done, the
+/// samples, and the value bytes, merged.
 async fn spawn_run(
     served: &Served,
     op: &Op,
-    tasks: usize,
+    (first, tasks): (usize, usize),
     length: Duration,
     reserve: Option<usize>,
 ) -> BenchResult<Done> {
@@ -2705,7 +2850,7 @@ async fn spawn_run(
     join_loops(spawn_loops(
         &served.table,
         (op, Pace::Straight),
-        tasks,
+        (first, tasks),
         until,
         reserve,
     ))
@@ -2969,6 +3114,7 @@ impl Measured {
                 "batch_fan_out": self.label.batch_fan_out,
                 "beside": self.label.beside.map(TableShape::table_name),
                 "keys_per_op": self.keys_per_op,
+                "row_cache": serving().row_cache,
             }),
             [self.window.to_json(), rounds_json(self.rounds)],
         )
@@ -3001,15 +3147,19 @@ fn rounds_json(rounds: Option<Rounds>) -> Json {
 /// Runs `op` over `served` with `tasks` tasks for the warm-up and then for
 /// the measured window, the samples of the window reserved from the
 /// warm-up's rate before the counters are first read, so recording
-/// allocates nothing inside the window. A GET log over the served store
-/// (`Served::gets`) starts anew with the window's counters.
+/// allocates nothing inside the window. The warm-up's operations start at
+/// `first` and the window's follow them, so neither asks again the keys
+/// an earlier run of the op just asked, which a cache smaller than the
+/// table would still hold; the window and the operation after its last.
+/// A GET log over the served store (`Served::gets`) starts anew with the
+/// window's counters.
 async fn measure_window(
     served: &Served,
     op: &Op,
-    tasks: usize,
+    (first, tasks): (usize, usize),
     settings: &RunSettings,
-) -> BenchResult<Window> {
-    let (warm_ops, _, _) = spawn_run(served, op, tasks, settings.warmup, None).await?;
+) -> BenchResult<(Window, usize)> {
+    let (warm_ops, _, _) = spawn_run(served, op, (first, tasks), settings.warmup, None).await?;
     let windows = approx::length(settings.windows);
     let reserve = (warm_ops / tasks + 1) * windows * SAMPLE_HEADROOM;
     if let Some(log) = &served.gets {
@@ -3017,17 +3167,24 @@ async fn measure_window(
     }
     let before = Counters::read(served);
     let started = Instant::now();
-    let (ops, samples, bytes) =
-        spawn_run(served, op, tasks, settings.duration, Some(reserve)).await?;
+    let (ops, samples, bytes) = spawn_run(
+        served,
+        op,
+        (first + warm_ops, tasks),
+        settings.duration,
+        Some(reserve),
+    )
+    .await?;
     let elapsed = started.elapsed();
     let counters = Counters::read(served).since(before);
-    Ok(Window {
+    let window = Window {
         ops,
         elapsed,
         latencies: Latencies::of(samples),
         counters,
         bytes,
-    })
+    };
+    Ok((window, first + warm_ops + ops))
 }
 
 /// Asks every page of the table, of every column it serves, at least once,
@@ -3035,9 +3192,16 @@ async fn measure_window(
 /// under Bloom every key page) before a warm run starts: a Get of each key
 /// of a key-value table, and of an ordered table Scans of each key's whole
 /// run, paged by order value as a caller pages a run longer than
-/// `max_scan_rows`, which fill the page cache.
+/// `max_scan_rows`, which fill the page cache. A table that reads through
+/// the row cache is asked every id, so the row cache holds every row: its
+/// page cache part need not hold every value page.
 async fn prime_cache(table: &Table, shape: TableShape) -> BenchResult<()> {
-    for id in (0..shape.rows).step_by(approx::length(shape.prime_stride())) {
+    let stride = if table.config().row_cache() {
+        EVERY_ID_STRIDE
+    } else {
+        shape.prime_stride()
+    };
+    for id in (0..shape.rows).step_by(approx::length(stride)) {
         let key = shape.key(id);
         match shape.ordered {
             Some(_) => page_through(table, &key, shape.whole_reads()).await?,
@@ -3098,11 +3262,66 @@ struct RunSettings {
     windows: u64,
 }
 
+/// One table served in one tier under each cache budget its selected
+/// scenarios measure, loaded; `None` for a budget none of them does.
+struct Budgets {
+    /// Under `WARM_CACHE_BYTES`, primed (`prime_cache`), for the warm
+    /// scenarios and the misses.
+    warm: Option<Served>,
+    cold: Option<Served>,
+    /// Under `SKEWED_CACHE_BYTES`, unfilled: the skewed scenario fills it
+    /// with its own keys.
+    skewed: Option<Served>,
+}
+
+impl Budgets {
+    /// `prepared` beside `beside` in `tier` under each budget `scenarios`
+    /// measure (`serve_loaded`).
+    async fn serve(
+        prepared: &Prepared,
+        beside: Option<&Prepared>,
+        tier: Tier,
+        scenarios: &[Scenario],
+    ) -> BenchResult<Self> {
+        let uses = |cache: Cache| scenarios.iter().any(|s| s.traits().cache == cache);
+        let warm = if uses(Cache::Warm) || uses(Cache::Unread) {
+            let served = serve_loaded(prepared, beside, tier, WARM_CACHE_BYTES).await?;
+            prime_cache(&served.table, prepared.shape).await?;
+            Some(served)
+        } else {
+            None
+        };
+        let cold = if uses(Cache::Cold) {
+            Some(serve_loaded(prepared, beside, tier, COLD_CACHE_BYTES).await?)
+        } else {
+            None
+        };
+        let skewed = if uses(Cache::Skewed) {
+            Some(serve_loaded(prepared, beside, tier, SKEWED_CACHE_BYTES).await?)
+        } else {
+            None
+        };
+        Ok(Self { warm, cold, skewed })
+    }
+
+    /// The table served under `cache`, which a selected scenario measures.
+    fn of(&self, cache: Cache) -> &Served {
+        match cache {
+            Cache::Warm | Cache::Unread => &self.warm,
+            Cache::Cold => &self.cold,
+            Cache::Skewed => &self.skewed,
+        }
+        .as_ref()
+        .expect("a table is served for every selected scenario")
+    }
+}
+
 /// Every selected lookup scenario of one table in one tier, each in every
-/// selected mode, over a warm table and, for the cold scenarios, a cold
-/// one; each served beside `beside` when given (`serve`). A Scan scenario
-/// is checked against the model whole (`verify_scans`) before it is
-/// measured.
+/// selected mode, over a warm table, for the cold scenarios a cold one,
+/// and for the skewed scenario one filled by a pass of its own keys
+/// (`fill_from`); each served beside `beside` when given (`serve`). A
+/// Scan scenario is checked against the model whole (`verify_scans`)
+/// before it is measured.
 async fn lookups(
     prepared: &Prepared,
     beside: Option<&Prepared>,
@@ -3112,19 +3331,7 @@ async fn lookups(
 ) -> BenchResult<Vec<Measured>> {
     let shape = prepared.shape;
     let (hits, misses) = key_pools(shape);
-    let cold_cache = |scenario: &Scenario| scenario.traits().cache == Cache::Cold;
-    let warm = if scenarios.iter().any(|s| !cold_cache(s)) {
-        let served = serve_loaded(prepared, beside, tier, WARM_CACHE_BYTES).await?;
-        prime_cache(&served.table, shape).await?;
-        Some(served)
-    } else {
-        None
-    };
-    let cold = if scenarios.iter().any(cold_cache) {
-        Some(serve_loaded(prepared, beside, tier, COLD_CACHE_BYTES).await?)
-    } else {
-        None
-    };
+    let budgets = Budgets::serve(prepared, beside, tier, scenarios).await?;
     let whole = scenarios
         .iter()
         .any(|s| s.traits().projects)
@@ -3147,6 +3354,18 @@ async fn lookups(
     for &scenario in scenarios {
         let op = match scenario {
             Scenario::WarmHit | Scenario::ColdHit => get(&hits, true, WHOLE_VALUE),
+            Scenario::SkewedHit => {
+                let (fill, measured) = skewed_pools(shape);
+                let served = budgets.of(Cache::Skewed);
+                fill_from(
+                    served,
+                    &get(&fill, true, WHOLE_VALUE),
+                    settings.tasks,
+                    KEY_POOL,
+                )
+                .await?;
+                get(&measured, true, WHOLE_VALUE)
+            }
             Scenario::Miss => get(&misses, false, WHOLE_VALUE),
             Scenario::MultiGet100 | Scenario::MultiGet100Cold => {
                 multi(&hits, SMALL_BATCH_KEYS, WHOLE_VALUE)
@@ -3184,10 +3403,7 @@ async fn lookups(
                 continue;
             }
         };
-        let served = if cold_cache(&scenario) { &cold } else { &warm };
-        let served = served
-            .as_ref()
-            .expect("a table is served for every selected scenario");
+        let served = budgets.of(scenario.traits().cache);
         verify_scans(&op, &served.table, shape).await?;
         let rounds = count_rounds(served, &op).await?;
         let label = RunLabel {
@@ -3276,10 +3492,11 @@ struct ModeRun {
     gets: Option<Json>,
 }
 
-/// `op` over `served` measured in every selected mode; the single-task
-/// run carries `rounds`, counted one operation at a time as that run runs
-/// them, and every run the GETs of its window when a log is in place,
-/// with up to `GET_SAMPLES` of them one by one.
+/// `op` over `served` measured in every selected mode, each mode's
+/// operations following the last mode's (`measure_window`); the
+/// single-task run carries `rounds`, counted one operation at a time as
+/// that run runs them, and every run the GETs of its window when a log is
+/// in place, with up to `GET_SAMPLES` of them one by one.
 async fn measure_modes(
     served: &Served,
     op: &Op,
@@ -3291,12 +3508,14 @@ async fn measure_modes(
         None => None,
     };
     let mut runs = Vec::with_capacity(settings.modes.len());
+    let mut next = 0;
     for &mode in &settings.modes {
         let (tasks, rounds) = match mode {
             Mode::Single => (1, rounds),
             Mode::Multi => (settings.tasks, None),
         };
-        let window = measure_window(served, op, tasks, settings).await?;
+        let (window, after) = measure_window(served, op, (next, tasks), settings).await?;
+        next = after;
         let gets = served
             .gets
             .as_ref()
@@ -3453,12 +3672,14 @@ async fn kv_beside_ordered(
 
 /// The two-table scenario in `tier`: `settings.tasks` loops of warm hits on
 /// the long table beside one loop of `MultiGet` 1,000 warm hits on the
-/// string table, both served over one storage, one `WARM_CACHE_BYTES` page
-/// cache, under Disk one local directory, and one count of calls in flight,
-/// as `open_with` opens a process's tables, each loaded and primed, run
-/// together for the warm-up and then for the measured window. Every loop yields between operations (`Pace::Yielding`): the hit
-/// loops would otherwise hold every worker, and the batch and its runs
-/// would wait for the window to end. One row per table. Neither row carries counters: both tables'
+/// string table, both served over one storage, one `WARM_CACHE_BYTES`
+/// cache budget, under Disk one local directory, and one count of calls
+/// in flight, as `open_with` opens a process's tables, each loaded and
+/// primed, run together for the warm-up and then for the measured window,
+/// whose operations follow the warm-up's. Every loop yields between
+/// operations (`Pace::Yielding`): the hit loops would otherwise hold every
+/// worker, and the batch and its runs would wait for the window to end.
+/// One row per table. Neither row carries counters: both tables'
 /// operations run in one window over one storage and one cache, so no
 /// count belongs to either row alone; each carries the value bytes its own
 /// loops read and returned.
@@ -3493,8 +3714,8 @@ async fn two_tables(
     let one = 1;
 
     let until = Instant::now() + settings.warmup;
-    let hit_loops = spawn_loops(long_table, hits, tasks, until, None);
-    let batch_loops = spawn_loops(string_table, batches, one, until, None);
+    let hit_loops = spawn_loops(long_table, hits, (0, tasks), until, None);
+    let batch_loops = spawn_loops(string_table, batches, (0, one), until, None);
     let (warm_hits, _, _) = join_loops(hit_loops).await?;
     let (warm_batches, _, _) = join_loops(batch_loops).await?;
 
@@ -3502,11 +3723,17 @@ async fn two_tables(
     let reserve = |ops: usize, tasks: usize| Some((ops / tasks + 1) * windows * SAMPLE_HEADROOM);
     let started = Instant::now();
     let until = started + settings.duration;
-    let hit_loops = spawn_loops(long_table, hits, tasks, until, reserve(warm_hits, tasks));
+    let hit_loops = spawn_loops(
+        long_table,
+        hits,
+        (warm_hits, tasks),
+        until,
+        reserve(warm_hits, tasks),
+    );
     let batch_loops = spawn_loops(
         string_table,
         batches,
-        one,
+        (warm_batches, one),
         until,
         reserve(warm_batches, one),
     );
@@ -5137,6 +5364,10 @@ fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Js
         "project_few_fields": PROJECT_FEW,
         "project_most_fields": PROJECT_MOST,
         "cold_cache_bytes": COLD_CACHE_BYTES,
+        "skewed_cache_bytes": SKEWED_CACHE_BYTES,
+        "zipf_exponent": ZIPF_EXPONENT,
+        "skew_seed": SKEW_SEED,
+        "row_cache": cli.row_cache.is_on(),
         "warmup_seconds": cli.warmup,
         "duration_seconds": cli.duration,
         "load_concurrency": icetray_core::load_concurrency(),
