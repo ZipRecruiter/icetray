@@ -132,9 +132,11 @@ and `icetray_scan_seconds`' to 10. `icetray_scan_rows`' run from 0 to
 handler runs: a body that does not decode (`internal`), a message over the
 4 MiB limit (`out_of_range`), and an encoding the server does not support
 (`unimplemented`). A call dropped before it completes, as when its client
-disconnects or its `grpc-timeout` passes, counts as `cancelled`, and a
-response whose body ends without a status counts as `unknown`. A call to
-a method outside the contract is not counted.
+disconnects or its `grpc-timeout` passes, counts as `cancelled`, and so
+does a call whose request the server could not finish reading from its
+connection, since its client is gone, whatever the gRPC layer answered.
+A response whose body ends without a status counts as `unknown`. A call
+to a method outside the contract is not counted.
 
 Gauges, written at each scrape:
 

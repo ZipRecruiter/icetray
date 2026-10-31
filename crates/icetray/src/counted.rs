@@ -5,10 +5,14 @@
 //! each request exactly once, under the `grpc-status` its client receives.
 //! A trailers-only answer carries the status in its headers and is counted
 //! as they leave; any other answer carries it in its trailers and is
-//! counted as its body yields them.
+//! counted as its body yields them. A request whose body fails to read is
+//! counted as `CANCELLED`, whatever it is answered: the failure is its
+//! connection's, so its client is gone and receives nothing.
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, ready};
 
 use hyper::HeaderMap;
@@ -32,21 +36,28 @@ fn grpc_status(headers: &HeaderMap) -> Option<Code> {
 /// One request being answered, counted in `requests` once: under the code
 /// `finish` is given, or as `CANCELLED` when it drops first, which is how
 /// a request ends whose client went away or whose `grpc-timeout` passed,
-/// when tonic drops the call and answers `CANCELLED` itself.
+/// when tonic drops the call and answers `CANCELLED` itself. Also
+/// `CANCELLED` when `failed` is set, whatever it was answered: its body
+/// failed to read (`RequestBody`), and tonic answers that failure with the
+/// code it gives the transport's error, `UNKNOWN` for a connection that
+/// closed, which no client receives.
 #[derive(Debug)]
 struct Answering {
     requests: Requests,
     call: Call,
     code: Code,
+    failed: Arc<AtomicBool>,
 }
 
 impl Answering {
-    /// A request of `call`, not yet answered, to count in `requests`.
-    fn new(requests: &Requests, call: Call) -> Self {
+    /// A request of `call`, not yet answered, to count in `requests`, its
+    /// body's failure to read to be recorded in `failed`.
+    fn new(requests: &Requests, call: Call, failed: Arc<AtomicBool>) -> Self {
         Self {
             requests: requests.clone(),
             call,
             code: Code::Cancelled,
+            failed,
         }
     }
 
@@ -58,7 +69,12 @@ impl Answering {
 
 impl Drop for Answering {
     fn drop(&mut self) {
-        self.requests.count(self.call, self.code);
+        let code = if self.failed.load(Ordering::Acquire) {
+            Code::Cancelled
+        } else {
+            self.code
+        };
+        self.requests.count(self.call, code);
     }
 }
 
@@ -84,7 +100,7 @@ impl<S: NamedService> NamedService for Counted<S> {
 
 impl<S, B, R> tower::Service<hyper::Request<B>> for Counted<S>
 where
-    S: tower::Service<hyper::Request<B>, Response = hyper::Response<R>>,
+    S: tower::Service<hyper::Request<RequestBody<B>>, Response = hyper::Response<R>>,
     S::Future: Unpin,
 {
     type Response = hyper::Response<CountedBody<R>>;
@@ -96,12 +112,52 @@ where
     }
 
     fn call(&mut self, request: hyper::Request<B>) -> Self::Future {
-        let answering =
-            Call::of_path(request.uri().path()).map(|call| Answering::new(&self.requests, call));
+        let call = Call::of_path(request.uri().path());
+        let failed = call.map(|_| Arc::new(AtomicBool::new(false)));
+        let answering = call
+            .zip(failed.clone())
+            .map(|(call, failed)| Answering::new(&self.requests, call, failed));
         CountedFuture {
-            inner: self.inner.call(request),
+            inner: self
+                .inner
+                .call(request.map(|inner| RequestBody { inner, failed })),
             answering,
         }
+    }
+}
+
+/// A counted request's body, handed to the service as it came, which sets
+/// `failed` when a read of it fails. Every error a request body yields is
+/// its connection's: a stream the client reset, a connection that closed,
+/// or a frame the client sent that broke the protocol. `None` for a
+/// request no call counts.
+#[derive(Debug)]
+pub struct RequestBody<B> {
+    inner: B,
+    failed: Option<Arc<AtomicBool>>,
+}
+
+impl<B: Body + Unpin> Body for RequestBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let polled = Pin::new(&mut self.inner).poll_frame(cx);
+        if let (Poll::Ready(Some(Err(_))), Some(failed)) = (&polled, &self.failed) {
+            failed.store(true, Ordering::Release);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -220,7 +276,7 @@ mod tests {
     #[derive(Clone)]
     struct Answers(fn() -> hyper::Response<Frames>);
 
-    impl tower::Service<hyper::Request<()>> for Answers {
+    impl<B> tower::Service<hyper::Request<B>> for Answers {
         type Response = hyper::Response<Frames>;
         type Error = Infallible;
         type Future = Ready<Result<Self::Response, Infallible>>;
@@ -229,7 +285,7 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _request: hyper::Request<()>) -> Self::Future {
+        fn call(&mut self, _request: hyper::Request<B>) -> Self::Future {
             ready(Ok((self.0)()))
         }
     }
@@ -373,6 +429,116 @@ mod tests {
         );
         drop(body);
         assert_eq!(counted_total(&handle).to_bits(), 1.0_f64.to_bits());
+    }
+
+    /// A request body that yields `frames` in order, then fails as a body
+    /// read from a closed connection does, unless `fails` is false.
+    #[derive(Debug)]
+    struct Request {
+        frames: VecDeque<Frame<Bytes>>,
+        fails: bool,
+    }
+
+    impl Body for Request {
+        type Data = Bytes;
+        type Error = tonic::Status;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, tonic::Status>>> {
+            match self.frames.pop_front() {
+                Some(frame) => Poll::Ready(Some(Ok(frame))),
+                None if self.fails => {
+                    self.fails = false;
+                    Poll::Ready(Some(Err(tonic::Status::unknown(
+                        "h2 protocol error: error reading a body from connection",
+                    ))))
+                }
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    /// A service that reads each request's body to its end, as tonic
+    /// decodes a request, and answers trailers-only: `UNKNOWN` whether or
+    /// not the read failed, since tonic answers a failed read with the
+    /// code it gives the transport's error, `UNKNOWN` for a closed
+    /// connection.
+    #[derive(Clone)]
+    struct Reads;
+
+    impl tower::Service<hyper::Request<RequestBody<Request>>> for Reads {
+        type Response = hyper::Response<Frames>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: hyper::Request<RequestBody<Request>>) -> Self::Future {
+            let mut body = request.into_body();
+            while let Some(Ok(_)) = body.frame().now_or_never().flatten() {}
+            let mut response = hyper::Response::new(Frames::default());
+            *response.headers_mut() = status("2");
+            ready(Ok(response))
+        }
+    }
+
+    /// A request of `call` whose body yields one message, then fails when
+    /// `fails`.
+    fn reading(call: Call, fails: bool) -> hyper::Request<Request> {
+        hyper::Request::builder()
+            .uri(format!(
+                "/{}/{}",
+                icetray_proto::v1::icetray_server::SERVICE_NAME,
+                call.method()
+            ))
+            .body(Request {
+                frames: VecDeque::from([Frame::data(Bytes::from_static(b"keys"))]),
+                fails,
+            })
+            .unwrap()
+    }
+
+    /// A request whose body fails to read from its connection is counted
+    /// as `CANCELLED`, whatever the service answers, since its client went
+    /// away before it finished sending; a request read whole is counted
+    /// under the code it is answered.
+    #[test]
+    fn test_call_counts_a_request_whose_body_fails_as_cancelled() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let requests = metrics::with_local_recorder(&recorder, Requests::register);
+        let mut service = Counted::new(Reads, requests);
+
+        drop(
+            service
+                .call(reading(Call::MultiGet, true))
+                .now_or_never()
+                .unwrap(),
+        );
+        assert_eq!(
+            count(&handle, Call::MultiGet, Code::Cancelled).to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert_eq!(
+            count(&handle, Call::MultiGet, Code::Unknown).to_bits(),
+            0.0_f64.to_bits()
+        );
+
+        drop(
+            service
+                .call(reading(Call::MultiGet, false))
+                .now_or_never()
+                .unwrap(),
+        );
+        assert_eq!(
+            count(&handle, Call::MultiGet, Code::Unknown).to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert_eq!(counted_total(&handle).to_bits(), 2.0_f64.to_bits());
     }
 
     /// A request for a path that is no call is answered and not counted.
