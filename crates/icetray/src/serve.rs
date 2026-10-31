@@ -854,9 +854,9 @@ impl BudgetRoom {
 }
 
 /// Whether a cache budget of `budget` bytes and tables whose resident
-/// indexes are `indexes`, one entry each, fit under `limit`: whether what
-/// they need (`memory::budget_needed`) is short of it with nothing beside
-/// (`memory::shortfall`).
+/// indexes are `indexes`, one entry each, fit under `limit`: what they
+/// need (`memory::budget_needed`) against the limit alone
+/// (`memory::shortfall`, no resident set).
 fn budget_room(indexes: &[u64], budget: u64, limit: Option<MemoryLimit>) -> BudgetRoom {
     let Some(limit) = limit else {
         return BudgetRoom::Unknown;
@@ -1219,7 +1219,7 @@ mod tests {
             config,
             TableSource::from_config(&source).await.unwrap(),
             None,
-            verify::TEST_PAGE_CACHE_BYTES,
+            verify::TEST_CACHE_BYTES,
         )
         .await
         .unwrap();

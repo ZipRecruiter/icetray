@@ -61,10 +61,14 @@ const INTERLEAVED_FILES: usize = 8;
 /// Ids written by the first two classes.
 const INTERLEAVED_WRITTEN: usize = 4_000;
 
-/// `fixture` served in the Full tier from its root, through the hint,
-/// under `strict`.
-async fn serve_root(fixture: &Fixture, strict: bool) -> Result<Served> {
-    verify::serve_root(fixture, fixture.config(Residency::Full, strict), false).await
+/// `fixture` served in the Full tier from its root, through the hint.
+async fn serve_lenient(fixture: &Fixture) -> Result<Served> {
+    verify::serve_root(fixture, fixture.config(Residency::Full, false)).await
+}
+
+/// `serve_lenient`, with the table strict.
+async fn serve_strict(fixture: &Fixture) -> Result<Served> {
+    verify::serve_root(fixture, fixture.config(Residency::Full, true)).await
 }
 
 #[tokio::test]
@@ -147,7 +151,8 @@ async fn test_a_rewritten_row_is_read_from_its_new_file() -> Result<()> {
     };
     let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     fixture.write_hint().await?;
-    let served = verify::serve_root(&fixture, fixture.config(Residency::Full, false), true).await?;
+    let served =
+        verify::serve_root_reading_rows(&fixture, fixture.config(Residency::Full, false)).await?;
     verify::verify_hits(&served, &fixture, &[OLD_ID]).await?;
     assert!(served.rows().usage() > 0, "the row is cached");
     let key = fixture.key(OLD_ID);
@@ -241,7 +246,7 @@ async fn test_refresh_follows_a_static_root_through_its_hint() -> Result<()> {
     };
     let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     fixture.write_hint().await?;
-    let served = serve_root(&fixture, false).await?;
+    let served = serve_lenient(&fixture).await?;
     let v1 = served.current();
     assert_eq!(v1.metadata_location, fixture.metadata_location());
 
@@ -331,7 +336,7 @@ async fn test_refresh_refuses_an_avro_data_file_and_keeps_serving() -> Result<()
     };
     let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     fixture.write_hint().await?;
-    let served = serve_root(&fixture, false).await?;
+    let served = serve_lenient(&fixture).await?;
     let v1 = served.current().snapshot_id;
 
     let path = format!("{}/{DATA_DIR}/rows.avro", fixture.root());
@@ -411,7 +416,7 @@ async fn test_refresh_recovers_when_the_offending_file_is_dropped() -> Result<()
     };
     let mut fixture = write_fixture(catalog.as_ref(), NAMESPACE, spec).await?;
     fixture.write_hint().await?;
-    let served = serve_root(&fixture, false).await?;
+    let served = serve_lenient(&fixture).await?;
     let v1 = served.current();
     let v1_paths: HashSet<String> = v1
         .files
@@ -585,7 +590,7 @@ async fn test_refresh_below_level_holds_then_swaps_once_compacted() -> Result<()
     )
     .await?;
     fixture.write_hint().await?;
-    let served = serve_root(&fixture, true).await?;
+    let served = serve_strict(&fixture).await?;
     let v1 = served.current();
     assert_eq!(v1.level, Level::Optimal);
 

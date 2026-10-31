@@ -26,10 +26,11 @@ use crate::keys::far_key;
 use crate::layout::VALUE_COLUMN;
 use crate::ordered::{TestScan, follow};
 
-/// The page cache budget of a served table: large enough that nothing a
-/// test touches is evicted, so a repeat batch is served from memory and a
-/// cold count is exactly the distinct pages a batch fetches.
-pub const TEST_PAGE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+/// The budget of a served table's page cache, and of its row cache when it
+/// reads rows: large enough that nothing a test touches is evicted, so a
+/// repeat batch is served from memory and a cold count is exactly the
+/// distinct pages a batch fetches.
+pub const TEST_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Load GETs past the per-file ones and the metadata file
 /// (`METADATA_FILE_GETS`): the manifest list and the one manifest a
@@ -61,7 +62,7 @@ pub struct Served {
     /// say whether it is cold.
     pub cache: PageCache,
     /// The row cache the table reads through (RFD 026) when it was served
-    /// reading rows (`serve_reading_rows`, `serve_root`); `None` for every
+    /// reading rows (`serve_reading_rows`, `serve_root_reading_rows`); `None` for every
     /// other table, whose lookups read every value from its page, so the
     /// GET oracles count what a lookup's pages cost.
     pub row_cache: Option<RowCache>,
@@ -226,65 +227,68 @@ pub async fn serve_disk(
     Ok((storage, local, served))
 }
 
-/// `build_in` with a `TEST_PAGE_CACHE_BYTES` cache over the source
+/// `build_in` with a `TEST_CACHE_BYTES` cache over the source
 /// `config` names, loaded: a table served over nothing a test shares.
 pub async fn serve_in(config: TableConfig, dir: &Path) -> Result<Served> {
     let source = TableSource::from_config(&config.source).await?;
-    build_in(config, source, dir, TEST_PAGE_CACHE_BYTES)
+    build_in(config, source, dir, TEST_CACHE_BYTES)
         .await?
         .load()
         .await
 }
 
-/// `build` with a `TEST_PAGE_CACHE_BYTES` cache, loaded.
+/// `build` with a `TEST_CACHE_BYTES` cache, loaded.
 pub async fn serve_over(
     storage: Arc<Storage>,
     config: TableConfig,
     source: TableSource,
     local: Option<Arc<LocalDir>>,
 ) -> Result<Served> {
-    build(storage, config, source, local, TEST_PAGE_CACHE_BYTES)
+    build(storage, config, source, local, TEST_CACHE_BYTES)
         .await?
         .load()
         .await
 }
 
-/// `build_with` of `config` from `source` over a fresh hedge-free storage
-/// (`storage_config_for_tests`) with no local directory and a
-/// `TEST_PAGE_CACHE_BYTES` page cache, and a row cache as large beside it
-/// when `reads_rows`; loaded.
-async fn serve_fresh(config: TableConfig, source: TableSource, reads_rows: bool) -> Result<Served> {
+/// `config` from `source` over a fresh hedge-free storage
+/// (`storage_config_for_tests`) with no local directory, reading through a
+/// row cache of `TEST_CACHE_BYTES` beside the page cache; loaded.
+pub async fn serve_reading_rows(config: TableConfig, source: TableSource) -> Result<Served> {
     build_with(
         Arc::new(Storage::new(storage_config_for_tests())),
         config,
         source,
         None,
-        TEST_PAGE_CACHE_BYTES,
-        reads_rows,
+        TEST_CACHE_BYTES,
+        true,
     )
     .await?
     .load()
     .await
 }
 
-/// `config` from `source` reading through a row cache (`serve_fresh`).
-pub async fn serve_reading_rows(config: TableConfig, source: TableSource) -> Result<Served> {
-    serve_fresh(config, source, true).await
-}
-
-/// `config` of `fixture` from its root, followed through the version
-/// hint, reading through a row cache when `reads_rows` (`serve_fresh`).
-pub async fn serve_root(
-    fixture: &Fixture,
-    config: TableConfig,
-    reads_rows: bool,
-) -> Result<Served> {
+/// `config` rooted at `fixture`'s root, followed through the version hint,
+/// with the source it names.
+async fn at_root(fixture: &Fixture, config: TableConfig) -> Result<(TableConfig, TableSource)> {
     let config = TableConfig {
         source: fixture.root_source(),
         ..config
     };
     let source = TableSource::from_config(&config.source).await?;
-    serve_fresh(config, source, reads_rows).await
+    Ok((config, source))
+}
+
+/// `config` of `fixture` from its root, followed through the version hint,
+/// over a fresh hedge-free storage (`serve`).
+pub async fn serve_root(fixture: &Fixture, config: TableConfig) -> Result<Served> {
+    let (config, source) = at_root(fixture, config).await?;
+    serve(config, source, storage_config_for_tests()).await
+}
+
+/// `serve_root`, reading through a row cache (`serve_reading_rows`).
+pub async fn serve_root_reading_rows(fixture: &Fixture, config: TableConfig) -> Result<Served> {
+    let (config, source) = at_root(fixture, config).await?;
+    serve_reading_rows(config, source).await
 }
 
 /// `serve_over` a fresh `Storage::new(storage)` with no local directory.

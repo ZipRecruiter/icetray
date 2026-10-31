@@ -1388,7 +1388,7 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
             ordered_spec(FRESH_ORDERED_TABLE),
         ],
         async |setup| {
-            setup.options.reload = Some(Versions::new(setup.config.clone(), false).reload());
+            setup.options.reload = Some(Versions::new(setup.config.clone()).reload());
             Ok(())
         },
     )
@@ -1495,7 +1495,7 @@ async fn test_scrape_keeps_every_gauge_the_scrape_before_exposed() -> TestResult
         ],
         async |setup| {
             setup.with_local_dir()?;
-            setup.options.reload = Some(Versions::new(setup.config.clone(), false).reload());
+            setup.options.reload = Some(Versions::new(setup.config.clone()).reload());
             Ok(())
         },
     )
@@ -2757,9 +2757,19 @@ struct Versions {
 }
 
 impl Versions {
+    /// Version 0, `config`, each version read as it was set.
+    fn new(config: Config) -> Arc<Self> {
+        Self::starting(config, false)
+    }
+
+    /// Version 0, `config`, each version validated as it is read.
+    fn validated(config: Config) -> Arc<Self> {
+        Self::starting(config, true)
+    }
+
     /// Version 0, `config`, each version validated as it is read when
-    /// `validated`, else read as it was set.
-    fn new(config: Config, validated: bool) -> Arc<Self> {
+    /// `validated`.
+    fn starting(config: Config, validated: bool) -> Arc<Self> {
         Arc::new(Self {
             current: std::sync::Mutex::new((0, config)),
             reads: std::sync::atomic::AtomicU64::new(0),
@@ -2844,7 +2854,7 @@ async fn following() -> Result<(Stack, Arc<Versions>), BoxError> {
 /// A stack over `specs`, serving the first alone and following `Versions`
 /// from there, loaded.
 async fn following_over(specs: Vec<FixtureSpec>) -> Result<(Stack, Arc<Versions>), BoxError> {
-    following_with(specs, |config| Versions::new(config, false)).await
+    following_with(specs, Versions::new).await
 }
 
 /// `following_over` with every version validated as it is read, version
@@ -2858,7 +2868,7 @@ async fn following_validated(
     following_with(specs, |mut config| {
         config.server.poll_interval = ServerConfig::default().poll_interval;
         edit(&mut config);
-        Versions::new(config, true)
+        Versions::validated(config)
     })
     .await
 }
@@ -3197,12 +3207,17 @@ async fn test_a_reload_adding_an_ordered_table_to_a_row_server_without_disk_is_r
     Ok(())
 }
 
-/// A `row_cache_share` that leaves the page cache a tenth of the budget.
-const PAGES_A_TENTH: f64 = 0.9;
-/// The parts of a budget `PAGES_A_TENTH` gives pages one of.
+/// The parts of a budget `pages_a_tenth` gives pages one of.
 const TENTHS: u64 = 10;
+
+/// A `row_cache_share` that leaves the page cache one of `TENTHS` parts of
+/// the budget beside a table reading rows.
+fn pages_a_tenth() -> f64 {
+    1.0 - approx::ratio(1, TENTHS)
+}
+
 /// A `cache_bytes` whose page part beside a table reading rows, at
-/// `PAGES_A_TENTH`, is a page and a half: one shard's minimum, which
+/// `pages_a_tenth`, is a page and a half: one shard's minimum, which
 /// parsing checks, and not the two shards' a two-worker runtime has.
 const SPLIT_TOO_THIN_BYTES: u64 = TENTHS * (VALUE_PAGE_BYTES + VALUE_PAGE_BYTES / 2);
 
@@ -3216,7 +3231,7 @@ async fn test_a_reload_whose_split_a_start_would_refuse_is_refused() -> TestResu
     let specs = vec![FixtureSpec::small(TABLE, KeyType::Long)];
     let (mut stack, versions) = following_validated(specs, |config| {
         config.server.cache_bytes = Some(SPLIT_TOO_THIN_BYTES);
-        config.server.row_cache_share = Some(PAGES_A_TENTH);
+        config.server.row_cache_share = Some(pages_a_tenth());
         config.tables[0].row_cache = Some(false);
     })
     .await?;

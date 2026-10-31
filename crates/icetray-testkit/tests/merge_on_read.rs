@@ -162,7 +162,7 @@ async fn built_in(
         config,
         TableSource::from_config(&source).await?,
         &scratch.join(fixture.spec().name.as_str()),
-        verify::TEST_PAGE_CACHE_BYTES,
+        verify::TEST_CACHE_BYTES,
     )
     .await
 }
@@ -246,7 +246,8 @@ async fn test_a_deleted_row_is_not_served_from_the_row_cache_after_refresh() -> 
     let (_dir, catalog) = local_catalog().await?;
     let mut fixture = fixture(catalog.as_ref(), "kv_row_cache_delete").await?;
     fixture.write_hint().await?;
-    let served = verify::serve_root(&fixture, fixture.config(Residency::Full, false), true).await?;
+    let served =
+        verify::serve_root_reading_rows(&fixture, fixture.config(Residency::Full, false)).await?;
     let id = FIRST_FILE_IDS[0];
     verify::verify_hits(&served, &fixture, &[id]).await?;
     let cached = served.rows().usage();

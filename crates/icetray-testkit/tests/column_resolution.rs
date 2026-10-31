@@ -105,12 +105,7 @@ fn root_entry(fixture: &Fixture, columns: &[&str], residency: Residency) -> Tabl
 
 /// `fixture` served from its root in the Full tier serving `columns`.
 async fn serve_root(fixture: &Fixture, columns: &[&str]) -> Result<Served> {
-    verify::serve_root(
-        fixture,
-        fixture.config_serving(Residency::Full, columns),
-        false,
-    )
-    .await
+    verify::serve_root(fixture, fixture.config_serving(Residency::Full, columns)).await
 }
 
 /// The error the first load of `config` from `source` fails with; the
@@ -123,7 +118,7 @@ async fn load_error(config: TableConfig, source: TableSource) -> Result<Error> {
         config,
         source,
         None,
-        verify::TEST_PAGE_CACHE_BYTES,
+        verify::TEST_CACHE_BYTES,
     )
     .await?;
     let error = served
@@ -604,10 +599,9 @@ async fn test_a_default_and_presence_alone_use_no_entry() -> Result<()> {
     let (_dir, mut fixture) =
         two_bucket_fixture("kv_added_row_cache", FormatVersion::V2, false).await?;
     add_column_then_rows(&mut fixture, StatedDefault::None).await?;
-    let served = verify::serve_root(
+    let served = verify::serve_root_reading_rows(
         &fixture,
         fixture.config_serving(Residency::Full, &[VALUE_COLUMN, SECOND_VALUE_COLUMN]),
-        true,
     )
     .await?;
     let rows = served.rows();

@@ -470,14 +470,16 @@ mod tests {
     #[test]
     fn test_call_counts_a_request_whose_body_fails_as_cancelled() {
         let (mut service, handle) = counted(Answers(trailers_only));
-        let reading = |fails| Frames {
-            fails,
-            ..Frames::of([Frame::data(Bytes::from_static(b"keys"))])
+        let keys = || Frames::of([Frame::data(Bytes::from_static(b"keys"))]);
+        let failing = Frames {
+            fails: true,
+            ..keys()
         };
+        let whole = keys();
 
         drop(
             service
-                .call(request(Call::MultiGet, reading(true)))
+                .call(request(Call::MultiGet, failing))
                 .now_or_never()
                 .unwrap(),
         );
@@ -492,7 +494,7 @@ mod tests {
 
         drop(
             service
-                .call(request(Call::MultiGet, reading(false)))
+                .call(request(Call::MultiGet, whole))
                 .now_or_never()
                 .unwrap(),
         );

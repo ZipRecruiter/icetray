@@ -4688,7 +4688,7 @@ async fn serve_reference(
         handles,
         local,
         dir,
-    } = stack(&storage, tier, cache_bytes, reads_rows([&config]), reuse).await?;
+    } = stack(&storage, tier, cache_bytes, config.row_cache(), reuse).await?;
     let cache = handles.cache.clone();
     let table = table_of(config, handles).await?;
     Ok(Served {

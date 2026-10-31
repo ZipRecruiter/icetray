@@ -88,7 +88,7 @@ async fn load_refused(config: TableConfig, source: TableSource) -> Result<Refuse
         config,
         source,
         None,
-        verify::TEST_PAGE_CACHE_BYTES,
+        verify::TEST_CACHE_BYTES,
     )
     .await?;
     let error = served
@@ -949,7 +949,7 @@ async fn test_disk_tier_without_a_local_directory_is_a_config_violation() -> Res
         fixture.config(Residency::Disk, false),
         fixture.catalog_source(Arc::clone(&catalog)),
         None,
-        verify::TEST_PAGE_CACHE_BYTES,
+        verify::TEST_CACHE_BYTES,
     )
     .await?;
     let error = served
@@ -1086,7 +1086,7 @@ async fn test_lookups_its_residency_cannot_reach_is_a_config_violation() -> Resu
         },
         fixture.catalog_source(Arc::clone(&catalog)),
         None,
-        verify::TEST_PAGE_CACHE_BYTES,
+        verify::TEST_CACHE_BYTES,
     )
     .await?;
     let error = served
