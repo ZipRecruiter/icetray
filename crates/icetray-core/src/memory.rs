@@ -412,9 +412,13 @@ mod tests {
     /// and the three, the three again, and the four, with a third more.
     #[test]
     fn test_budget_shortfall_counts_the_largest_table_twice_and_a_third() {
+        let held = GIB + 3 * GIB + 3 * GIB + 4 * GIB;
+        let needed = held + held / PROCESS_SHARE_DENOMINATOR;
+        assert_eq!(budget_needed(&[GIB, 3 * GIB], 4 * GIB), needed);
+        let limit = 10 * GIB;
         assert_eq!(
-            budget_shortfall(&[GIB, 3 * GIB], 4 * GIB, 10 * GIB),
-            Some(44 * GIB / 3 - 10 * GIB)
+            budget_shortfall(&[GIB, 3 * GIB], 4 * GIB, limit),
+            Some(needed - limit)
         );
     }
 

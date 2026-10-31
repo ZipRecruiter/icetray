@@ -927,12 +927,17 @@ mod tests {
         assert!(usage > 0, "the value is cached at the default share");
     }
 
-    /// A whole budget whose page part, at the default row share, holds
-    /// about one value page in each shard of the page cache's memory level,
-    /// and so ten times that once no table reads through the row cache.
+    /// A row share that leaves pages a tenth of the budget beside a table
+    /// reading rows.
+    const PAGES_A_TENTH: f64 = 0.9;
+    /// The parts of a budget `PAGES_A_TENTH` gives pages one of.
+    const TENTHS: u64 = 10;
+
+    /// A whole budget whose page part, at `PAGES_A_TENTH`, holds about one
+    /// value page in each shard of the page cache's memory level, and so
+    /// `TENTHS` times that once no table reads through the row cache.
     fn tight_budget() -> u64 {
-        let pages_per_shard_without_rows = 10;
-        pages_per_shard_without_rows * cache::min_memory_bytes(cache::memory_shards())
+        TENTHS * cache::min_memory_bytes(cache::memory_shards())
     }
 
     /// `table` reading pages alone.
@@ -968,6 +973,7 @@ mod tests {
         let first = named(FIRST_TABLE, &fixture, Residency::Full);
         let mut config = config(vec![first.clone()]);
         config.server.cache_bytes = Some(tight_budget());
+        config.server.row_cache_share = Some(PAGES_A_TENTH);
         let opened = loaded(&config).await;
         let before = opened.budget();
         assert!(before.row_bytes > 0, "the key-value table reads rows");
@@ -1002,6 +1008,7 @@ mod tests {
         let first = named(FIRST_TABLE, &fixture, Residency::Full);
         let mut config = config(vec![pages_alone(first.clone())]);
         config.server.cache_bytes = Some(tight_budget());
+        config.server.row_cache_share = Some(PAGES_A_TENTH);
         let opened = loaded(&config).await;
         assert_eq!(opened.budget().row_bytes, 0);
         assert!(!row_cache_keeps_a_value(&opened));
@@ -1024,13 +1031,13 @@ mod tests {
         );
     }
 
-    /// A budget whose page part with a row-reading table, a tenth, holds
-    /// one shard's minimum and not two shards', which parsing admits and
-    /// a two-worker runtime refuses; whole, it holds two shards' minimum.
+    /// A budget whose page part beside a row-reading table at
+    /// `PAGES_A_TENTH`, one and a half shards' minimum, holds one shard's
+    /// minimum and not two shards', which parsing admits and a two-worker
+    /// runtime refuses; whole, it holds two shards' minimum.
     fn one_shard_s_tenth() -> u64 {
-        let tenths = 10;
-        let shards_and_a_half = 3;
-        tenths * shards_and_a_half * cache::min_memory_bytes(1) / 2
+        let one_and_a_half_shards = 3 * cache::min_memory_bytes(1) / 2;
+        TENTHS * one_and_a_half_shards
     }
 
     /// On a server whose tables read pages alone, tables that read rows
@@ -1044,6 +1051,7 @@ mod tests {
         let first = named(FIRST_TABLE, &fixture, Residency::Full);
         let mut config = config(vec![pages_alone(first.clone())]);
         config.server.cache_bytes = Some(one_shard_s_tenth());
+        config.server.row_cache_share = Some(PAGES_A_TENTH);
         let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();
@@ -1187,35 +1195,46 @@ mod tests {
         assert_eq!(one_table, local.index_bytes_in_use().unwrap());
     }
 
-    /// Each table served reports its generation's index bytes, which
-    /// `icetray_index_bytes` publishes, and none before it loads; a budget
-    /// nothing has read is entirely unfilled.
-    #[tokio::test]
-    async fn test_index_bytes_lists_each_table_served_and_the_budget_is_unfilled() {
-        let fixture = two_file_fixture().await;
-        let dir = tempfile::tempdir().unwrap();
-        let config = config_with_local(
-            dir.path(),
-            vec![
-                named(FIRST_TABLE, &fixture, Residency::Full),
-                named(FULL_TABLE, &fixture, Residency::Bloom),
-            ],
-        );
-        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
-            .await
-            .unwrap();
-        assert!(opened.index_bytes().is_empty(), "nothing loaded");
-        assert_eq!(opened.unfilled_cache_bytes(), opened.budget().whole());
-        for table in opened.tables().iter() {
-            table.load().await.unwrap();
+    /// Each table served reports its generation's index bytes, what
+    /// `icetray_index_bytes` publishes for it, and none before it loads; a
+    /// budget nothing has read is entirely unfilled.
+    #[test]
+    fn test_index_bytes_lists_each_table_served_and_the_budget_is_unfilled() {
+        let names = [FIRST_TABLE, FULL_TABLE];
+        let (index_bytes, series) = recorded(async {
+            let fixture = two_file_fixture().await;
+            let dir = tempfile::tempdir().unwrap();
+            let config = config_with_local(
+                dir.path(),
+                vec![
+                    named(names[0], &fixture, Residency::Full),
+                    named(names[1], &fixture, Residency::Bloom),
+                ],
+            );
+            let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
+                .await
+                .unwrap();
+            assert!(opened.index_bytes().is_empty(), "nothing loaded");
+            assert_eq!(opened.unfilled_cache_bytes(), opened.budget().whole());
+            for table in opened.tables().iter() {
+                table.load().await.unwrap();
+                table.publish_gauges();
+            }
+            opened.index_bytes()
+        });
+        assert_eq!(index_bytes.len(), names.len());
+        for (name, bytes) in names.into_iter().zip(index_bytes) {
+            assert!(bytes > 0, "{name}");
+            let published = series.gauge(
+                metric::INDEX_BYTES,
+                &[(metric::LABEL_TABLE, name.to_string())],
+            );
+            assert_eq!(
+                published.to_bits(),
+                approx::gauge(bytes).to_bits(),
+                "{name}"
+            );
         }
-        let expected: Vec<u64> = opened
-            .tables()
-            .iter()
-            .map(|table| crate::approx::count(table.current().unwrap().index_bytes))
-            .collect();
-        assert_eq!(opened.index_bytes(), expected);
-        assert!(expected.iter().all(|&bytes| bytes > 0));
     }
 
     #[tokio::test]

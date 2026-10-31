@@ -5686,11 +5686,7 @@ mod tests {
         fixture: &Fixture,
         config: TableConfig,
     ) -> (Table, RowCache, PageCache) {
-        let rows = RowCache::new(testing::CACHE_BYTES);
-        let handles = TableHandles {
-            row_cache: Some(rows.clone()),
-            ..handles_over(fixture).await
-        };
+        let (handles, rows) = handles_reading_rows(fixture).await;
         let pages = handles.cache.clone();
         let defaults = ServerConfig::default();
         let table = table_sharing(
@@ -5702,6 +5698,17 @@ mod tests {
         );
         table.load().await.unwrap();
         (table, rows, pages)
+    }
+
+    /// `handles_over` with a row cache of its own, which comes back beside
+    /// them.
+    async fn handles_reading_rows(fixture: &Fixture) -> (TableHandles, RowCache) {
+        let rows = RowCache::new(testing::CACHE_BYTES);
+        let handles = TableHandles {
+            row_cache: Some(rows.clone()),
+            ..handles_over(fixture).await
+        };
+        (handles, rows)
     }
 
     /// The one value a lookup naming one column answers.
@@ -5721,26 +5728,38 @@ mod tests {
         )
     }
 
+    /// Two Gets of one key from a loaded table of a one-file fixture whose
+    /// entry sets `row_cache` as given, reading through a row cache of its
+    /// own, with the page cache emptied between them: the GETs the second
+    /// issues and what the row cache holds after both, and the series.
+    fn get_twice_around_a_cleared_page_cache(row_cache: Option<bool>) -> ((u64, u64), Series) {
+        recorded(async move {
+            let fixture = one_file_fixture(WriterLayout::contract()).await;
+            let config = TableConfig {
+                row_cache,
+                ..lenient(&fixture)
+            };
+            let (table, rows, pages) = table_reading_rows(&fixture, config).await;
+            let first = keys_from(0, FILE_KEYS)[0];
+            let read = [ColumnRead::whole(VALUE_COLUMN)];
+            let key = Key::Long(first);
+            assert_eq!(table.get(&key, &read).await.unwrap().row, present(first));
+            pages.clear();
+            let before = fixture.gets();
+            assert_eq!(table.get(&key, &read).await.unwrap().row, present(first));
+            table.publish_lookup_counts();
+            (fixture.gets() - before, rows.usage())
+        })
+    }
+
     /// A repeated Get is served from the row cache: with the page cache
     /// emptied between the two, the second reads no value page and is a
     /// warm hit (RFD 026).
     #[test]
     fn test_a_row_cache_hit_reads_no_value_page() {
-        let (gets, series) = recorded(async {
-            let fixture = one_file_fixture(WriterLayout::contract()).await;
-            let (table, rows, pages) = table_reading_rows(&fixture, lenient(&fixture)).await;
-            let first = keys_from(0, FILE_KEYS)[0];
-            let read = [ColumnRead::whole(VALUE_COLUMN)];
-            let key = Key::Long(first);
-            assert_eq!(table.get(&key, &read).await.unwrap().row, present(first));
-            assert!(rows.usage() > 0, "the value was cached");
-            pages.clear();
-            let before = fixture.gets();
-            assert_eq!(table.get(&key, &read).await.unwrap().row, present(first));
-            table.publish_lookup_counts();
-            fixture.gets() - before
-        });
+        let ((gets, usage), series) = get_twice_around_a_cleared_page_cache(None);
         assert_eq!(gets, 0, "no value page is read");
+        assert!(usage > 0, "the value was cached");
         assert_eq!(lookups_counted(&series, LookupResult::ColdHit), 1);
         assert_eq!(lookups_counted(&series, LookupResult::WarmHit), 1);
     }
@@ -5789,11 +5808,7 @@ mod tests {
     async fn test_tables_listing_columns_in_another_order_read_their_own_columns() {
         const VALUE_ALONE_TABLE: &str = "value_alone";
         let (fixture, all, _gauged) = two_column_fixture(FILE_KEYS, WriterLayout::contract()).await;
-        let rows = RowCache::new(testing::CACHE_BYTES);
-        let handles = TableHandles {
-            row_cache: Some(rows.clone()),
-            ..handles_over(&fixture).await
-        };
+        let (handles, rows) = handles_reading_rows(&fixture).await;
         let listed = lenient(&fixture);
         let reversed = TableConfig {
             name: STRICT_TABLE.to_string(),
@@ -5896,23 +5911,7 @@ mod tests {
     /// value page again and is a cold hit, and the row cache holds nothing.
     #[test]
     fn test_row_cache_false_reads_pages_alone() {
-        let ((gets, usage), series) = recorded(async {
-            let fixture = one_file_fixture(WriterLayout::contract()).await;
-            let config = TableConfig {
-                row_cache: Some(false),
-                ..lenient(&fixture)
-            };
-            let (table, rows, pages) = table_reading_rows(&fixture, config).await;
-            let first = keys_from(0, FILE_KEYS)[0];
-            let read = [ColumnRead::whole(VALUE_COLUMN)];
-            let key = Key::Long(first);
-            assert_eq!(table.get(&key, &read).await.unwrap().row, present(first));
-            pages.clear();
-            let before = fixture.gets();
-            assert_eq!(table.get(&key, &read).await.unwrap().row, present(first));
-            table.publish_lookup_counts();
-            (fixture.gets() - before, rows.usage())
-        });
+        let ((gets, usage), series) = get_twice_around_a_cleared_page_cache(Some(false));
         assert_eq!(gets, 1, "the value page is read again");
         assert_eq!(usage, 0);
         assert_eq!(lookups_counted(&series, LookupResult::ColdHit), 2);

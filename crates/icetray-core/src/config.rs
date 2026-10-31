@@ -3800,9 +3800,7 @@ locaton = "typo"
     fn test_parse_lookups_defaults_to_the_best_level_of_its_residency() {
         let with =
             |residency: &str| format!("{}\nresidency = \"{residency}\"\n", TOML_MINIMAL.trim_end());
-        let local = format!(
-            "\n[storage.local]\ndir = \"/var/lib/icetray\"\npage_cache_disk_bytes = {PAGE_CACHE_DISK_BLOCK_BYTES}\n"
-        );
+        let local = format!("\n{}", local_with_disk_level(PAGE_CACHE_DISK_BLOCK_BYTES));
         for residency in Residency::ALL {
             let text = format!("{}{local}", with(residency.name()));
             let config = Config::parse(&text).unwrap();
@@ -4226,8 +4224,9 @@ locaton = "typo"
         );
         // Disk has its local directory, so the budget is the only fault.
         let disk = format!(
-            "{}\nresidency = \"disk\"\nresident_budget_bytes = 1\n\n[storage.local]\ndir = \"/var/lib/icetray\"\npage_cache_disk_bytes = {PAGE_CACHE_DISK_BLOCK_BYTES}\n",
-            TOML_MINIMAL.trim_end()
+            "{}\nresidency = \"disk\"\nresident_budget_bytes = 1\n\n{}",
+            TOML_MINIMAL.trim_end(),
+            local_with_disk_level(PAGE_CACHE_DISK_BLOCK_BYTES)
         );
         assert_eq!(
             violation(&disk),
@@ -4281,8 +4280,9 @@ locaton = "typo"
     fn test_parse_refuses_page_cache_disk_below_one_block() {
         let with_disk_level = |bytes: u64| {
             format!(
-                "{}\n\n[storage.local]\ndir = \"/var/lib/icetray\"\npage_cache_disk_bytes = {bytes}\n",
-                TOML_MINIMAL.trim_end()
+                "{}\n\n{}",
+                TOML_MINIMAL.trim_end(),
+                local_with_disk_level(bytes)
             )
         };
         let just_below = PAGE_CACHE_DISK_BLOCK_BYTES - 1;

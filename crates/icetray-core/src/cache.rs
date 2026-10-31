@@ -1441,9 +1441,10 @@ mod tests {
     /// with one shard per worker, the first few dozen suffice.
     const SHARD_SEARCH_OFFSETS: u64 = 1024;
     /// Pages of `PAGE`'s weight one memory shard holds in the hit-again
-    /// test: enough that the shard's small queue, a tenth of it, holds
-    /// more than one, so a page read once leaves from there and not from
-    /// the main queue.
+    /// test: enough that the shard's small queue, a tenth of it
+    /// (`eviction()`'s `small_queue_capacity_ratio`, foyer's S3-FIFO
+    /// default), holds more than one, so a page read once leaves from there
+    /// and not from the main queue.
     const SHARD_PAGES: usize = 20;
     /// Bytes cut from the end of an encoded key so that its file id ends
     /// one byte short of its length prefix.
@@ -2388,6 +2389,10 @@ mod tests {
     #[tokio::test]
     async fn test_page_hit_again_outlives_pages_read_once() {
         let first = PageKey(Arc::from(FILE_ID), FIRST_OFFSET);
+        assert!(
+            eviction().small_queue_capacity_ratio > approx::ratio(1, count(SHARD_PAGES)),
+            "the small queue holds more than one page"
+        );
         let weight = weigh(&first, &PageValue(Bytes::from_static(PAGE)));
         let cache = PageCache::new(count(memory_shards() * SHARD_PAGES * weight), None)
             .await

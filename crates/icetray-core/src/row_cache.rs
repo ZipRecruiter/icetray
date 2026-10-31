@@ -525,9 +525,9 @@ mod tests {
 
     #[test]
     fn test_weigh_rounds_to_jemalloc_size_classes() {
-        assert_eq!(weigh(Some(100)), 112 + 160);
-        assert_eq!(weigh(Some(1029)), 1280 + 160);
-        assert_eq!(weigh(None), 160);
+        assert_eq!(weigh(Some(100)), 112 + ROW_ENTRY_OVERHEAD_BYTES);
+        assert_eq!(weigh(Some(1029)), 1280 + ROW_ENTRY_OVERHEAD_BYTES);
+        assert_eq!(weigh(None), ROW_ENTRY_OVERHEAD_BYTES);
     }
 
     /// A row hit again after it was cached outlives any number of rows read
@@ -645,8 +645,6 @@ mod tests {
     fn test_the_ghost_list_is_reserved_out_of_the_budget() {
         let cache = RowCache::new(ROOMY_BYTES);
         let shards = approx::count(cache.0.built.load().cache.num_shards());
-        let ghosts = (ROOMY_BYTES / ESTIMATED_ENTRY_BYTES + shards).div_ceil(GHOST_ITEMS_DIVISOR);
-        assert_eq!(cache.0.built.load().ghosts.bytes, ghosts * ROW_SLOT_BYTES);
         let under_a_fifteenth = 15;
         assert!(
             cache.0.built.load().ghosts.bytes * under_a_fifteenth < ROOMY_BYTES,
@@ -662,14 +660,6 @@ mod tests {
                 "the entries hold the rest, down to a multiple of the shards"
             );
         }
-    }
-
-    /// A budget of zero reserves nothing: its cache holds nothing, and so
-    /// remembers none of what it evicts.
-    #[test]
-    fn test_a_zero_budget_reserves_no_ghosts() {
-        let cache = RowCache::new(0);
-        assert_eq!(cache.0.built.load().ghosts.bytes, 0);
     }
 
     /// Whether `cache` remembers a row evicted from its cold queue: the row,

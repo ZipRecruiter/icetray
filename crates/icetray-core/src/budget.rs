@@ -128,11 +128,20 @@ mod tests {
 
     /// The shards the tests' caches split into, as on a 16-worker host.
     const SHARDS: usize = 16;
-    /// The limit the tests derive from: 8 GiB, half of it the budget.
+    /// The limit the tests derive from.
     const LIMIT_BYTES: u64 = 8 * GIB;
-    /// Nine tenths of 4 GiB, rounded down: the row cache's default part of
-    /// half the limit.
-    const ROWS_OF_HALF_THE_LIMIT: u64 = 3_865_470_566;
+    /// Nine tenths of 4 GiB, rounded down.
+    const NINE_TENTHS_OF_FOUR_GIB: u64 = 3_865_470_566;
+
+    /// The whole budget derived from `LIMIT_BYTES` by default.
+    fn default_whole() -> u64 {
+        share_of(LIMIT_BYTES, DEFAULT_CACHE_SHARE_OF_LIMIT)
+    }
+
+    /// The row cache's part of `whole` at the default row share.
+    fn default_rows_of(whole: u64) -> u64 {
+        share_of(whole, DEFAULT_ROW_CACHE_SHARE)
+    }
 
     fn limit(of: LimitSource) -> MemoryLimit {
         MemoryLimit {
@@ -145,11 +154,12 @@ mod tests {
     fn test_budget_defaults_to_half_the_cgroup_limit() {
         let cgroup = limit(LimitSource::Cgroup);
         let budget = resolve(&ServerConfig::default(), Some(cgroup), true, SHARDS).unwrap();
+        let rows = default_rows_of(default_whole());
         assert_eq!(
             budget,
             Budget {
-                row_bytes: ROWS_OF_HALF_THE_LIMIT,
-                page_bytes: 4 * GIB - ROWS_OF_HALF_THE_LIMIT,
+                row_bytes: rows,
+                page_bytes: default_whole() - rows,
                 derived_from: Some(cgroup),
             }
         );
@@ -159,19 +169,16 @@ mod tests {
     fn test_budget_on_a_host_without_a_cgroup_limit_is_half_the_host() {
         let host = limit(LimitSource::Host);
         let budget = resolve(&ServerConfig::default(), Some(host), true, SHARDS).unwrap();
-        assert_eq!(budget.row_bytes + budget.page_bytes, 4 * GIB);
-        assert_eq!(budget.row_bytes, ROWS_OF_HALF_THE_LIMIT);
+        assert_eq!(budget.whole(), default_whole());
+        assert_eq!(budget.row_bytes, default_rows_of(default_whole()));
         assert_eq!(budget.derived_from, Some(host));
     }
 
     #[test]
     fn test_budget_without_a_limit_is_the_fallback() {
         let budget = resolve(&ServerConfig::default(), None, true, SHARDS).unwrap();
-        assert_eq!(budget.row_bytes + budget.page_bytes, FALLBACK_CACHE_BYTES);
-        assert_eq!(
-            budget.row_bytes,
-            share_of(FALLBACK_CACHE_BYTES, DEFAULT_ROW_CACHE_SHARE)
-        );
+        assert_eq!(budget.whole(), FALLBACK_CACHE_BYTES);
+        assert_eq!(budget.row_bytes, default_rows_of(FALLBACK_CACHE_BYTES));
         assert_eq!(budget.derived_from, None);
     }
 
@@ -202,7 +209,7 @@ mod tests {
             budget,
             Budget {
                 row_bytes: 0,
-                page_bytes: 4 * GIB,
+                page_bytes: default_whole(),
                 derived_from: Some(cgroup),
             }
         );
@@ -215,7 +222,8 @@ mod tests {
             of: LimitSource::Cgroup,
         };
         let refused = resolve(&ServerConfig::default(), Some(small), true, SHARDS).unwrap_err();
-        let page_bytes = 2 * MIB - share_of(2 * MIB, DEFAULT_ROW_CACHE_SHARE);
+        let whole = share_of(small.bytes, DEFAULT_CACHE_SHARE_OF_LIMIT);
+        let page_bytes = whole - default_rows_of(whole);
         assert_eq!(
             refused,
             ConfigViolation::PageCacheTooSmall {
@@ -233,9 +241,7 @@ mod tests {
         assert_eq!(share_of(GIB, 0.0), 0);
         assert_eq!(share_of(GIB, 1.0), GIB);
         assert_eq!(share_of(u64::MAX, 1.0), u64::MAX);
-        assert_eq!(
-            share_of(4 * GIB, DEFAULT_ROW_CACHE_SHARE),
-            ROWS_OF_HALF_THE_LIMIT
-        );
+        let nine_tenths = 0.9;
+        assert_eq!(share_of(4 * GIB, nine_tenths), NINE_TENTHS_OF_FOUR_GIB);
     }
 }
