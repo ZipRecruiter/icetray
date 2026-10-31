@@ -163,7 +163,7 @@ Gauges, written at each scrape:
 | `icetray_generation_swapped_at_seconds` | `table` | When the serving generation was swapped in, in Unix seconds. |
 | `icetray_findings` | `table`, `code`, and `column` for a code about one value column | The number of findings of each code that icetray raised on the serving generation, 0 for a code not raised. A code about one value column has one series per configured column. |
 | `icetray_index_bytes` | `table` | The resident index's live bytes. |
-| `icetray_page_cache_bytes` | `cache` | Bytes a page cache's memory level holds after evictions: the lookup cache against `server.page_cache_bytes`, the scan cache against `server.scan_page_cache_bytes`. |
+| `icetray_page_cache_bytes` | `cache` | Bytes a page cache's memory level holds after evictions: the lookup cache against its part of `server.cache_bytes`, the scan cache against `server.scan_page_cache_bytes`. |
 | `icetray_row_cache_bytes` | | Bytes the row cache holds after evictions: each entry's value at its allocation size plus the per-entry overhead. |
 | `icetray_config_pending` | | 1 while the configuration file differs from the configuration applied, else 0. |
 | `icetray_process_rss_bytes` | | The process's resident set size. |
@@ -289,6 +289,12 @@ Events worth knowing:
 - `open-file limit`, at start, with the `limit` in force, and a warning
   with `limit` and `needed` when that limit is too low
   ([File descriptors](#file-descriptors)).
+- `cache budget`, at start, with `cache_bytes`, the whole budget, split
+  into `row_bytes` for the row cache and `page_bytes` for the page
+  cache's memory level, and the memory `limit` with its `limit_source`
+  (`cgroup` or `host`), both absent when no limit can be read. The
+  budget is derived from the limit unless `server.cache_bytes` sets it
+  ([Configuration](configuration.md#server)).
 - `listening`, with both addresses and the table count; then
   `table serving` for each table as its first load completes.
 - `swapped in a generation`, with the snapshot id and the files reused,
@@ -660,9 +666,9 @@ through settings, mounted files, and environment variables.
   over the tables the replica serves, of the doctor's `predicted` bytes
   for each table's residency (`predicted.full`, `predicted.disk_memory`,
   or `predicted.bloom`), doubled for a table a refresh can rewrite
-  wholesale or a reload can change; plus `server.page_cache_bytes`, and
-  `server.scan_page_cache_bytes` on a replica that serves an ordered
-  table; plus a
+  wholesale or a reload can change; plus `server.cache_bytes`, half the
+  limit when unset, and `server.scan_page_cache_bytes` on a replica that
+  serves an ordered table; plus a
   third of that total for the process, requests in flight, a load's
   transient chunks, and the allocator's fragmentation and bookkeeping. The
   `icetray_allocator_*` gauges show how much of the resident set the

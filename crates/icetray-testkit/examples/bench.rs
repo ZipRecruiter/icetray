@@ -86,8 +86,8 @@ use icetray_core::config::{
 use icetray_core::contract::{TARGET_FILE_BYTES_MAX, VALUE_PAGE_BYTES};
 use icetray_core::{
     CallsInFlight, DEFAULT_MAX_SCAN_ROWS, Direction, FILE_PREFIX, FindingLog, Generation, Key,
-    KeyType, Level, LocalDir, OrderValue, PageCache, ResidentParts, Row, ScanBounds, Scanned,
-    Storage, Table, TableHandles, TableSource,
+    KeyType, Level, LocalDir, OrderValue, PageCache, ResidentParts, Row, RowCache, ScanBounds,
+    Scanned, Storage, Table, TableHandles, TableSource,
 };
 use icetray_core::{approx, catalog, time};
 use icetray_testkit::fixture::{NAMESPACE, SECOND_VALUE_COLUMN, memory_catalog_local};
@@ -1831,6 +1831,7 @@ async fn stack(
     let handles = TableHandles {
         storage: Arc::clone(storage),
         cache: PageCache::new(cache_bytes, None).await?,
+        row_cache: Some(RowCache::new(approx::count(cache_bytes))),
         local: local.clone(),
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,
@@ -4508,10 +4509,11 @@ fn validate_reference(
         }
     }
     let config = Config {
-        server: ServerConfig {
-            batch_fan_out: serving.batch_fan_out,
-            max_multi_scan_values: serving.max_multi_scan_values,
-            ..ServerConfig::default()
+        server: {
+            let mut server = ServerConfig::default();
+            server.batch_fan_out = serving.batch_fan_out;
+            server.max_multi_scan_values = serving.max_multi_scan_values;
+            server
         },
         storage: serving.storage,
         tables: tables

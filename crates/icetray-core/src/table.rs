@@ -41,6 +41,7 @@ use crate::manifest::{CheckedReads, ColumnRead, Selection, TableLayout, check_co
 use crate::metric::{self, LookupResult, ScanResult, Temperature};
 use crate::order::{OrderValue, ScanBounds};
 use crate::projection;
+use crate::row_cache::RowCache;
 use crate::scan::{self, MultiScanLookup, Oversize, ScanLookup, ScanRequestFault, Scanned};
 use crate::shard::{self, Line, Sharded};
 use crate::snapshot::{SequenceNumber, SnapshotId};
@@ -167,8 +168,9 @@ impl fmt::Display for StateName {
 }
 
 /// What a table is built over beside its configuration and source: the
-/// storage its reads go through, the page cache, the local directory (RFD
-/// 017) when one is configured, the count of `get` and `multi_get` calls
+/// storage its reads go through, the page cache, the row cache when its
+/// lookups read through one, the local directory (RFD 017) when one is
+/// configured, the count of `get` and `multi_get` calls
 /// in flight, and the bound of GETs one `multi_get` holds in flight.
 /// `open_with` builds one and hands every table it opens a clone, so a
 /// process's tables share one of each. Clones share what they hold.
@@ -178,6 +180,9 @@ pub struct TableHandles {
     pub storage: Arc<Storage>,
     /// The page cache the table's lookups read pages through.
     pub cache: PageCache,
+    /// The row cache a key-value table's lookups read values through (RFD
+    /// 026); `None` reads every value from its page.
+    pub row_cache: Option<RowCache>,
     /// The local directory, when `storage.local` is set.
     pub local: Option<Arc<LocalDir>>,
     /// The calls in flight on every table holding this count, which a
@@ -1223,6 +1228,7 @@ impl Table {
         let TableHandles {
             storage,
             cache,
+            row_cache: _,
             local,
             calls,
             findings,
@@ -2937,6 +2943,7 @@ mod tests {
         TableHandles {
             storage: Arc::clone(&fixture.storage),
             cache: cache().await,
+            row_cache: Some(RowCache::new(approx::count(testing::CACHE_BYTES))),
             local: None,
             calls: CallsInFlight::new(),
             findings: FindingLog::Events,

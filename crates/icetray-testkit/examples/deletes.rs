@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use iceberg::spec::DataFile;
 use icetray_core::ColumnRead;
-use icetray_core::config::{Residency, ServerConfig, SourceConfig, TableConfig, ValueFormat};
+use icetray_core::config::{
+    FALLBACK_CACHE_BYTES, Residency, SourceConfig, TableConfig, ValueFormat,
+};
 use icetray_core::{
     Generation, Key, KeyType, PER_MILLE, Row, TableSource, TableSummary, approx, diagnose, time,
 };
@@ -456,7 +458,7 @@ async fn build(
         config,
         TableSource::from_config(source).await?,
         local,
-        ServerConfig::default().page_cache_bytes,
+        approx::length(FALLBACK_CACHE_BYTES),
     )
     .await?)
 }

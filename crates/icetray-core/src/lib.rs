@@ -8,6 +8,7 @@ pub mod approx;
 mod aws_catalog;
 mod blocking;
 mod bucket;
+pub mod budget;
 mod cache;
 pub mod catalog;
 pub mod check;

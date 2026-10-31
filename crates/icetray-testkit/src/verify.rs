@@ -109,6 +109,7 @@ pub async fn build(
     let handles = TableHandles {
         storage: Arc::clone(&storage),
         cache: cache.clone(),
+        row_cache: None,
         local,
         calls: CallsInFlight::new(),
         findings: FindingLog::Events,

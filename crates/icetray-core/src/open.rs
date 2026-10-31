@@ -1,8 +1,9 @@
-//! Opening every configured table (RFD 012): one storage, one page cache,
-//! the optional local directory, one count of calls in flight, and every
-//! table in `Loading` over them, built the same way for the daemon and the
-//! one-shot subcommands, so a subcommand reads a table exactly as `serve`
-//! does. Loading is the caller's step. A running daemon replaces its set of
+//! Opening every configured table (RFD 012): one storage, one row cache
+//! and one page cache within one budget (RFD 028), the optional local
+//! directory, one count of calls in flight, and every table in `Loading`
+//! over them, built the same way for the daemon and the one-shot
+//! subcommands, so a subcommand reads a table exactly as `serve` does.
+//! Loading is the caller's step. A running daemon replaces its set of
 //! tables through `Opened::apply` (RFD 018).
 
 use std::collections::{HashMap, HashSet};
@@ -14,22 +15,32 @@ use std::time::Duration;
 use arc_swap::{ArcSwap, Guard};
 use futures::future::join_all;
 
+use crate::approx;
+use crate::budget::{self, Budget};
 use crate::cache::{self, PageCache};
 use crate::catalog::TableSource;
 use crate::config::{Config, ConfigError, TableConfig};
 use crate::error::{Error, Result};
 use crate::local::{ChunkRules, DataFileIdentity, LocalDir};
+use crate::memory;
+use crate::metric::CacheName;
+use crate::row_cache::RowCache;
 use crate::storage::Storage;
 use crate::table::{self, CallsInFlight, FindingLog, Table, TableHandles};
 
 /// Everything a process opened: the storage every read goes through, the
-/// one page cache every table shares, the local directory when configured,
-/// and the tables in configuration order.
+/// one row cache and one page cache every table shares, the local
+/// directory when configured, and the tables in configuration order.
 pub struct Opened {
     /// The storage every table reads through.
     pub storage: Arc<Storage>,
     /// The page cache every table shares.
     pub cache: PageCache,
+    /// The row cache every key-value table shares (RFD 026).
+    pub row_cache: RowCache,
+    /// What the row cache and the page cache's memory level were opened
+    /// with (RFD 028).
+    pub budget: Budget,
     /// The scan cache every ordered table shares (RFD 025), memory alone;
     /// no key-value table reads it.
     pub scan_cache: PageCache,
@@ -421,11 +432,11 @@ pub async fn open(config: &Config, only: Option<&str>, findings: FindingLog) -> 
 /// a test constructs one with `Storage::new` and never touches the SDK
 /// chain, and registers its own stores on it. The binary's subcommands
 /// use `open`; the daemon's in-process tests start it over this. Before
-/// anything is opened, `page_cache_bytes` is checked against the minimum
-/// of the shards the cache has on the calling runtime, which parsing could
-/// not know: less is `Error::Config` with
-/// `ConfigViolation::PageCacheTooSmall` (`cache::check_capacity`), for
-/// `scan_page_cache_bytes` as for `page_cache_bytes`.
+/// anything is opened, the cache budget is resolved under the process's
+/// memory limit (`budget::resolve`) and logged, and its page part and
+/// `scan_page_cache_bytes` are checked against the minimum of the shards
+/// a cache has on the calling runtime, which parsing could not know: less
+/// is `Error::Config` with `ConfigViolation::PageCacheTooSmall`.
 /// The scan cache is memory alone, whether or not the lookup cache has a
 /// disk level (RFD 025).
 pub async fn open_with(
@@ -434,25 +445,43 @@ pub async fn open_with(
     storage: Arc<Storage>,
     findings: FindingLog,
 ) -> Result<Opened> {
-    for (cache, bytes) in config.server.cache_budgets() {
-        cache::check_capacity(cache, bytes)
-            .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
-    }
+    let limit = memory::limit();
+    let shards = cache::memory_shards();
+    let invalid = |violation| Error::Config(ConfigError::Invalid(violation));
+    let budget =
+        budget::resolve(&config.server, limit, config.reads_rows(), shards).map_err(invalid)?;
+    cache::check_capacity(
+        CacheName::Scan,
+        config.server.scan_page_cache_bytes,
+        shards,
+        None,
+    )
+    .map_err(invalid)?;
+    tracing::info!(
+        cache_bytes = budget.row_bytes + budget.page_bytes,
+        row_bytes = budget.row_bytes,
+        page_bytes = budget.page_bytes,
+        limit = limit.map(|limit| limit.bytes),
+        limit_source = limit.map(|limit| tracing::field::display(limit.of)),
+        "cache budget"
+    );
     let local = match &config.storage.local {
         Some(local) => Some(Arc::new(LocalDir::open(local, storage.stats())?)),
         None => None,
     };
     let cache = PageCache::new(
-        config.server.page_cache_bytes,
+        approx::length(budget.page_bytes),
         local.as_ref().and_then(|local| local.page_cache_level()),
     )
     .await?;
+    let row_cache = RowCache::new(budget.row_bytes);
     let scan_cache = PageCache::for_scans(
         usize::try_from(config.server.scan_page_cache_bytes).unwrap_or(usize::MAX),
     );
     let handles = TableHandles {
         storage: Arc::clone(&storage),
         cache: cache.clone(),
+        row_cache: Some(row_cache.clone()),
         local: local.clone(),
         calls: CallsInFlight::new(),
         findings,
@@ -481,6 +510,8 @@ pub async fn open_with(
     Ok(Opened {
         storage,
         cache,
+        row_cache,
+        budget,
         scan_cache,
         local,
         tables: ArcSwap::from_pointee(Tables::new(tables)),
@@ -521,7 +552,6 @@ mod tests {
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
 
     use super::*;
-    use crate::approx;
     use crate::check::FindingCode;
     use crate::config::{
         ConfigError, ConfigViolation, LocalConfig, Residency, ServerConfig, SourceConfig,
@@ -626,8 +656,8 @@ mod tests {
 
     /// A budget `Config::parse` admits, one shard's minimum, is refused
     /// on a runtime of two workers, whose cache has two shards, before any
-    /// table is opened; the scan cache's budget is held to it as the lookup
-    /// cache's is (RFD 025).
+    /// table is opened; the scan cache's budget is held to it as the page
+    /// cache's part of `cache_bytes` is (RFD 025).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_open_with_refuses_a_page_cache_below_the_runtime_shards_minimum() {
         let workers = 2;
@@ -635,12 +665,13 @@ mod tests {
         let one_shard = cache::min_memory_bytes(1);
         let two_shards = cache::min_memory_bytes(workers);
         let mut config = config(vec![named(FIRST_TABLE, &fixture, Residency::Full)]);
+        config.server.row_cache_share = Some(0.0);
         for refused in [CacheName::Lookup, CacheName::Scan] {
             let (lookup, scan) = match refused {
                 CacheName::Lookup => (one_shard, two_shards),
                 CacheName::Scan => (two_shards, one_shard),
             };
-            config.server.page_cache_bytes = approx::length(lookup);
+            config.server.cache_bytes = Some(lookup);
             config.server.scan_page_cache_bytes = scan;
             let error = open_with(&config, None, storage_for(&config), FindingLog::Events)
                 .await
@@ -654,6 +685,7 @@ mod tests {
                         bytes,
                         minimum,
                         shards,
+                        limit: None,
                     })) if cache == refused
                         && bytes == one_shard
                         && minimum == two_shards
@@ -662,12 +694,31 @@ mod tests {
                 "{error}"
             );
         }
-        config.server.page_cache_bytes = approx::length(two_shards);
+        config.server.cache_bytes = Some(two_shards);
         config.server.scan_page_cache_bytes = two_shards;
         let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
             .await
             .unwrap();
         assert_eq!(names(&opened), [FIRST_TABLE]);
+    }
+
+    /// The budget follows the tables: a key-value table gives the row
+    /// cache its share, and the row cache opened is the one every table's
+    /// handles hold.
+    #[tokio::test]
+    async fn test_open_with_splits_the_budget_for_a_key_value_table() {
+        let fixture = two_file_fixture().await;
+        let mut config = config(vec![named(FIRST_TABLE, &fixture, Residency::Full)]);
+        config.server.cache_bytes = Some(crate::config::FALLBACK_CACHE_BYTES);
+        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
+            .await
+            .unwrap();
+        assert_eq!(
+            opened.budget,
+            budget::resolve(&config.server, None, true, cache::memory_shards()).unwrap()
+        );
+        assert!(opened.budget.row_bytes > opened.budget.page_bytes);
+        assert!(opened.handles.row_cache.is_some());
     }
 
     /// A call in flight on one table is counted where every other table

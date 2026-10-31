@@ -2622,9 +2622,10 @@ async fn test_serve_exits_1_when_its_listener_is_taken() -> TestResult {
 /// The variable tokio's multi-thread runtime reads its worker count from.
 const TOKIO_WORKER_THREADS: &str = "TOKIO_WORKER_THREADS";
 
-/// A page cache budget the file admits, which holds a value page for one
-/// shard of the cache but not for the two a two-worker runtime gives it, is
-/// refused as the daemon opens the cache, and the failure reaches exit 1.
+/// A cache budget the file admits, given whole to the page cache, which
+/// holds a value page for one shard of the cache but not for the two a
+/// two-worker runtime gives it, is refused as the daemon opens the cache,
+/// and the failure reaches exit 1.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_serve_exits_1_when_the_page_cache_is_below_its_shards_minimum() -> TestResult {
     let workers = 2;
@@ -2632,7 +2633,8 @@ async fn test_serve_exits_1_when_the_page_cache_is_below_its_shards_minimum() ->
     let fixture = local_fixture(dir.path(), FixtureSpec::small("kv_cache", KeyType::Long)).await?;
     let mut config: Json = serde_json::from_str(&json_config(TABLE_A, &fixture))?;
     let one_shard_not_two = VALUE_PAGE_BYTES * workers;
-    config["server"]["page_cache_bytes"] = Json::from(one_shard_not_two);
+    config["server"]["cache_bytes"] = Json::from(one_shard_not_two);
+    config["server"]["row_cache_share"] = Json::from(0.0);
     let path = write_file(dir.path(), "serve.json", &config.to_string())?;
     // Spawned and waited on within a bound rather than run to its end, so
     // a daemon that wrongly starts serving fails the test instead of

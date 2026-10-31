@@ -649,8 +649,8 @@ impl fmt::Display for Temperature {
 /// label value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CacheName {
-    /// The value-page cache key-value lookups read through,
-    /// `server.page_cache_bytes`.
+    /// The value-page cache key-value lookups read through, budgeted by
+    /// its memory level's part of `server.cache_bytes`.
     Lookup,
     /// The memory cache of ordered tables' pages,
     /// `server.scan_page_cache_bytes` (RFD 025).
@@ -658,10 +658,11 @@ pub enum CacheName {
 }
 
 impl CacheName {
-    /// The `[server]` setting that budgets the cache's memory.
+    /// The `[server]` setting that budgets the cache's memory, alone or
+    /// with the row cache.
     pub(crate) fn budget_setting(self) -> &'static str {
         match self {
-            Self::Lookup => "page_cache_bytes",
+            Self::Lookup => "cache_bytes",
             Self::Scan => "scan_page_cache_bytes",
         }
     }

@@ -34,7 +34,7 @@ use clap::Parser;
 use iceberg::spec::MAIN_BRANCH;
 use icetray_core::ColumnRead;
 use icetray_core::config::{
-    LocalConfig, Residency, ServerConfig, SourceConfig, StorageConfig, TableConfig,
+    FALLBACK_CACHE_BYTES, LocalConfig, Residency, SourceConfig, StorageConfig, TableConfig,
 };
 use icetray_core::{
     FALL_PER_MILLE, Generation, Key, KeyType, LocalDir, PER_MILLE, RECOVER_PER_MILLE, Storage,
@@ -399,7 +399,7 @@ async fn serve(cli: &Cli) -> SweepResult<Served> {
         config,
         TableSource::from_config(&source).await?,
         Some(Arc::new(local)),
-        ServerConfig::default().page_cache_bytes,
+        approx::length(FALLBACK_CACHE_BYTES),
     )
     .await?;
     Ok(served.load().await?)

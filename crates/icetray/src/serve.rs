@@ -888,9 +888,9 @@ async fn page_cache_loop(opened: Arc<Opened>) -> Infallible {
 
 #[cfg(test)]
 mod tests {
-    use icetray_core::config::{SourceConfig, StorageConfig, TableConfig};
+    use icetray_core::config::{FALLBACK_CACHE_BYTES, SourceConfig, StorageConfig, TableConfig};
     use icetray_core::memory::LimitSource;
-    use icetray_core::{CallsInFlight, PageCache, TableHandles, TableSource};
+    use icetray_core::{CallsInFlight, PageCache, RowCache, TableHandles, TableSource};
     use tokio::sync::oneshot;
 
     use super::*;
@@ -977,7 +977,10 @@ mod tests {
         };
         let handles = TableHandles {
             storage: Arc::new(Storage::new(StorageConfig::default())),
-            cache: PageCache::new(server.page_cache_bytes, None).await.unwrap(),
+            cache: PageCache::new(approx::length(FALLBACK_CACHE_BYTES), None)
+                .await
+                .unwrap(),
+            row_cache: Some(RowCache::new(FALLBACK_CACHE_BYTES)),
             local: None,
             calls: CallsInFlight::new(),
             findings: FindingLog::Debug,

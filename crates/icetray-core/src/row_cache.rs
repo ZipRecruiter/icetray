@@ -134,7 +134,12 @@ pub struct RowCache(Arc<Inner>);
 impl RowCache {
     /// A cache that holds entries up to `capacity_bytes` as `weigh` charges
     /// them. Its hit and miss counters are registered at zero in the
-    /// recorder current now.
+    /// recorder current now. It splits into shards chosen for
+    /// `capacity_bytes` and kept for its life, each holding its share of
+    /// the budget, so an entry is cached only when it fits its shard's
+    /// share: a budget under one `ROW_CACHE_MAX_VALUE_BYTES` value per
+    /// shard caches only smaller values, and a budget of zero, a server
+    /// none of whose tables reads through the cache, caches nothing.
     #[must_use]
     pub fn new(capacity_bytes: u64) -> Self {
         let estimated_items = approx::length(capacity_bytes / ESTIMATED_ENTRY_BYTES).max(1);
@@ -183,7 +188,9 @@ impl RowCache {
     }
 
     /// Sets the budget to `capacity_bytes`, evicting entries until what is
-    /// held fits.
+    /// held fits. The shards stay those `new` chose, so a budget shrunk
+    /// under one `ROW_CACHE_MAX_VALUE_BYTES` value per shard caches only
+    /// smaller values until it grows again.
     pub fn resize(&self, capacity_bytes: u64) {
         self.0.cache.set_capacity(capacity_bytes);
     }
@@ -375,6 +382,48 @@ mod tests {
         cache.resize(smaller);
         assert!(cache.usage() <= smaller, "{} over {smaller}", cache.usage());
         assert!(cache.usage() > 0, "the cache keeps what fits");
+    }
+
+    /// A budget of zero caches nothing, a null included.
+    #[test]
+    fn test_a_zero_budget_caches_nothing() {
+        let cache = RowCache::new(0);
+        cache.insert(key(1, 0), Some(b"a value"));
+        cache.insert(key(2, 0), None);
+        assert_eq!(cache.get(&key(1, 0)), Cached::Absent);
+        assert_eq!(cache.get(&key(2, 0)), Cached::Absent);
+        assert_eq!(cache.usage(), 0);
+    }
+
+    /// A large cache shrunk to zero empties and caches nothing; at half of
+    /// one largest value per shard it caches small values and not the
+    /// largest; grown back it caches the largest again.
+    #[test]
+    fn test_resize_to_zero_and_back_caches_what_each_budget_holds() {
+        let cache = RowCache::new(ROOMY_BYTES);
+        let largest = vec![0_u8; approx::length(ROW_CACHE_MAX_VALUE_BYTES)];
+        let small = b"a value";
+        let shards = approx::count(cache.0.cache.num_shards());
+        cache.insert(key(1, 0), Some(&largest));
+        assert_ne!(cache.get(&key(1, 0)), Cached::Absent);
+
+        cache.resize(0);
+        assert_eq!(cache.usage(), 0);
+        cache.insert(key(2, 0), Some(small));
+        assert_eq!(cache.get(&key(2, 0)), Cached::Absent);
+
+        cache.resize(shards * weigh(Some(largest.len())) / 2);
+        cache.insert(key(3, 0), Some(&largest));
+        assert_eq!(cache.get(&key(3, 0)), Cached::Absent);
+        cache.insert(key(4, 0), Some(small));
+        assert_eq!(
+            cache.get(&key(4, 0)),
+            Cached::Value(Bytes::from_static(small))
+        );
+
+        cache.resize(ROOMY_BYTES);
+        cache.insert(key(5, 0), Some(&largest));
+        assert_ne!(cache.get(&key(5, 0)), Cached::Absent);
     }
 
     /// The counters are registered at zero when the cache is made, a scrape's

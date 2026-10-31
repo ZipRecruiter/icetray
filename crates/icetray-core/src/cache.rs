@@ -30,6 +30,7 @@ use crate::contract::{PAGE_CACHE_DISK_BLOCK_BYTES, VALUE_PAGE_BYTES};
 use crate::descriptors;
 use crate::error::{Error, Recurrence, Recurs, Result};
 use crate::local::DiskLevel;
+use crate::memory::MemoryLimit;
 use crate::metric::{self, CacheName};
 use crate::shard::{self, Sharded, Tally};
 use crate::storage::IoStats;
@@ -52,7 +53,7 @@ const ENTRY_OVERHEAD_BYTES: usize = 64;
 /// takes its shard's lock exclusively, so fewer shards than workers makes
 /// concurrent fetches wait on each other. `min_memory_bytes` is computed
 /// from the same count.
-fn memory_shards() -> usize {
+pub(crate) fn memory_shards() -> usize {
     shard::count()
 }
 
@@ -73,21 +74,23 @@ fn eviction() -> S3FifoConfig {
 /// share, so the cache would hold a page per shard however small the budget
 /// and the configured bytes would bound nothing. `Config::parse` refuses
 /// less than one shard's minimum, which no machine goes below, and
-/// `check_capacity` refuses less than the minimum of the shards the cache
-/// will have on the runtime it opens on.
+/// `open_with` refuses less than the minimum of the shards the cache will
+/// have on the runtime it opens on (`check_capacity`).
 pub(crate) fn min_memory_bytes(shards: usize) -> u64 {
     approx::count(shards) * (VALUE_PAGE_BYTES + approx::count(ENTRY_OVERHEAD_BYTES))
 }
 
 /// `ConfigViolation::PageCacheTooSmall` for `cache`'s budget of `bytes`
-/// below `min_memory_bytes` of the shards a cache opened on the caller's
-/// runtime has; `open_with` calls it for each cache before it opens one,
-/// since the worker count is not known when the configuration is parsed.
+/// below `min_memory_bytes(shards)`, naming the memory `limit` the budget
+/// was derived from, if any. Parsing calls it with one shard; `open_with`
+/// with `memory_shards()` before it opens a cache, since the worker count
+/// is not known when the configuration is parsed.
 pub(crate) fn check_capacity(
     cache: CacheName,
     bytes: u64,
+    shards: usize,
+    limit: Option<MemoryLimit>,
 ) -> std::result::Result<(), ConfigViolation> {
-    let shards = memory_shards();
     let minimum = min_memory_bytes(shards);
     if bytes < minimum {
         return Err(ConfigViolation::PageCacheTooSmall {
@@ -95,6 +98,7 @@ pub(crate) fn check_capacity(
             bytes,
             minimum,
             shards,
+            limit,
         });
     }
     Ok(())
@@ -1599,38 +1603,31 @@ mod tests {
         }
     }
 
-    /// The minimum follows the shards a cache opened on the caller's
-    /// runtime has: one per worker, rounded up to a power of two.
+    /// The minimum is one value page per shard, and a cache opened on a
+    /// runtime has one shard per worker, rounded up to a power of two.
     #[test]
-    fn test_check_capacity_refuses_less_than_a_page_per_runtime_shard() {
+    fn test_check_capacity_refuses_less_than_a_page_per_shard() {
         let workers: usize = 3;
         let shards = workers.next_power_of_two();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
             .build()
             .unwrap();
+        assert_eq!(runtime.block_on(async { memory_shards() }), shards);
         let minimum = min_memory_bytes(shards);
-        let single = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
         for cache in [CacheName::Lookup, CacheName::Scan] {
             assert_eq!(
-                runtime.block_on(async { check_capacity(cache, minimum - 1) }),
+                check_capacity(cache, minimum - 1, shards, None),
                 Err(ConfigViolation::PageCacheTooSmall {
                     cache,
                     bytes: minimum - 1,
                     minimum,
                     shards,
+                    limit: None,
                 })
             );
-            assert_eq!(
-                runtime.block_on(async { check_capacity(cache, minimum) }),
-                Ok(())
-            );
-            assert_eq!(
-                single.block_on(async { check_capacity(cache, minimum - 1) }),
-                Ok(())
-            );
+            assert_eq!(check_capacity(cache, minimum, shards, None), Ok(()));
+            assert_eq!(check_capacity(cache, minimum - 1, 1, None), Ok(()));
         }
     }
 

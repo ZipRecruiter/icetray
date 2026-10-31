@@ -9,18 +9,21 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category;
 
 use crate::approx;
 use crate::aws_catalog;
-use crate::cache::min_memory_bytes;
+use crate::budget;
+use crate::cache::check_capacity;
 use crate::check::ScanLimits;
 use crate::column;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
 use crate::error::{Error, Result};
 use crate::level::Level;
 use crate::manifest::{self, ColumnRead, ValueType};
+use crate::memory::MemoryLimit;
 use crate::metric::CacheName;
 use crate::storage::{self, LocationError};
 use crate::time;
@@ -60,16 +63,33 @@ const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// `Duration::MAX` overflows it.
 const MAX_POLL_INTERVAL: Duration = Duration::from_hours(24);
 
-/// The value-page cache budget when the file says nothing: 256 mebibytes,
-/// a few thousand pages at the layout's 64-kibibyte bound (RFD 002), enough
-/// for a warm working set on a small replica while leaving memory to the
-/// resident index. A replica that serves more raises it in the file.
-const DEFAULT_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+/// The share of the process's memory limit (`memory::limit`) that
+/// `server.cache_bytes` is when the file sets none: a half. The limit, not
+/// the memory free, so every start of a replica gets the same budget; the
+/// other half holds the resident indexes, a second generation while a
+/// refresh loads, requests in flight, the allocator, and the kernel's cache
+/// of `disk` tables' chunk files (RFD 028).
+pub(crate) const DEFAULT_CACHE_SHARE_OF_LIMIT: f64 = 0.5;
 
-/// The page cache shards `Config::parse` checks `page_cache_bytes` against:
-/// one, the fewest a cache has on any machine, since the worker count that
-/// sets the real number is not known until the cache opens on a runtime
-/// (`cache::check_capacity`).
+/// `server.cache_bytes` when the file sets none and no memory limit can be
+/// read: 256 mebibytes, a few thousand pages at the layout's 64-kibibyte
+/// bound (RFD 002), enough for a warm working set on a small replica while
+/// leaving memory to the resident index.
+pub const FALLBACK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The share of the cache budget the row cache holds when the file sets no
+/// `server.row_cache_share` and a table reads through it: nine tenths. On a
+/// sampled production trace the whole budget given to rows missed least at
+/// every row size and budget measured; the page cache's memory level keeps
+/// the rest for the key and dictionary pages every lookup reads, a hit in
+/// the row cache included, and for the pages on their way to the disk
+/// level (RFD 028).
+pub(crate) const DEFAULT_ROW_CACHE_SHARE: f64 = 0.9;
+
+/// The page cache shards `Config::parse` checks a set `server.cache_bytes`
+/// and `scan_page_cache_bytes` against: one, the fewest a cache has on any
+/// machine, since the worker count that sets the real number is not known
+/// until the cache opens on a runtime (`budget::resolve`).
 const PARSE_CACHE_SHARDS: usize = 1;
 
 /// `strict` when a table says nothing: off. No table is refused for its
@@ -189,8 +209,8 @@ pub(crate) const DEFAULT_SCAN_DEADLINE: Duration = Duration::from_secs(5);
 pub(crate) const DEFAULT_MULTI_SCAN_DEADLINE: Duration = Duration::from_secs(15);
 
 /// The memory cache that holds the pages ordered tables' span GETs fetch,
-/// when the file says nothing: 256 mebibytes, as large as the default
-/// value-page cache (RFD 025). It is separate from the page cache and keeps
+/// when the file says nothing: 256 mebibytes, as large as
+/// `FALLBACK_CACHE_BYTES` (RFD 025). It is separate from the page cache and keeps
 /// off the disk level, so a scan evicts only other scans' pages.
 pub(crate) const DEFAULT_SCAN_PAGE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -541,28 +561,46 @@ pub enum ConfigViolation {
         /// Its residency.
         residency: Residency,
     },
-    /// The memory budget of a page cache, `page_cache_bytes` or
-    /// `scan_page_cache_bytes`, cannot hold one value page in every shard
-    /// of its memory level, so the cache would keep a page per shard
-    /// however small the budget, and the budget would bound nothing
-    /// (`cache::min_memory_bytes`). `Config::parse` checks the budget
-    /// against one shard, the least any cache has; opening the cache
-    /// checks it against the shards it has on the runtime it opens on, one
-    /// per worker thread rounded up to a power of two.
-    #[error(
-        "server.{} {bytes} is below one value page per cache shard, {minimum} bytes for {shards} shards",
-        .cache.budget_setting()
-    )]
+    /// The memory budget of a page cache, its memory level's part of
+    /// `cache_bytes` or `scan_page_cache_bytes`, cannot hold one value page
+    /// in every shard of its memory level, so the cache would keep a page
+    /// per shard however small the budget, and the budget would bound
+    /// nothing (`cache::min_memory_bytes`). `Config::parse` checks a set
+    /// budget against one shard, the least any cache has; opening the
+    /// caches checks it against the shards they have on the runtime they
+    /// open on, one per worker thread rounded up to a power of two, and
+    /// checks a budget derived from the memory limit only then.
+    #[error("{}", page_cache_too_small(*cache, *bytes, *minimum, *shards, *limit))]
     PageCacheTooSmall {
         /// The cache whose budget it is.
         cache: CacheName,
-        /// The configured budget.
+        /// The budget.
         bytes: u64,
         /// The smallest budget that holds a value page in every shard: one
         /// contract value page with its entry overhead per shard.
         minimum: u64,
         /// The shards the minimum is for.
         shards: usize,
+        /// The memory limit the budget was derived from, when the file
+        /// sets no `cache_bytes`.
+        limit: Option<MemoryLimit>,
+    },
+    /// A `[server]` key icetray no longer reads, which the file still sets:
+    /// refused rather than ignored, naming the setting that replaced it, so
+    /// a deployment does not run on a default it believes it configured.
+    #[error("server.{setting} is no longer a setting; use server.{replacement}")]
+    RemovedSetting {
+        /// The removed key.
+        setting: &'static str,
+        /// The key that replaced it.
+        replacement: &'static str,
+    },
+    /// `row_cache_share` is outside `[0, 1]` or not a number; it is the
+    /// share of `cache_bytes` the row cache holds (RFD 028).
+    #[error("server.row_cache_share {share} is not in [0, 1]")]
+    RowCacheShareOutOfRange {
+        /// The configured share.
+        share: f64,
     },
     /// A page cache disk level smaller than its one block, which would hold
     /// nothing (RFD 017); zero turns the level off instead.
@@ -813,6 +851,29 @@ fn lookups_unreachable(
     }
 }
 
+/// `ConfigViolation::PageCacheTooSmall`'s message: the budget by its
+/// setting, and for a budget derived from the memory limit, the limit and
+/// where it comes from, since the file names no number to raise.
+fn page_cache_too_small(
+    cache: CacheName,
+    bytes: u64,
+    minimum: u64,
+    shards: usize,
+    limit: Option<MemoryLimit>,
+) -> String {
+    let setting = cache.budget_setting();
+    let refusal = format!(
+        "server.{setting} gives the {cache} page cache {bytes} bytes, below one value page per cache shard, {minimum} bytes for {shards} shards"
+    );
+    match limit {
+        Some(limit) => format!(
+            "{refusal}; server.{setting} is unset, so it is derived from the {} memory limit of {} bytes: set it, or raise the limit",
+            limit.of, limit.bytes
+        ),
+        None => refusal,
+    }
+}
+
 /// The whole configuration: the server, storage, and the tables it serves.
 /// Every section defaults when absent; a key the schema does not know is an
 /// error in every section.
@@ -884,6 +945,13 @@ impl Config {
         Ok(self)
     }
 
+    /// Whether any configured table reads through the row cache: a
+    /// key-value table, one that sets no `order_column`. The row cache's
+    /// part of the budget is zero when none does (`budget::resolve`).
+    pub(crate) fn reads_rows(&self) -> bool {
+        self.tables.iter().any(|table| table.order_column.is_none())
+    }
+
     /// The settings outside `tables` whose value in `next` differs from
     /// this configuration's, by their names in the file, in file order:
     /// what a reload refuses, since the server builds them once at start
@@ -899,14 +967,6 @@ impl Config {
 }
 
 impl ServerConfig {
-    /// Each page cache with the memory budget it is configured for.
-    pub(crate) fn cache_budgets(&self) -> [(CacheName, u64); 2] {
-        [
-            (CacheName::Lookup, approx::count(self.page_cache_bytes)),
-            (CacheName::Scan, self.scan_page_cache_bytes),
-        ]
-    }
-
     /// The names, in file order, of the settings whose value in `next`
     /// differs from this one's.
     fn differing_settings(&self, next: &Self) -> Vec<&'static str> {
@@ -914,7 +974,9 @@ impl ServerConfig {
             listen,
             metrics_listen,
             poll_interval,
-            page_cache_bytes,
+            cache_bytes,
+            row_cache_share,
+            removed_page_cache_bytes: _,
             log,
             get_deadline,
             multi_get_deadline,
@@ -941,9 +1003,10 @@ impl ServerConfig {
                 "server.poll_interval",
                 *poll_interval == server.poll_interval,
             ),
+            ("server.cache_bytes", *cache_bytes == server.cache_bytes),
             (
-                "server.page_cache_bytes",
-                *page_cache_bytes == server.page_cache_bytes,
+                "server.row_cache_share",
+                row_cache_share.map(f64::to_bits) == server.row_cache_share.map(f64::to_bits),
             ),
             ("server.log", *log == server.log),
             ("server.get_deadline", *get_deadline == server.get_deadline),
@@ -1043,6 +1106,12 @@ impl StorageConfig {
 
 /// The first rule the configuration breaks, or `Ok` when it breaks none.
 fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
+    if config.server.removed_page_cache_bytes.is_some() {
+        return Err(ConfigViolation::RemovedSetting {
+            setting: "page_cache_bytes",
+            replacement: "cache_bytes",
+        });
+    }
     validate_bounds(&config.server, &config.storage)?;
     validate_hedge(&config.storage.hedge)?;
     validate_log(&config.server.log)?;
@@ -1060,17 +1129,25 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     {
         return Err(ConfigViolation::IncompleteStaticKeys);
     }
-    let minimum = min_memory_bytes(PARSE_CACHE_SHARDS);
-    for (cache, bytes) in config.server.cache_budgets() {
-        if bytes < minimum {
-            return Err(ConfigViolation::PageCacheTooSmall {
-                cache,
-                bytes,
-                minimum,
-                shards: PARSE_CACHE_SHARDS,
-            });
-        }
+    if let Some(share) = config.server.row_cache_share
+        && !(0.0..=1.0).contains(&share)
+    {
+        return Err(ConfigViolation::RowCacheShareOutOfRange { share });
     }
+    if config.server.cache_bytes.is_some() {
+        budget::resolve(
+            &config.server,
+            None,
+            config.reads_rows(),
+            PARSE_CACHE_SHARDS,
+        )?;
+    }
+    check_capacity(
+        CacheName::Scan,
+        config.server.scan_page_cache_bytes,
+        PARSE_CACHE_SHARDS,
+        None,
+    )?;
     if let Some(local) = &config.storage.local
         && local.page_cache_disk_bytes > 0
         && local.page_cache_disk_bytes < PAGE_CACHE_DISK_BLOCK_BYTES
@@ -1363,13 +1440,28 @@ pub struct ServerConfig {
     /// second) to `MAX_POLL_INTERVAL` (one day).
     #[serde(with = "time::friendly_duration")]
     pub poll_interval: Duration,
-    /// The value-page cache budget in bytes; at least one contract value
-    /// page with its entry overhead per shard of the cache's memory level
-    /// (`cache::min_memory_bytes`), or the budget would bound nothing. The
+    /// The bytes the row cache and the page cache's memory level hold
+    /// together (RFD 028). `None` derives it from the process's memory
+    /// limit when the caches open: `DEFAULT_CACHE_SHARE_OF_LIMIT` of it, or
+    /// `FALLBACK_CACHE_BYTES` when no limit can be read
+    /// (`budget::resolve`). The page cache's part must hold one contract
+    /// value page with its entry overhead per shard of its memory level
+    /// (`cache::min_memory_bytes`), or the budget would bound nothing; the
     /// shards are one per worker thread rounded up to a power of two, so
-    /// parsing checks one shard's minimum and opening the cache checks the
+    /// parsing checks one shard's minimum and opening the caches checks the
     /// rest.
-    pub page_cache_bytes: usize,
+    pub cache_bytes: Option<u64>,
+    /// The share of `cache_bytes` the row cache holds when a table reads
+    /// through it, in `[0, 1]`, the rest being the page cache's memory
+    /// level; `None` is `DEFAULT_ROW_CACHE_SHARE`. When no table reads
+    /// through the row cache, the page cache holds the whole budget.
+    pub row_cache_share: Option<f64>,
+    /// The removed `page_cache_bytes`, read under its name so that
+    /// validation refuses a file that sets it, naming `cache_bytes`
+    /// (`ConfigViolation::RemovedSetting`), where an unknown key would
+    /// fail the parse without the replacement.
+    #[serde(rename = "page_cache_bytes")]
+    pub(crate) removed_page_cache_bytes: Option<IgnoredAny>,
     /// Log field renames and additions.
     pub log: LogConfig,
     /// How long a `Get` may run before it is `DEADLINE_EXCEEDED`, and how
@@ -1446,7 +1538,9 @@ impl Default for ServerConfig {
             listen: DEFAULT_LISTEN,
             metrics_listen: DEFAULT_METRICS_LISTEN,
             poll_interval: DEFAULT_POLL_INTERVAL,
-            page_cache_bytes: DEFAULT_PAGE_CACHE_BYTES,
+            cache_bytes: None,
+            row_cache_share: None,
+            removed_page_cache_bytes: None,
             log: LogConfig::default(),
             get_deadline: DEFAULT_GET_DEADLINE,
             multi_get_deadline: DEFAULT_MULTI_GET_DEADLINE,
@@ -2474,6 +2568,7 @@ mod tests {
     use serde_path_to_error::Segment;
 
     use super::*;
+    use crate::cache::min_memory_bytes;
     use crate::contract::VALUE_PAGE_BYTES;
     use crate::error::Error;
     use crate::storage::LocationFault;
@@ -2485,8 +2580,10 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9433);
     /// The poll interval the full fixture names, `"30s"`.
     const FIXTURE_POLL_INTERVAL: Duration = Duration::from_secs(30);
-    /// The page cache budget the full fixture names: 128 mebibytes.
-    const FIXTURE_PAGE_CACHE_BYTES: usize = 128 * 1024 * 1024;
+    /// The cache budget the full fixture names: 128 mebibytes.
+    const FIXTURE_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+    /// The row cache's share of it the full fixture names.
+    const FIXTURE_ROW_CACHE_SHARE: f64 = 0.75;
     /// The hedge percentile the full fixture names.
     const FIXTURE_HEDGE_PERCENTILE: f64 = 0.9;
     /// The hedge window the full fixture names.
@@ -2582,7 +2679,8 @@ mod tests {
 listen = "{FIXTURE_LISTEN}"
 metrics_listen = "{FIXTURE_METRICS_LISTEN}"
 poll_interval = "30s"
-page_cache_bytes = {FIXTURE_PAGE_CACHE_BYTES}
+cache_bytes = {FIXTURE_CACHE_BYTES}
+row_cache_share = {FIXTURE_ROW_CACHE_SHARE}
 get_deadline = "2s"
 multi_get_deadline = "8s"
 max_in_flight = {FIXTURE_MAX_IN_FLIGHT}
@@ -2597,12 +2695,9 @@ load_deadline = "45m"
 refresh_deadline = "10m"
 drain_deadline = "25s"
 
-[server.log.fields]
-time = "ts"
-level = "severity"
-
-[server.log.static_fields]
-service = "icetray"
+[server.log]
+fields = {{ time = "ts", level = "severity" }}
+static_fields = {{ service = "icetray" }}
 
 [storage]
 max_retries = {FIXTURE_MAX_RETRIES}
@@ -2700,7 +2795,8 @@ endpoint = "https://s3tables.example"
                 "listen": FIXTURE_LISTEN.to_string(),
                 "metrics_listen": FIXTURE_METRICS_LISTEN.to_string(),
                 "poll_interval": "30s",
-                "page_cache_bytes": FIXTURE_PAGE_CACHE_BYTES,
+                "cache_bytes": FIXTURE_CACHE_BYTES,
+                "row_cache_share": FIXTURE_ROW_CACHE_SHARE,
                 "get_deadline": "2s",
                 "multi_get_deadline": "8s",
                 "max_in_flight": FIXTURE_MAX_IN_FLIGHT,
@@ -2832,7 +2928,9 @@ value_columns = ["value"]
                 listen: FIXTURE_LISTEN,
                 metrics_listen: FIXTURE_METRICS_LISTEN,
                 poll_interval: FIXTURE_POLL_INTERVAL,
-                page_cache_bytes: FIXTURE_PAGE_CACHE_BYTES,
+                cache_bytes: Some(FIXTURE_CACHE_BYTES),
+                row_cache_share: Some(FIXTURE_ROW_CACHE_SHARE),
+                removed_page_cache_bytes: None,
                 log: LogConfig {
                     fields: BTreeMap::from([
                         (StandardField::Time, "ts".to_string()),
@@ -2991,7 +3089,8 @@ value_columns = ["value"]
         assert_eq!(config.server.listen, DEFAULT_LISTEN);
         assert_eq!(config.server.metrics_listen, DEFAULT_METRICS_LISTEN);
         assert_eq!(config.server.poll_interval, DEFAULT_POLL_INTERVAL);
-        assert_eq!(config.server.page_cache_bytes, DEFAULT_PAGE_CACHE_BYTES);
+        assert_eq!(config.server.cache_bytes, None);
+        assert_eq!(config.server.row_cache_share, None);
         assert!(config.server.log.fields.is_empty());
         assert!(config.server.log.static_fields.is_empty());
         assert_eq!(config.server.get_deadline, DEFAULT_GET_DEADLINE);
@@ -3288,6 +3387,65 @@ locaton = "typo"
                 "server.scan_page_cache_bytes",
                 "storage.max_retries"
             ]
+        );
+    }
+
+    #[test]
+    fn test_restart_settings_names_cache_bytes_and_row_cache_share() {
+        let running = Config::parse(TOML_MINIMAL).unwrap();
+        let mut next = running.clone();
+        next.server.cache_bytes = Some(FIXTURE_CACHE_BYTES);
+        next.server.row_cache_share = Some(FIXTURE_ROW_CACHE_SHARE);
+        assert_eq!(
+            running.restart_settings(&next),
+            ["server.cache_bytes", "server.row_cache_share"]
+        );
+    }
+
+    /// The removed `page_cache_bytes` is refused naming its replacement,
+    /// in either syntax, rather than failing the parse as an unknown key.
+    #[test]
+    fn test_page_cache_bytes_is_refused_naming_cache_bytes() {
+        let toml = format!("[server]\npage_cache_bytes = 1048576\n{TOML_MINIMAL}");
+        let json = r#"{"server": {"page_cache_bytes": 1048576}, "tables": [{"name": "kv", "source": {"type": "static", "location": "s3://example-warehouse/db/kv"}, "ref": "main", "key_column": "key", "value_columns": ["value"]}]}"#;
+        for text in [toml.as_str(), json] {
+            assert_eq!(
+                violation(text),
+                ConfigViolation::RemovedSetting {
+                    setting: "page_cache_bytes",
+                    replacement: "cache_bytes",
+                },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_row_cache_share_outside_zero_to_one_is_refused() {
+        let with_share = |share: f64| {
+            let mut config = Config::parse(TOML_MINIMAL).unwrap();
+            config.server.row_cache_share = Some(share);
+            config.validated()
+        };
+        for share in [-0.1, 1.5, f64::NAN] {
+            let refused = with_share(share);
+            assert!(
+                matches!(
+                    refused,
+                    Err(Error::Config(ConfigError::Invalid(
+                        ConfigViolation::RowCacheShareOutOfRange { share: refused }
+                    ))) if refused.to_bits() == share.to_bits()
+                ),
+                "{share}: {refused:?}"
+            );
+        }
+        for share in [0.0, 1.0] {
+            assert!(with_share(share).is_ok(), "{share}");
+        }
+        let toml = format!("[server]\nrow_cache_share = 1.5\n{TOML_MINIMAL}");
+        assert_eq!(
+            violation(&toml),
+            ConfigViolation::RowCacheShareOutOfRange { share: 1.5 }
         );
     }
 
@@ -3844,6 +4002,10 @@ locaton = "typo"
         );
     }
 
+    /// A set `cache_bytes` whose page part, the whole of it at a row
+    /// share of zero, and `scan_page_cache_bytes` are each held to one
+    /// shard's minimum; a `cache_bytes` left to the memory limit is checked
+    /// only when the caches open.
     #[test]
     fn test_parse_refuses_each_page_cache_below_a_value_page_per_shard() {
         let minimum = min_memory_bytes(PARSE_CACHE_SHARDS);
@@ -3851,7 +4013,7 @@ locaton = "typo"
             let setting = cache.budget_setting();
             let with_budget = |bytes: u64| {
                 format!(
-                    "[server]\n{setting} = {bytes}\n{}",
+                    "[server]\n{setting} = {bytes}\nrow_cache_share = 0.0\n{}",
                     TOML_MINIMAL.trim_start()
                 )
             };
@@ -3862,20 +4024,29 @@ locaton = "typo"
                         cache,
                         bytes,
                         minimum,
-                        shards: PARSE_CACHE_SHARDS
+                        shards: PARSE_CACHE_SHARDS,
+                        limit: None,
                     },
                     "{setting} {bytes} bytes"
                 );
             }
-            let at_minimum = Config::parse(&with_budget(minimum)).unwrap();
-            assert!(
-                at_minimum
-                    .server
-                    .cache_budgets()
-                    .contains(&(cache, minimum)),
-                "{setting}"
-            );
+            Config::parse(&with_budget(minimum)).unwrap();
         }
+        let rows_take_most = format!(
+            "[server]\ncache_bytes = {minimum}\n{}",
+            TOML_MINIMAL.trim_start()
+        );
+        assert!(
+            matches!(
+                violation(&rows_take_most),
+                ConfigViolation::PageCacheTooSmall {
+                    cache: CacheName::Lookup,
+                    bytes,
+                    ..
+                } if bytes < minimum
+            ),
+            "the row cache's share leaves the page cache under the minimum"
+        );
     }
 
     #[test]

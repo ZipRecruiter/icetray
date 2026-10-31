@@ -290,11 +290,12 @@ impl Setup {
 /// loopback at OS-assigned ports and the test poll interval.
 fn config_over(s3: &S3Fixture, tables: Vec<TableConfig>) -> Config {
     Config {
-        server: ServerConfig {
-            listen: LOOPBACK_ANY_PORT,
-            metrics_listen: LOOPBACK_ANY_PORT,
-            poll_interval: TEST_POLL_INTERVAL,
-            ..ServerConfig::default()
+        server: {
+            let mut server = ServerConfig::default();
+            server.listen = LOOPBACK_ANY_PORT;
+            server.metrics_listen = LOOPBACK_ANY_PORT;
+            server.poll_interval = TEST_POLL_INTERVAL;
+            server
         },
         storage: s3.storage_config(),
         tables,

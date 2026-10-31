@@ -310,7 +310,7 @@ data files are immutable, so a cached page never goes stale, and icetray
 evicts pages by size alone. Concurrent lookups that need the same
 uncached page share one GET.
 
-- **The memory level**, `server.page_cache_bytes`
+- **The memory level**, its part of `server.cache_bytes`
   ([Configuration](configuration.md#server)), holds the hottest pages. A hit there costs no I/O. The level is split
   into shards, one per worker thread rounded up to a power of two, and
   each shard evicts within its own share of the budget. A newly cached

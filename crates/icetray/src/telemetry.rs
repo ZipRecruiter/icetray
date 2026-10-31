@@ -336,7 +336,8 @@ impl Scrape {
 
     /// Writes every series a scrape reads as it stands: each table's lookup
     /// counts (`Table::publish_lookup_counts`) and gauges
-    /// (`Table::publish_gauges`), the page cache's hit counts and bytes, the
+    /// (`Table::publish_gauges`), the page caches' hit counts and bytes, the
+    /// row cache's hits, misses, and bytes, the
     /// in-flight gauges from the slots, `config_pending`, and the sampled
     /// gauges (`sample`). The counts are published so a scrape reads every
     /// lookup answered and every page hit before it; the gauges are written
@@ -351,6 +352,7 @@ impl Scrape {
             cache.publish_hit_counts();
             cache.publish_usage();
         }
+        self.opened.row_cache.publish();
         metrics::gauge!(metric::REQUESTS_IN_FLIGHT).set(approx::gauge_len(self.slots.admitted()));
         metrics::gauge!(metric::MAX_IN_FLIGHT).set(approx::gauge_len(self.slots.limit()));
         if let Some(pending) = &self.pending {

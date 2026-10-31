@@ -100,7 +100,8 @@ table = "profiles"
 | `listen` | address | `"127.0.0.1:7433"` | The gRPC listener. |
 | `metrics_listen` | address | `"127.0.0.1:9433"` | The HTTP listener for `/metrics` and `/ready`. |
 | `poll_interval` | duration | `"10s"` | How often each table's ref is re-resolved and the configuration file re-read. At least `"1s"` and at most `"24h"`. |
-| `page_cache_bytes` | bytes | `268435456` (256 MiB) | The memory budget of the value-page cache. See the note below. |
+| `cache_bytes` | bytes | half the memory limit, else `268435456` (256 MiB) | The memory the row cache and the page cache's memory level hold together. Unset, it is half the process's memory limit, the smaller of its cgroup's limit and the host's memory, and 256 MiB when neither can be read. See the note below. |
+| `row_cache_share` | number | `0.9` | The share of `cache_bytes` the row cache holds, in [0, 1]; the page cache's memory level holds the rest. When no table reads through the row cache, the page cache holds all of `cache_bytes`. A value outside the range is refused, as `server.row_cache_share 1.5 is not in [0, 1]`. |
 | `get_deadline` | duration | `"5s"` | The longest a `Get` may run, and the longest each page fetch of any lookup may run, in a `MultiGet` too. Past it the call fails with `DEADLINE_EXCEEDED`. |
 | `multi_get_deadline` | duration | `"15s"` | The longest a whole `MultiGet` may run, whatever its size. |
 | `max_in_flight` | count | `1024` | The most `Get`, `MultiGet`, `Scan`, and `MultiScan` calls in flight at once. icetray refuses one more immediately with `RESOURCE_EXHAUSTED`; calls are never queued. |
@@ -110,7 +111,7 @@ table = "profiles"
 | `max_scan_bytes` | bytes | `4194304` (4 MiB) | The most bytes one `Scan` or `MultiScan` response may encode to, the default being a gRPC client's default limit on a message it receives. icetray measures the response it would send and refuses a larger one with `FAILED_PRECONDITION`, sending no rows and naming the size, the bound, and the rows (`Scan`) or leading keys' results (`MultiScan`) that would fit; a `Scan` counts as an `error` in `icetray_scans_total`, and a `MultiScan` counts each key it read as one. `TableInfo` reports it in `max_scan_bytes` for every ordered table. An owner whose clients accept larger messages raises it. Like every setting outside `[[tables]]`, a change applies on restart. Zero is invalid, as `server.max_scan_bytes 0 is not above zero`. |
 | `scan_deadline` | duration | `"5s"` | The longest a `Scan` may run, and the longest each GET of any Scan, span or key page, may run, in a `MultiScan` too. Past it the call fails with `DEADLINE_EXCEEDED`. |
 | `multi_scan_deadline` | duration | `"15s"` | The longest a whole `MultiScan` may run, whatever its size. |
-| `scan_page_cache_bytes` | bytes | `268435456` (256 MiB) | The memory budget of the cache for the pages an ordered table's span GETs fetch. It is separate from `page_cache_bytes` and never spills to the disk level, so a scan evicts only other scans' pages. Its minimum is `page_cache_bytes`'s, as the note below states it. |
+| `scan_page_cache_bytes` | bytes | `268435456` (256 MiB) | The memory budget of the cache for the pages an ordered table's span GETs fetch. It is separate from `cache_bytes` and never spills to the disk level, so a scan evicts only other scans' pages. Its minimum is the page cache's, as the note below states it. |
 | `load_deadline` | duration | `"30m"` | The longest a build may run while no generation of the table is serving: a first load, or a retry after one failed. |
 | `refresh_deadline` | duration | `"5m"` | The longest one refresh over a serving generation may run. Past it the table is [degraded](glossary.md) and the next poll retries. |
 | `drain_deadline` | duration | `"20s"` | How long a shutdown waits for open calls to finish. |
@@ -119,14 +120,30 @@ Every duration and every count must be above zero. The gRPC layer
 enforces a client's own deadline, and its expiry is reported as the
 client's.
 
+icetray sizes the caches once, as they open at start, and logs the
+result ([Operating icetray](operating.md#logs)). A key-value table reads
+through the row cache, so on a server that serves one, the row cache
+holds `row_cache_share` of `cache_bytes`; on a server of ordered tables
+alone, the page cache holds all of it. The default follows the memory
+limit rather than the memory free, so every start of a replica gets the
+same budget, and the other half of the limit holds the resident indexes,
+a second generation while a refresh loads, and requests in flight
+([Memory](operating.md#memory)). The row cache splits into shards that
+each hold their share of its part, so a part below one 64 KiB value per
+shard caches only smaller values.
+
 The page cache has one shard per tokio worker thread, rounded up to a
 power of two, and each shard must hold one 64 KiB value page plus its
-64-byte entry: 65,600 bytes. icetray refuses a `page_cache_bytes` under
-one shard's minimum when it parses the file, and one under the total for
-the machine's shards (1,049,600 bytes for the 16 shards of an 11-core
-machine) when it opens the cache, with exit 1, before any table loads.
-The scan cache has as many shards, and `scan_page_cache_bytes` is held
-to the same minimum.
+64-byte entry: 65,600 bytes. icetray refuses a page cache part of a set
+`cache_bytes` under one shard's minimum when it parses the file, and one
+under the total for the machine's shards (1,049,600 bytes for the 16
+shards of an 11-core machine) when it opens the cache, with exit 1,
+before any table loads. A `cache_bytes` derived from the memory limit is
+checked when the cache opens, and the refusal names the limit and where
+it was read. The scan cache has as many shards, and
+`scan_page_cache_bytes` is held to the same minimum. A file that still
+sets the removed `page_cache_bytes` is refused, as
+`server.page_cache_bytes is no longer a setting; use server.cache_bytes`.
 The worker count is the number of cores the process sees, unless
 `TOKIO_WORKER_THREADS` sets it.
 
