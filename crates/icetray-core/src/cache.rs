@@ -903,9 +903,10 @@ impl PageCache {
     /// shards as `new` splits it, evicting in each shard until what it
     /// holds fits: a memory-only cache drops what it evicts, and a cache
     /// with a disk level writes it there. The disk level is unchanged. The
-    /// call blocks until every shard has evicted. `Opened::fit_caches`
-    /// checks the budget against `min_memory_bytes` first; a smaller one
-    /// given here directly is taken as it is. A failure of the level is
+    /// call blocks until every shard has evicted. `Opened::check_split`
+    /// checks the budget `Opened::fit_caches` gives it against
+    /// `min_memory_bytes` first; a smaller one given here directly is taken
+    /// as it is. A failure of the level is
     /// `CacheError::Backend`.
     pub fn resize_memory(&self, bytes: u64) -> Result<()> {
         let bytes = approx::length(bytes);

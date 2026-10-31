@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use icetray_core::budget::Budget;
 use icetray_core::config::{Config, ConfigError, ConfigViolation};
 use icetray_core::{Applied, Opened, Refused, Table, approx, metric};
 use metrics::Counter;
@@ -262,27 +263,28 @@ impl Reloader {
     }
 
     /// Waits for polls and requests until one reload applies, then returns
-    /// what it changed. A read that finds the configuration applied, or on
+    /// what it changed and the split its tables take
+    /// (`Opened::check_split`), for `Opened::fit_caches`. A read that finds the configuration applied, or on
     /// a poll the one last refused, does nothing further; a refused reload
     /// is logged and counted, and the wait goes on. A read that fails is
     /// no reload: it is logged when the file becomes unreadable, and
     /// neither counted nor reflected in `config_pending`, since whether the
     /// file differs is unknown. Dropping the future
     /// drops a reload in flight, which swaps nothing in.
-    pub(crate) async fn next(&mut self, opened: &Opened) -> Applied {
+    pub(crate) async fn next(&mut self, opened: &Opened) -> (Applied, Budget) {
         loop {
             let requested = tokio::select! {
                 _ = self.ticker.tick() => false,
                 () = self.requested.notified() => true,
             };
-            if let Some(applied) = self.attempt(opened, requested).await {
-                return applied;
+            if let Some(reloaded) = self.attempt(opened, requested).await {
+                return reloaded;
             }
         }
     }
 
     /// One read, and the reload it calls for.
-    async fn attempt(&mut self, opened: &Opened, requested: bool) -> Option<Applied> {
+    async fn attempt(&mut self, opened: &Opened, requested: bool) -> Option<(Applied, Budget)> {
         let source = Arc::clone(&self.source);
         let read = match tokio::task::spawn_blocking(move || source.read()).await {
             Ok(read) => read,
@@ -309,7 +311,7 @@ impl Reloader {
             return None;
         }
         match self.reload(opened, reading).await {
-            Ok(applied) => Some(applied),
+            Ok(reloaded) => Some(reloaded),
             Err(refusal) => {
                 self.refuse(digest, &refusal);
                 if matches!(refusal, ReloadRefusal::Tables(_)) {
@@ -325,18 +327,18 @@ impl Reloader {
 
     /// Applies `reading`'s tables when nothing else in it changed and the
     /// caches' split for them is one a start with the file would take
-    /// (`Opened::check_split`).
+    /// (`Opened::check_split`), and returns what it changed and that split.
     async fn reload(
         &mut self,
         opened: &Opened,
         reading: Reading,
-    ) -> Result<Applied, ReloadRefusal> {
+    ) -> Result<(Applied, Budget), ReloadRefusal> {
         let config = reading.config.map_err(ReloadRefusal::Invalid)?;
         let restart = self.running.restart_settings(&config);
         if !restart.is_empty() {
             return Err(ReloadRefusal::Restart(restart));
         }
-        opened
+        let split = opened
             .check_split(&config.tables)
             .map_err(ReloadRefusal::Split)?;
         let applied = opened
@@ -361,7 +363,7 @@ impl Reloader {
         self.applied = reading.digest;
         self.refused = None;
         count(ReloadResult::Applied);
-        Ok(applied)
+        Ok((applied, split))
     }
 
     /// Logs and counts `refusal` of the configuration digested as `digest`,

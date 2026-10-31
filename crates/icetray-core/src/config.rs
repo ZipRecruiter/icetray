@@ -966,10 +966,9 @@ impl Config {
     }
 
     /// Whether any configured table reads through the row cache
-    /// (`TableConfig::row_cache`). The row cache's part of the budget is
-    /// zero when none does (`budget::resolve`).
+    /// (`reads_rows`).
     pub(crate) fn reads_rows(&self) -> bool {
-        self.tables.iter().any(TableConfig::row_cache)
+        reads_rows(&self.tables)
     }
 
     /// The settings outside `tables` whose value in `next` differs from
@@ -1182,6 +1181,13 @@ fn validate(config: &Config) -> std::result::Result<(), ConfigViolation> {
     }
     validate_tables(config)?;
     validate_split(config)
+}
+
+/// Whether any of `tables` reads through the row cache
+/// (`TableConfig::row_cache`). The row cache's part of the budget is zero
+/// when none does (`budget::resolve`).
+pub(crate) fn reads_rows<'a>(tables: impl IntoIterator<Item = &'a TableConfig>) -> bool {
+    tables.into_iter().any(TableConfig::row_cache)
 }
 
 /// A server with no page-cache disk level that serves a table reading

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
-use icetray_core::budget::Shortfall;
+use icetray_core::budget::{Budget, Shortfall};
 use icetray_core::config::{Config, Residency, ServerConfig};
 use icetray_core::memory::{self, MemoryLimit};
 use icetray_core::open::open_with;
@@ -547,14 +547,14 @@ impl Run {
                 biased;
                 ended = periodic.ended() => break Some(ended),
                 () = stop(self.shutdown.subscribe()) => break None,
-                applied = next_reload(reloader.as_mut(), &self.opened) => {
+                (applied, split) = next_reload(reloader.as_mut(), &self.opened) => {
                     for table in &applied.stopped {
                         periodic.stop_refresh(table);
                     }
                     for table in &applied.started {
                         periodic.spawn_refresh(table, &self.opened, self.poll_interval);
                     }
-                    fit_caches(&self.opened);
+                    fit_caches(&self.opened, split);
                     check_budget(&self.opened);
                     tokio::select! {
                         () = retain(&self.opened) => {}
@@ -645,8 +645,12 @@ async fn withdraw_health(health: &mut HealthReporter) {
     }
 }
 
-/// The next reload `reloader` applies; without one, never.
-async fn next_reload(reloader: Option<&mut Reloader>, opened: &Opened) -> icetray_core::Applied {
+/// The next reload `reloader` applies, and the split its tables take;
+/// without one, never.
+async fn next_reload(
+    reloader: Option<&mut Reloader>,
+    opened: &Opened,
+) -> (icetray_core::Applied, Budget) {
     match reloader {
         Some(reloader) => reloader.next(opened).await,
         None => std::future::pending().await,
@@ -703,13 +707,12 @@ pub(crate) async fn retain(opened: &Opened) {
     }
 }
 
-/// Resizes the caches to the split the tables a reload swapped in call
-/// for (`Opened::fit_caches`). The reload checked that split before the
-/// swap (`Opened::check_split`), so only a failure of the page cache's
-/// level remains, which is logged: the tables serve on, and the split
-/// recorded stays the one before.
-fn fit_caches(opened: &Opened) {
-    if let Err(error) = opened.fit_caches() {
+/// Resizes the caches to `split`, the split the reload checked before the
+/// swap (`Opened::check_split`) for the tables it swapped in
+/// (`Opened::fit_caches`). A failure of the page cache's level is logged:
+/// the tables serve on, and the split recorded stays the one before.
+fn fit_caches(opened: &Opened, split: Budget) {
+    if let Err(error) = opened.fit_caches(split) {
         tracing::error!(
             reason = %error.kind(),
             %error,

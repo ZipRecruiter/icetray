@@ -29,7 +29,7 @@ use crate::blocking::on_blocking_pool;
 use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
 use crate::check::{self, Capping, ColumnCost, ColumnLevel, Finding, FindingCode, LookupCost};
-use crate::config::{Residency, TableConfig};
+use crate::config::{Residency, ServerConfig, TableConfig};
 use crate::deletes::DeleteSummary;
 use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, RefusalReason, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Row};
@@ -217,6 +217,36 @@ pub struct TableHandles {
     /// refuses a Scan or `MultiScan` response, which the doctor holds a
     /// table's runs against (`large_runs`).
     pub max_scan_bytes: usize,
+}
+
+impl TableHandles {
+    /// The handles of a process whose `[server]` is `server`, over
+    /// `storage`, the page cache `cache`, the row cache `row_cache` when
+    /// its tables read through one, and the local directory `local` when
+    /// `storage.local` is set, with a count of calls in flight of their
+    /// own: what `open_with` builds, the batch bounds taken from `server`.
+    /// Tables built over clones of the handles share every one of them.
+    #[must_use]
+    pub fn new(
+        server: &ServerConfig,
+        storage: Arc<Storage>,
+        cache: PageCache,
+        row_cache: Option<RowCache>,
+        local: Option<Arc<LocalDir>>,
+        findings: FindingLog,
+    ) -> Self {
+        Self {
+            storage,
+            cache,
+            row_cache,
+            local,
+            calls: CallsInFlight::new(),
+            findings,
+            batch_fan_out: server.batch_fan_out,
+            max_multi_scan_values: server.max_multi_scan_values,
+            max_scan_bytes: server.max_scan_bytes,
+        }
+    }
 }
 
 /// Which calls a table serves (RFD 025, Configuration): a table entry that
@@ -2948,17 +2978,14 @@ mod tests {
     /// so a lookup reads every value from its page, no local directory, and
     /// a count of calls in flight of their own.
     async fn handles_over(fixture: &Fixture) -> TableHandles {
-        TableHandles {
-            storage: Arc::clone(&fixture.storage),
-            cache: cache().await,
-            row_cache: None,
-            local: None,
-            calls: CallsInFlight::new(),
-            findings: FindingLog::Events,
-            batch_fan_out: DEFAULT_BATCH_FAN_OUT,
-            max_multi_scan_values: ServerConfig::default().max_multi_scan_values,
-            max_scan_bytes: ServerConfig::default().max_scan_bytes,
-        }
+        TableHandles::new(
+            &ServerConfig::default(),
+            Arc::clone(&fixture.storage),
+            cache().await,
+            None,
+            None,
+            FindingLog::Events,
+        )
     }
 
     /// A table following `fixture`'s main branch under `config`, built over

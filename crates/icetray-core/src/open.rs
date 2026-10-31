@@ -19,13 +19,13 @@ use crate::approx;
 use crate::budget::{self, Budget, Shortfall};
 use crate::cache::{self, PageCache};
 use crate::catalog::TableSource;
-use crate::config::{Config, ConfigError, ConfigViolation, ServerConfig, TableConfig};
+use crate::config::{self, Config, ConfigError, ConfigViolation, ServerConfig, TableConfig};
 use crate::error::{Error, Result};
 use crate::local::{ChunkRules, DataFileIdentity, LocalDir};
 use crate::memory::{self, MemoryLimit};
 use crate::row_cache::RowCache;
 use crate::storage::Storage;
-use crate::table::{self, CallsInFlight, FindingLog, Table, TableHandles};
+use crate::table::{self, FindingLog, Table, TableHandles};
 
 /// Everything a process opened: the storage every read goes through, the
 /// one row cache and one page cache every table shares, the local
@@ -47,8 +47,9 @@ pub struct Opened {
     /// The server settings the budget was resolved under, which a reload
     /// cannot change (RFD 018).
     server: ServerConfig,
-    /// The memory limit read when the caches opened: `fit_caches` resolves
-    /// under it, so the whole budget stays the one the server started with.
+    /// The memory limit read when the caches opened: `check_split`
+    /// resolves under it, so the whole budget stays the one the server
+    /// started with.
     limit: Option<MemoryLimit>,
     /// The local directory (RFD 017), when `storage.local` is set.
     pub local: Option<Arc<LocalDir>>,
@@ -252,38 +253,23 @@ impl Opened {
         &self,
         tables: &[TableConfig],
     ) -> std::result::Result<Budget, ConfigViolation> {
-        self.split(tables.iter().any(TableConfig::row_cache))
+        resolve_split(&self.server, self.limit, config::reads_rows(tables))
     }
 
-    /// The budget under the settings and the memory limit the caches
-    /// opened with, with the row cache's part when `rows_read`.
-    fn split(&self, rows_read: bool) -> std::result::Result<Budget, ConfigViolation> {
-        budget::resolve(&self.server, self.limit, rows_read, cache::memory_shards())
-    }
-
-    /// Resizes the row cache and the page cache's memory level to the split
-    /// the tables served now call for (RFD 028): the budget resolved under
-    /// the settings and the memory limit the caches opened with, so its
-    /// whole is unchanged, with the row cache's part when a table served
-    /// reads through it and none otherwise. Nothing changes when the row
-    /// part is as it was. The cache that shrinks is resized first, so the
-    /// two never hold more than the whole between the resizes, and a resize
-    /// blocks until its evictions are done. A new page part under the
-    /// minimum for the page cache's shards is `Error::Config` with
-    /// `ConfigViolation::PageCacheTooSmall` and changes nothing, which the
-    /// tables a reload checked with `check_split` never meet; a failure
-    /// of the page cache's level is `CacheError::Backend`, after a row
-    /// cache that shrinks has shrunk, and leaves the split recorded as it
-    /// was, so the next call resizes again. The serve loop
-    /// calls it after every reload that applied, and the split is logged
-    /// as `cache budget` when it changes.
-    pub fn fit_caches(&self) -> Result<()> {
-        let rows_read = self.tables().iter().any(|table| table.config().row_cache());
-        let next = self
-            .split(rows_read)
-            .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
+    /// Resizes the row cache and the page cache's memory level to `next`,
+    /// the split `check_split` returned for the tables served now (RFD
+    /// 028), whose whole is the one the caches opened with. Nothing
+    /// changes when `next` is the split recorded. The cache that shrinks is
+    /// resized first, so the two never hold more than the whole between
+    /// the resizes, and a resize blocks until its evictions are done. A
+    /// failure of the page cache's level is `CacheError::Backend`, after a
+    /// row cache that shrinks has shrunk, and leaves the split recorded as
+    /// it was, so the next call resizes again. The serve loop calls it
+    /// after every reload that applied, and the split is logged as `cache
+    /// budget` when it changes.
+    pub fn fit_caches(&self, next: Budget) -> Result<()> {
         let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
-        if next.row_bytes == budget.row_bytes {
+        if next == *budget {
             return Ok(());
         }
         if next.row_bytes < budget.row_bytes {
@@ -534,8 +520,7 @@ pub async fn open_with(
     findings: FindingLog,
 ) -> Result<Opened> {
     let limit = memory::limit();
-    let shards = cache::memory_shards();
-    let budget = budget::resolve(&config.server, limit, config.reads_rows(), shards)
+    let budget = resolve_split(&config.server, limit, config.reads_rows())
         .map_err(|violation| Error::Config(ConfigError::Invalid(violation)))?;
     log_budget(&budget, limit);
     let local = match &config.storage.local {
@@ -548,17 +533,14 @@ pub async fn open_with(
     )
     .await?;
     let row_cache = RowCache::new(budget.row_bytes);
-    let handles = TableHandles {
-        storage: Arc::clone(&storage),
-        cache: cache.clone(),
-        row_cache: Some(row_cache.clone()),
-        local: local.clone(),
-        calls: CallsInFlight::new(),
+    let handles = TableHandles::new(
+        &config.server,
+        Arc::clone(&storage),
+        cache.clone(),
+        Some(row_cache.clone()),
+        local.clone(),
         findings,
-        batch_fan_out: config.server.batch_fan_out,
-        max_multi_scan_values: config.server.max_multi_scan_values,
-        max_scan_bytes: config.server.max_scan_bytes,
-    };
+    );
     let deadlines = Deadlines {
         load: config.server.load_deadline,
         refresh: config.server.refresh_deadline,
@@ -593,6 +575,17 @@ pub async fn open_with(
         deadlines,
         complete,
     })
+}
+
+/// The split `server` sets under the memory `limit` (`budget::resolve`),
+/// with the row cache's part when `rows_read`, for page caches split into
+/// the shards a cache has on the calling runtime.
+fn resolve_split(
+    server: &ServerConfig,
+    limit: Option<MemoryLimit>,
+    rows_read: bool,
+) -> std::result::Result<Budget, ConfigViolation> {
+    budget::resolve(server, limit, rows_read, cache::memory_shards())
 }
 
 /// Logs `budget`, resolved under the memory `limit`, as `cache budget`.
@@ -980,8 +973,10 @@ mod tests {
         assert!(before.row_bytes > 0, "the key-value table reads rows");
         assert!(row_cache_keeps_a_value(&opened));
 
-        opened.apply(&[pages_alone(first)]).await.unwrap();
-        opened.fit_caches().unwrap();
+        let tables = [pages_alone(first)];
+        let split = opened.check_split(&tables).unwrap();
+        opened.apply(&tables).await.unwrap();
+        opened.fit_caches(split).unwrap();
         assert_eq!(
             opened.budget(),
             budget::Budget {
@@ -1011,8 +1006,10 @@ mod tests {
         assert_eq!(opened.budget().row_bytes, 0);
         assert!(!row_cache_keeps_a_value(&opened));
 
-        opened.apply(&[first]).await.unwrap();
-        opened.fit_caches().unwrap();
+        let tables = [first];
+        let split = opened.check_split(&tables).unwrap();
+        opened.apply(&tables).await.unwrap();
+        opened.fit_caches(split).unwrap();
         let shards = cache::memory_shards();
         assert_eq!(
             opened.budget(),
