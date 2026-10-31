@@ -299,10 +299,10 @@ enum Scenario {
     /// key under one fan-out. Protobuf tables only.
     #[value(name = "multi-get-100-cold-both")]
     MultiGet100ColdBoth,
-    /// A Scan of one key's whole run, newest first, whose pages the scan
+    /// A Scan of one key's whole run, newest first, whose pages the page
     /// cache holds. Ordered table only.
     ScanWarm,
-    /// A Scan of one key's whole run through the `COLD_CACHE_BYTES` scan
+    /// A Scan of one key's whole run through the `COLD_CACHE_BYTES` page
     /// cache, which holds almost none of the table's pages. Ordered table
     /// only.
     ScanCold,
@@ -421,7 +421,7 @@ impl Scenario {
 struct Traits {
     /// The scenario's name in the results.
     name: &'static str,
-    /// The page cache it measures.
+    /// The cache budget it measures.
     cache: Cache,
     /// Whether `lookups` measures it, per table and tier; the others are
     /// loads, refreshes, and the scenarios of two tables, which `main`
@@ -439,13 +439,15 @@ struct Traits {
     table: Option<TableName>,
 }
 
-/// The page cache a scenario measures.
+/// The cache budget a scenario measures, split between the row cache and
+/// the page cache as a server splits it (`stack`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cache {
-    /// One primed to hold every value page, which the table's must fit.
+    /// The `WARM_CACHE_BYTES` budget, primed to hold every value, which
+    /// the table's must fit.
     Warm,
-    /// The `COLD_CACHE_BYTES` caches, which hold almost none of the
-    /// table's value pages.
+    /// The `COLD_CACHE_BYTES` budget, which holds almost none of the
+    /// table's values.
     Cold,
     /// None it depends on: a miss, served warm, reads no value page, and a
     /// load or a refresh reads none through it.
@@ -1777,8 +1779,8 @@ const WARM_CACHE_BYTES: usize = 1 << 30;
 
 /// The cache budget of the cold-hit scenario: one mebibyte, about ten of
 /// a table's two thousand value pages, so nearly every uniformly random
-/// hit misses both caches, reads its page from the file, and decodes it. The run
-/// reports the page fetches it measured per lookup.
+/// hit misses both caches, reads its page from the file, and decodes it.
+/// The run reports the page fetches it measured per lookup.
 const COLD_CACHE_BYTES: usize = 1 << 20;
 
 /// One table served over storage of its own, so its counters are its own,

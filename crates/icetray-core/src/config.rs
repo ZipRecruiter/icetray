@@ -85,9 +85,9 @@ pub const FALLBACK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_ROW_CACHE_SHARE: f64 = 0.9;
 
 /// The page cache shards `Config::parse` checks a set `server.cache_bytes`
-/// against: one, the fewest a cache has on any
-/// machine, since the worker count that sets the real number is not known
-/// until the cache opens on a runtime (`budget::resolve`).
+/// against: one, the fewest a cache has on any machine, since the worker
+/// count that sets the real number is not known until the caches open on
+/// a runtime, where `open_with` supplies it (`budget::resolve`).
 const PARSE_CACHE_SHARDS: usize = 1;
 
 /// `strict` when a table says nothing: off. No table is refused for its
@@ -571,14 +571,14 @@ pub enum ConfigViolation {
         residency: Residency,
     },
     /// The memory budget of the page cache, its memory level's part of
-    /// `cache_bytes`, cannot hold one value page
-    /// in every shard of its memory level, so the cache would keep a page
-    /// per shard however small the budget, and the budget would bound
-    /// nothing (`cache::min_memory_bytes`). `Config::parse` checks a set
-    /// budget against one shard, the least any cache has; opening the
-    /// caches checks it against the shards they have on the runtime they
-    /// open on, one per worker thread rounded up to a power of two, and
-    /// checks a budget derived from the memory limit only then.
+    /// `cache_bytes`, cannot hold one value page in every shard of its
+    /// memory level, so the cache would keep a page per shard however small
+    /// the budget, and the budget would bound nothing
+    /// (`cache::min_memory_bytes`). `Config::parse` checks a set budget
+    /// against one shard, the least any cache has; opening the caches
+    /// checks it against the shards they have on the runtime they open on,
+    /// one per worker thread rounded up to a power of two, and checks a
+    /// budget derived from the memory limit only then.
     #[error("{}", page_cache_too_small(*bytes, *minimum, *shards, *limit))]
     PageCacheTooSmall {
         /// The budget.

@@ -336,12 +336,13 @@ impl Scrape {
 
     /// Writes every series a scrape reads as it stands: each table's lookup
     /// counts (`Table::publish_lookup_counts`) and gauges
-    /// (`Table::publish_gauges`), the page caches' hit counts and bytes, the
-    /// row cache's hits, misses, and bytes, the cache
-    /// budget's shortfall, the in-flight gauges from the slots, `config_pending`, and the sampled
-    /// gauges (`sample`). The counts are published so a scrape reads every
-    /// lookup answered and every page hit before it; the gauges are written
-    /// so the recorder keeps them (`GAUGE_IDLE_TIMEOUT`).
+    /// (`Table::publish_gauges`), the page cache's hit counts and bytes,
+    /// the row cache's hits, misses, and bytes, the cache budget's
+    /// shortfall, the in-flight gauges from the slots, `config_pending`,
+    /// and the sampled gauges (`sample`). The counts are published so a
+    /// scrape reads every lookup answered and every page and row hit before
+    /// it; the gauges are written so the recorder keeps them
+    /// (`GAUGE_IDLE_TIMEOUT`).
     fn publish(&self) {
         let tables = self.opened.tables();
         for table in tables.iter() {

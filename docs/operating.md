@@ -165,7 +165,7 @@ Gauges, written at each scrape:
 | `icetray_index_bytes` | `table` | The resident index's live bytes. |
 | `icetray_page_cache_bytes` | | Bytes the page cache's memory level holds after evictions, against its part of `server.cache_bytes`. |
 | `icetray_row_cache_bytes` | | Bytes the row cache holds after evictions: each entry's value at its allocation size plus the per-entry overhead. It stays about a sixteenth below the row cache's part of the budget, which is reserved for the keys of rows evicted recently, so a row read again soon after its eviction is kept longer. |
-| `icetray_cache_budget_shortfall_bytes` | | Bytes by which the cache budget, with the resident indexes of the tables served and the largest of them once more, and a third of that sum, overruns the memory limit; 0 when they fit, and when no limit can be read. icetray measures it once the tables first serve and after every reload that applies. A value above 0 means the limit is too low for the budget or the tables ([Memory](#memory)). |
+| `icetray_cache_budget_shortfall_bytes` | | Bytes by which the cache budget, with the resident indexes of the tables served and the largest of them once more, and a third of that sum, overruns the memory limit; 0 when they fit, and when no limit can be read. icetray measures it once the tables first serve and after every reload that applies, not on a refresh. A value above 0 means the limit is too low for the budget or the tables ([Memory](#memory)). |
 | `icetray_config_pending` | | 1 while the configuration file differs from the configuration applied, else 0. |
 | `icetray_process_rss_bytes` | | The process's resident set size. |
 | `icetray_allocator_allocated_bytes`, `_active_bytes`, `_metadata_bytes`, `_resident_bytes`, `_retained_bytes` | | jemalloc's own counts, which split the resident set. `allocated` is live data; `active` minus `allocated` is free space inside pages in use; `resident` minus `active` and `metadata` is freed memory not yet returned to the operating system; `retained` is address space only. |
@@ -577,10 +577,10 @@ restart ([RFD 018](rfd/018-configuration-reload.md)).
   validation (a file that lists no table fails it), when the caches'
   split for its tables is one a start with it would refuse, or when any
   setting outside `[[tables]]` changed, since those apply only on
-  restart. icetray
-  logs the refusal as `configuration reload refused` and counts it, and
-  `icetray_config_pending` reads 1 until the file matches the applied
-  configuration. The refusal's `reason` names what to fix:
+  restart. icetray logs the refusal as `configuration reload refused`
+  and counts it, and `icetray_config_pending` reads 1 until the file
+  matches the applied configuration. The refusal's `reason` names what
+  to fix:
   - for a file that does not parse or fails validation, the error, naming
     the file and the setting by its full path;
   - for a restart-only change, the setting, as in
@@ -706,23 +706,27 @@ through settings, mounted files, and environment variables.
   the indexes and the largest table's once more. With `cache_bytes` set,
   it may be at most three quarters of the limit less those indexes. The
   `icetray_allocator_*` gauges show how much of the resident set the
-  allocator accounts for. To judge whether the budget suits a table, compare
-  the doctor's `value_columns[].value_bytes`, each column's uncompressed
-  bytes in the snapshot, with the budget: a table whose hot rows are a small
-  share of those bytes fits a small budget, and one that is read evenly wants
-  the budget near their sum.
-- Once the tables serve, and after every reload that applies, icetray
-  applies that rule to itself: it adds each table's resident index bytes
-  (`icetray_index_bytes`), the largest once more, and the cache budget, adds
-  a third of the sum, and compares it with the memory limit, which is the
-  smaller of the container's cgroup limit and the host's memory. When the
-  limit is lower, icetray logs a warning with `needed`, `limit`,
-  `limit_source` (`cgroup` or `host`), and `missing_bytes`, and sets
-  `icetray_cache_budget_shortfall_bytes` to the bytes missing; the gauge
-  reads 0 when the budget fits, and when no limit can be read. It is a
-  warning and not a refusal, since it depends on the replica's memory,
-  which the doctor does not see. Raise the limit, or lower
-  `server.cache_bytes`; a reload measures it again.
+  allocator accounts for. To judge whether the budget suits a table,
+  compare the doctor's `value_columns[].value_bytes`, each column
+  chunk's uncompressed bytes in the snapshot with its page headers and a
+  dictionary page's compressed extent, with the row cache's share of
+  `cache_bytes`, which every table the server serves shares: a table
+  whose hot rows are a small share of those bytes fits a small budget,
+  and one that is read evenly wants the budget near their sum.
+- Once the tables first serve, and after every reload that applies,
+  icetray applies that rule to itself: it adds each table's resident
+  index bytes (`icetray_index_bytes`), the largest once more, and the
+  cache budget, adds a third of the sum, and compares it with the memory
+  limit, which is the smaller of the container's cgroup limit and the
+  host's memory. When the limit is lower, icetray logs a warning with
+  `needed`, `limit`, `limit_source` (`cgroup` or `host`), and
+  `missing_bytes`, and sets `icetray_cache_budget_shortfall_bytes` to the
+  bytes missing; the gauge reads 0 when the budget fits, and when no
+  limit can be read. A refresh does not measure it again, so an index
+  that grows with its table's snapshots shows in the gauge at the next
+  applied reload or restart. It is a warning and not a refusal, since it
+  depends on the replica's memory, which the doctor does not see. Raise
+  the limit, or lower `server.cache_bytes`; a reload measures it again.
 - `server.max_scan_bytes` bounds the response a `Scan` or `MultiScan`
   sends, not what the call holds while it reads. Each file that holds
   the key reads up to the limit's rows of every requested column before

@@ -121,20 +121,20 @@ client's.
 
 icetray sizes the caches as they open at start, and logs the result
 ([Operating icetray](operating.md#logs)). A key-value table reads
-through the row cache unless it sets `row_cache = false`, so on a server
-that serves one that does, the row cache holds `row_cache_share` of
-`cache_bytes`; on a server where no table does, the page cache holds all
-of it. A reload that changes whether any table served reads through the
-row cache resizes both caches to match, within the same `cache_bytes`;
-any other change to either setting applies on restart. The default follows the memory
-limit rather than the memory free, so every start of a replica gets the
-same budget, and the other half of the limit holds the resident indexes,
-a second generation while a refresh loads, and requests in flight
-([Memory](operating.md#memory)); icetray checks the budget and the
-indexes against the limit once the tables serve, and warns when they do
-not fit. The row cache splits into shards that
-each hold their share of its part, so a part below one 64 KiB value per
-shard caches only smaller values.
+through the row cache unless it sets `row_cache = false`. When at least
+one table the server serves reads through the row cache, the row cache
+holds `row_cache_share` of `cache_bytes`; when none does, the page cache
+holds all of it. A reload that changes whether any table served reads
+through the row cache resizes both caches to match, within the same
+`cache_bytes`; any other change to either setting applies on restart.
+The default follows the memory limit rather than the memory free, so
+every start of a replica gets the same budget, and the other half of the
+limit holds the resident indexes, a second generation while a refresh
+loads, and requests in flight ([Memory](operating.md#memory)); icetray
+checks the budget and the indexes against the limit once the tables
+serve, and warns when they do not fit. The row cache splits into shards
+that each hold their share of its part, so a part below one 64 KiB value
+per shard caches only smaller values.
 
 The page cache has one shard per tokio worker thread, rounded up to a
 power of two, and each shard must hold one 64 KiB value page plus its
@@ -150,8 +150,8 @@ it was read. A file that still sets the removed `page_cache_bytes` or
 The worker count is the number of cores the process sees, unless
 `TOKIO_WORKER_THREADS` sets it.
 
-A server with no page-cache disk level, which is `storage.local` with a
-`page_cache_disk_bytes` above zero, that serves a table reading through
+A server without a page-cache disk level (one is `storage.local` with a
+`page_cache_disk_bytes` above zero) that serves a table reading through
 the row cache beside tables reading pages alone, ordered tables or
 key-value tables with `row_cache = false`, must set `row_cache_share`.
 Those tables' pages live in the page cache's memory level alone, and no
@@ -856,7 +856,7 @@ One per table, from `info` and from `doctor`:
 | `value_columns[].level` | The level a lookup requesting the column achieves, as `icetray_table_column_level` reports it. |
 | `value_columns[].gets_per_hit` | The value-page GETs a cold hit spends on the column alone, 1, or 2 when a file dictionary-encodes it, as `icetray_table_column_gets_per_hit` reports it. A request's cold cost is `lookup_cost.gets_per_miss` plus the figures of the columns it requests. On an ordered table, the GETs a cold `Scan` spends on the column's span, which `order.gets_per_scan` sums over the configured columns. |
 | `value_columns[].files_predating_column` | Data files written before the column was added, for which a lookup returns the column's default. |
-| `value_columns[].value_bytes` | The column's uncompressed bytes in the snapshot, summed over the data files from their footers; a file written before the column was added contributes none. The same bytes `value_columns[].avg_value_bytes` of `doctor --files` divides by each file's rows. Compare it with `server.cache_bytes` to see how much of the column the cache budget could hold. |
+| `value_columns[].value_bytes` | The column chunks' uncompressed bytes in the snapshot, as each data file's footer records them, page headers and a dictionary page's compressed extent included, summed over the files; a file written before the column was added contributes none. The same bytes `value_columns[].avg_value_bytes` of `doctor --files` divides by each file's rows. Compare it with the row cache's share of `server.cache_bytes`, which every table the server serves shares, to see how much of the column the budget could hold. |
 | `deletes.rows` | Rows the snapshot's deletes remove from the data files it holds, as `icetray_table_deleted_rows` reports it while the snapshot serves. |
 | `deletes.files` | Position delete files and deletion vectors whose rows the load applied, as `icetray_table_delete_files` reports it. |
 | `deletes.fraction` | `deletes.rows` over `records`, as `icetray_table_deleted_fraction` reports it. |

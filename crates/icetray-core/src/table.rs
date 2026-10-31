@@ -1542,12 +1542,12 @@ impl Table {
     /// field list out of range or with a number named twice, whatever the
     /// table holds; `Error::WrongTableKind` on an ordered table, which
     /// `scan` serves (RFD 025), whether or not it has loaded;
-    /// `Error::NotReady` with no
-    /// generation; `Error::KeyType` for a key of another type than the
-    /// table's; and `Error::ColumnRequest` for a column the generation does
-    /// not serve or a field list the entry's format for it does not take
-    /// (`TableLayout::select`). `Error::MalformedValue` for a value that is
-    /// not the protobuf its column declares, when its read names fields.
+    /// `Error::NotReady` with no generation; `Error::KeyType` for a key of
+    /// another type than the table's; and `Error::ColumnRequest` for a
+    /// column the generation does not serve or a field list the entry's
+    /// format for it does not take (`TableLayout::select`).
+    /// `Error::MalformedValue` for a value that is not the protobuf its
+    /// column declares, when its read names fields.
     pub async fn get(&self, key: &Key, columns: &[ColumnRead<'_>]) -> Result<Lookup> {
         let _in_flight = self.lookups.enter();
         let columns = check_column_reads(&self.name, columns)?;

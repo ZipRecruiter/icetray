@@ -66,16 +66,16 @@ pub(crate) struct FileRows {
 }
 
 /// Where a run's pages come from beyond what the tier holds (RFD 025,
-/// Caching and hedging): the Scan cache, through which every GET of a
-/// page goes; the fan-out a GET holds one permit of while it runs; the
-/// table's span hedge window, which span GETs are hedged in; and the
-/// counters a GET counts in as it is issued, each value column's at its
-/// position in the layout and the order column's. A Bloom-tier key page is
-/// fetched through the cache under the file's lookup window and counted
-/// nowhere.
+/// Caching and hedging; RFD 027): the page cache every table shares,
+/// through which every GET of a page goes; the fan-out a GET holds one
+/// permit of while it runs; the table's span hedge window, which span
+/// GETs are hedged in; and the counters a GET counts in as it is issued,
+/// each value column's at its position in the layout and the order
+/// column's. A Bloom-tier key page is fetched through the cache under the
+/// file's lookup window and counted nowhere.
 #[derive(Clone, Copy)]
 pub(crate) struct RunSource<'a> {
-    /// The Scan cache.
+    /// The page cache every table shares.
     pub(crate) cache: &'a PageCache,
     /// The Scan's fan-out (`TableHandles::batch_fan_out`); `None` bounds
     /// nothing.
@@ -274,7 +274,7 @@ impl FileIndex {
     /// no GET, they place its rows exactly before the round (`known`):
     /// under Disk every order page the walk could need is read from the
     /// chunk file first, and otherwise a page that holds a bound is decoded
-    /// from the Scan cache where memory holds it and its chunk's dictionary
+    /// from the page cache where memory holds it and its chunk's dictionary
     /// page. Rows a known order value places outside are passed over, and
     /// the values read are then those of the rows taken alone. Then, in one
     /// round, every order page over the rows taken up whose values are not
@@ -477,15 +477,15 @@ impl FileIndex {
     }
 
     /// The order values a read knows before its round: none where `placed`,
-    /// the walk in `direction` the fences alone place, takes up no row on a page that
-    /// holds a bound, since every row it takes up is then placed; under
-    /// Disk, those of every row `placed` takes up, read from the chunk
-    /// file, which cover every row a walk with them takes up, since such a
-    /// walk counts at least as many rows inside as `placed` at every step
-    /// and so stops no later; otherwise those of each piece of a page that
-    /// holds a bound which `placed` takes up a row of, where the Scan cache
-    /// holds the page and its chunk's dictionary page in memory, read with
-    /// no GET (`cached_pages`).
+    /// the walk in `direction` the fences alone place, takes up no row on a
+    /// page that holds a bound, since every row it takes up is then placed;
+    /// under Disk, those of every row `placed` takes up, read from the
+    /// chunk file, which cover every row a walk with them takes up, since
+    /// such a walk counts at least as many rows inside as `placed` at every
+    /// step and so stops no later; otherwise those of each piece of a page
+    /// that holds a bound which `placed` takes up a row of, where the page
+    /// cache holds the page and its chunk's dictionary page in memory, read
+    /// with no GET (`cached_pages`).
     async fn known(
         &self,
         order: OrderLeaf,
@@ -741,7 +741,7 @@ impl FileIndex {
     }
 
     /// Data pages `pages` of `chunk` and its dictionary page when it has
-    /// one, as the bytes they decode from, when the Scan cache holds every
+    /// one, as the bytes they decode from, when the page cache holds every
     /// one of them in memory; `None` otherwise, with nothing fetched or
     /// claimed (`PageCache::held_span`).
     fn cached_pages(
@@ -1372,7 +1372,7 @@ mod tests {
             .unwrap()
     }
 
-    /// What a read runs through: a fresh Scan cache and span window.
+    /// What a read runs through: a fresh page cache and span window.
     struct Reads {
         cache: PageCache,
         window: HedgeWindow,
@@ -3334,7 +3334,7 @@ mod tests {
         );
     }
 
-    /// Fresh reads whose Scan cache holds order page `page` of `index`, as
+    /// Fresh reads whose page cache holds order page `page` of `index`, as
     /// a Scan that read it leaves it.
     async fn reads_holding(index: &FileIndex, (row_group, page): PageAt) -> Reads {
         let reads = Reads::new().await;
@@ -3352,7 +3352,7 @@ mod tests {
         reads
     }
 
-    /// The Scan cache holds an order page beside a bound's when a Scan
+    /// The page cache holds an order page beside a bound's when a Scan
     /// pages through a run by order value: with it in memory, a read places
     /// the bound exactly before its round and reads the value pages the rows
     /// taken lie on, where on a cold cache the limit's rows shifted past the
