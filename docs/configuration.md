@@ -130,7 +130,9 @@ any other change to either setting applies on restart. The default follows the m
 limit rather than the memory free, so every start of a replica gets the
 same budget, and the other half of the limit holds the resident indexes,
 a second generation while a refresh loads, and requests in flight
-([Memory](operating.md#memory)). The row cache splits into shards that
+([Memory](operating.md#memory)); icetray checks the budget and the
+indexes against the limit once the tables serve, and warns when they do
+not fit. The row cache splits into shards that
 each hold their share of its part, so a part below one 64 KiB value per
 shard caches only smaller values.
 

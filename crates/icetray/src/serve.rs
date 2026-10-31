@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
+use icetray_core::budget::Shortfall;
 use icetray_core::config::{Config, Residency, ServerConfig};
 use icetray_core::memory::{self, MemoryLimit};
 use icetray_core::open::open_with;
@@ -520,6 +521,7 @@ impl Run {
 
         retain(&self.opened).await;
         warn_memory_room(&self.opened);
+        check_budget(&self.opened);
         set_health(&self.health, ServingStatus::Serving).await;
         self.ready.send_modify(|ready| *ready = true);
 
@@ -553,6 +555,7 @@ impl Run {
                         periodic.spawn_refresh(table, &self.opened, self.poll_interval);
                     }
                     fit_caches(&self.opened);
+                    check_budget(&self.opened);
                     tokio::select! {
                         () = retain(&self.opened) => {}
                         () = stop(self.shutdown.subscribe()) => break None,
@@ -730,8 +733,11 @@ enum Room {
     Fits,
     /// It does not.
     Short {
-        /// The bytes needed.
+        /// The bytes needed: the kernel's page cache's, and the part of the
+        /// cache budget not yet filled.
         needed: u64,
+        /// The part of `needed` that is the cache budget not yet filled.
+        unfilled: u64,
         /// The limit compared with.
         limit: MemoryLimit,
         /// The resident set beside it.
@@ -741,11 +747,14 @@ enum Room {
     },
 }
 
-/// Whether `needed` bytes of page cache fit under the memory limit `limit`
-/// reads beside the resident set `rss` reads. Neither is read when nothing
-/// is needed.
+/// Whether `needed` bytes of page cache, and the `unfilled` part of the
+/// cache budget, fit under the memory limit `limit` reads beside the
+/// resident set `rss` reads. The resident set holds what the caches have
+/// filled, so the budget counts as what it will hold once filled (RFD 028).
+/// Neither is read when no page cache is needed.
 fn room(
     needed: u64,
+    unfilled: u64,
     limit: impl FnOnce() -> Option<MemoryLimit>,
     rss: impl FnOnce() -> Option<u64>,
 ) -> Room {
@@ -755,9 +764,11 @@ fn room(
     let (Some(limit), Some(rss)) = (limit(), rss()) else {
         return Room::Unknown { needed };
     };
+    let needed = needed.saturating_add(unfilled);
     match memory::shortfall(needed, limit.bytes, rss) {
         Some(missing_bytes) => Room::Short {
             needed,
+            unfilled,
             limit,
             rss,
             missing_bytes,
@@ -768,8 +779,10 @@ fn room(
 
 /// Warns when the page cache's disk level and the chunk files of every
 /// table served, each counted once (`Opened::page_cache_needed_bytes`),
-/// need more of the kernel's page cache than the memory limit leaves
-/// beside the process's resident set (RFD 020), so an undersized
+/// and the part of the cache budget not yet filled
+/// (`Opened::unfilled_cache_bytes`), need more of the kernel's page cache
+/// than the memory limit leaves beside the process's resident set (RFD
+/// 020, RFD 028), so an undersized
 /// deployment is told at start, before a sample finds its `disk` tables
 /// short of the page cache. The run calls it once the first loads have
 /// served and retention has run, and after a reload that started a `disk`
@@ -779,7 +792,13 @@ fn room(
 /// a limit to compare, nothing is checked, and that is logged at debug.
 fn warn_memory_room(opened: &Opened) {
     let rss = || memory_stats::memory_stats().map(|stats| approx::count(stats.physical_mem));
-    match room(opened.page_cache_needed_bytes(), memory::limit, rss) {
+    let room = room(
+        opened.page_cache_needed_bytes(),
+        opened.unfilled_cache_bytes(),
+        memory::limit,
+        rss,
+    );
+    match room {
         Room::NotNeeded | Room::Fits => {}
         Room::Unknown { needed } => tracing::debug!(
             needed,
@@ -787,11 +806,13 @@ fn warn_memory_room(opened: &Opened) {
         ),
         Room::Short {
             needed,
+            unfilled,
             limit,
             rss,
             missing_bytes,
         } => tracing::warn!(
             needed,
+            unfilled_budget_bytes = unfilled,
             limit = limit.bytes,
             limit_source = %limit.of,
             rss,
@@ -799,6 +820,94 @@ fn warn_memory_room(opened: &Opened) {
             "the chunk files and the page cache's disk level need more page cache than the memory limit leaves beside the process"
         ),
     }
+}
+
+/// What the check of the cache budget against the memory limit found
+/// (`budget_room`).
+#[derive(Debug, PartialEq, Eq)]
+enum BudgetRoom {
+    /// No memory limit can be read to compare with.
+    Unknown,
+    /// The budget and the indexes fit.
+    Fits,
+    /// They do not.
+    Short {
+        /// The bytes the limit would have to be: its own and what is
+        /// missing.
+        needed: u64,
+        /// The limit compared with.
+        limit: MemoryLimit,
+        /// What exceeds it.
+        missing_bytes: u64,
+    },
+}
+
+impl BudgetRoom {
+    /// The bytes missing, zero when the budget fits or nothing can be
+    /// compared with.
+    fn missing_bytes(&self) -> u64 {
+        match self {
+            Self::Unknown | Self::Fits => 0,
+            Self::Short { missing_bytes, .. } => *missing_bytes,
+        }
+    }
+}
+
+/// Whether a cache budget of `budget` bytes and tables whose resident
+/// indexes are `indexes`, one entry each, fit under `limit`
+/// (`memory::budget_shortfall`).
+fn budget_room(indexes: &[u64], budget: u64, limit: Option<MemoryLimit>) -> BudgetRoom {
+    let Some(limit) = limit else {
+        return BudgetRoom::Unknown;
+    };
+    match memory::budget_shortfall(indexes, budget, limit.bytes) {
+        Some(missing_bytes) => BudgetRoom::Short {
+            needed: limit.bytes.saturating_add(missing_bytes),
+            limit,
+            missing_bytes,
+        },
+        None => BudgetRoom::Fits,
+    }
+}
+
+/// Records what `room` found missing in `shortfall`, which a scrape
+/// publishes as `cache_budget_shortfall_bytes` (zero when nothing is), and
+/// logs it: a warning on a shortfall, which is not a refusal, since it
+/// depends on the replica's memory, which the doctor does not see; a debug
+/// line when no limit can be read.
+fn settle_budget(shortfall: &Shortfall, room: &BudgetRoom) {
+    shortfall.record(room.missing_bytes());
+    match room {
+        BudgetRoom::Fits => {}
+        BudgetRoom::Unknown => {
+            tracing::debug!("no memory limit to check the cache budget against");
+        }
+        BudgetRoom::Short {
+            needed,
+            limit,
+            missing_bytes,
+        } => tracing::warn!(
+            needed,
+            limit = limit.bytes,
+            limit_source = %limit.of,
+            missing_bytes,
+            "the cache budget and the resident indexes of the tables served need more memory than the limit allows"
+        ),
+    }
+}
+
+/// Checks the cache budget and the resident indexes of the tables served
+/// against the memory limit (RFD 028) and records the result
+/// (`settle_budget`). The run calls it once the first loads have served
+/// and after every reload that applied, once the caches are resized to its
+/// tables, so the gauge measures what is served now.
+fn check_budget(opened: &Opened) {
+    let room = budget_room(
+        &opened.index_bytes(),
+        opened.budget().whole(),
+        memory::limit(),
+    );
+    settle_budget(&opened.shortfall, &room);
 }
 
 /// Whether a reload that swapped in `started` added a `disk` table, which
@@ -905,10 +1014,13 @@ async fn page_cache_loop(opened: Arc<Opened>) -> Infallible {
 
 #[cfg(test)]
 mod tests {
-    use icetray_core::budget;
+    use icetray_core::budget::{self, Shortfall};
     use icetray_core::config::{SourceConfig, StorageConfig, TableConfig};
     use icetray_core::memory::LimitSource;
+    use icetray_core::metric;
     use icetray_core::{CallsInFlight, PageCache, RowCache, TableHandles, TableSource};
+    use icetray_testkit::verify::series_value;
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use tokio::sync::oneshot;
 
     use super::*;
@@ -952,26 +1064,134 @@ mod tests {
     fn test_room_skips_nothing_needed_and_names_what_is_missing() {
         let unread_limit = || -> Option<MemoryLimit> { panic!("the limit was read") };
         let unread_rss = || -> Option<u64> { panic!("the resident set was read") };
-        assert_eq!(room(0, unread_limit, unread_rss), Room::NotNeeded);
+        assert_eq!(room(0, 0, unread_limit, unread_rss), Room::NotNeeded);
         let half = GIB.bytes / 2;
         assert_eq!(
-            room(half, || None, || Some(half)),
+            room(half, 0, || None, || Some(half)),
             Room::Unknown { needed: half }
         );
         assert_eq!(
-            room(half, || Some(GIB), || None),
+            room(half, 0, || Some(GIB), || None),
             Room::Unknown { needed: half }
         );
-        assert_eq!(room(half, || Some(GIB), || Some(half)), Room::Fits);
+        assert_eq!(room(half, 0, || Some(GIB), || Some(half)), Room::Fits);
         assert_eq!(
-            room(GIB.bytes, || Some(GIB), || Some(half)),
+            room(GIB.bytes, 0, || Some(GIB), || Some(half)),
             Room::Short {
                 needed: GIB.bytes,
+                unfilled: 0,
                 limit: GIB,
                 rss: half,
                 missing_bytes: half,
             }
         );
+    }
+
+    /// The resident set holds only what the caches have filled, so the
+    /// part of the budget they have not yet filled is needed beside it:
+    /// what fits without it is short with it, and a check of nothing
+    /// needed stays unneeded however much of the budget is unfilled.
+    #[test]
+    fn test_room_counts_the_budget_not_the_current_fill() {
+        let quarter = GIB.bytes / 4;
+        let half = GIB.bytes / 2;
+        assert_eq!(room(half, 0, || Some(GIB), || Some(half)), Room::Fits);
+        assert_eq!(
+            room(half, quarter, || Some(GIB), || Some(half)),
+            Room::Short {
+                needed: half + quarter,
+                unfilled: quarter,
+                limit: GIB,
+                rss: half,
+                missing_bytes: quarter,
+            }
+        );
+        assert_eq!(
+            room(0, quarter, || Some(GIB), || Some(half)),
+            Room::NotNeeded
+        );
+    }
+
+    /// Indexes of one and three gibibytes and a budget of four need
+    /// `44/3` GiB, which a limit of ten is short of by what exceeds it;
+    /// no limit read is no shortfall to name.
+    #[test]
+    fn test_budget_room_names_what_the_limit_is_short_of() {
+        let ten = MemoryLimit {
+            bytes: 10 * GIB.bytes,
+            of: LimitSource::Cgroup,
+        };
+        let indexes = [GIB.bytes, 3 * GIB.bytes];
+        let missing_bytes = 44 * GIB.bytes / 3 - ten.bytes;
+        assert_eq!(
+            budget_room(&indexes, 4 * GIB.bytes, Some(ten)),
+            BudgetRoom::Short {
+                needed: ten.bytes + missing_bytes,
+                limit: ten,
+                missing_bytes,
+            }
+        );
+        assert_eq!(
+            budget_room(&indexes, GIB.bytes / 4, Some(ten)),
+            BudgetRoom::Fits
+        );
+        assert_eq!(
+            budget_room(&indexes, 4 * GIB.bytes, None),
+            BudgetRoom::Unknown
+        );
+    }
+
+    /// The bits of the gauge `bytes` publishes as.
+    fn bits(bytes: u64) -> u64 {
+        approx::gauge(bytes).to_bits()
+    }
+
+    /// The bits of the gauge as a scrape publishes it, over a recorder of
+    /// the test's own: `None` when the exposition holds no such series.
+    fn published(shortfall: &Shortfall) -> Option<u64> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&recorder, || shortfall.publish());
+        series_value(
+            &recorder.handle().render(),
+            metric::CACHE_BUDGET_SHORTFALL_BYTES,
+            &[],
+        )
+        .map(f64::to_bits)
+    }
+
+    /// The gauge is exposed from the start, at zero, and stays zero when
+    /// the budget fits the limit or no limit can be read.
+    #[test]
+    fn test_the_gauge_reads_zero_when_the_budget_fits() {
+        let shortfall = Shortfall::default();
+        assert_eq!(
+            published(&shortfall),
+            Some(bits(0)),
+            "before the first check"
+        );
+        let limit = Some(GIB);
+        let fits = budget_room(&[GIB.bytes / 8], GIB.bytes / 4, limit);
+        settle_budget(&shortfall, &fits);
+        assert_eq!(published(&shortfall), Some(bits(0)));
+        settle_budget(&shortfall, &budget_room(&[GIB.bytes], GIB.bytes, None));
+        assert_eq!(published(&shortfall), Some(bits(0)));
+    }
+
+    /// A shortfall is the gauge's value and a warning's `missing_bytes`,
+    /// and a later check that fits reads zero again.
+    #[test]
+    fn test_the_gauge_reads_the_bytes_missing_and_a_warning_names_them() {
+        let shortfall = Shortfall::default();
+        let room = budget_room(&[GIB.bytes], GIB.bytes, Some(GIB));
+        let BudgetRoom::Short { missing_bytes, .. } = room else {
+            panic!("expected a shortfall, got {room:?}");
+        };
+        assert!(missing_bytes > 0);
+        settle_budget(&shortfall, &room);
+        assert_eq!(published(&shortfall), Some(bits(missing_bytes)));
+        let fits = budget_room(&[GIB.bytes / 8], GIB.bytes / 4, Some(GIB));
+        settle_budget(&shortfall, &fits);
+        assert_eq!(published(&shortfall), Some(bits(0)));
     }
 
     /// A table in `residency`, never loaded, over the default cache budget

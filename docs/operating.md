@@ -165,6 +165,7 @@ Gauges, written at each scrape:
 | `icetray_index_bytes` | `table` | The resident index's live bytes. |
 | `icetray_page_cache_bytes` | | Bytes the page cache's memory level holds after evictions, against its part of `server.cache_bytes`. |
 | `icetray_row_cache_bytes` | | Bytes the row cache holds after evictions: each entry's value at its allocation size plus the per-entry overhead. It stays about a sixteenth below the row cache's part of the budget, which is reserved for the keys of rows evicted recently, so a row read again soon after its eviction is kept longer. |
+| `icetray_cache_budget_shortfall_bytes` | | Bytes by which the cache budget, with the resident indexes of the tables served and the largest of them once more, and a third of that sum, overruns the memory limit; 0 when they fit, and when no limit can be read. icetray measures it once the tables first serve and after every reload that applies. A value above 0 means the limit is too low for the budget or the tables ([Memory](#memory)). |
 | `icetray_config_pending` | | 1 while the configuration file differs from the configuration applied, else 0. |
 | `icetray_process_rss_bytes` | | The process's resident set size. |
 | `icetray_allocator_allocated_bytes`, `_active_bytes`, `_metadata_bytes`, `_resident_bytes`, `_retained_bytes` | | jemalloc's own counts, which split the resident set. `allocated` is live data; `active` minus `allocated` is free space inside pages in use; `resident` minus `active` and `metadata` is freed memory not yet returned to the operating system; `retained` is address space only. |
@@ -297,6 +298,12 @@ Events worth knowing:
   ([Refresh and reload](#refresh-and-reload)). The
   budget is derived from the limit unless `server.cache_bytes` sets it
   ([Configuration](configuration.md#server)).
+- A warning, `the cache budget and the resident indexes of the tables
+  served need more memory than the limit allows`, with `needed`, `limit`,
+  `limit_source` (`cgroup` or `host`), and `missing_bytes`, once the
+  tables first serve and after a reload that applies, while
+  `icetray_cache_budget_shortfall_bytes` is above 0
+  ([Memory](#memory)).
 - `listening`, with both addresses and the table count; then
   `table serving` for each table as its first load completes.
 - `swapped in a generation`, with the snapshot id and the files reused,
@@ -684,16 +691,34 @@ through settings, mounted files, and environment variables.
 
 ### Memory
 
-- Run each replica under a container memory limit. Size it as the sum,
-  over the tables the replica serves, of the doctor's `predicted` bytes
-  for each table's residency (`predicted.full`, `predicted.disk_memory`,
-  or `predicted.bloom`), doubled for a table a refresh can rewrite
-  wholesale or a reload can change; plus `server.cache_bytes`, half the
-  limit when unset; plus a
-  third of that total for the process, requests in flight, a load's
-  transient chunks, and the allocator's fragmentation and bookkeeping. The
+- Run each replica under a container memory limit, and set the limit
+  first: the cache budget follows it, half of it unless
+  `server.cache_bytes` sets it ([Configuration](configuration.md#server)).
+  The limit has to hold the resident indexes of the tables the replica
+  serves, which are the sum, over its tables, of the doctor's `predicted`
+  bytes for each table's residency (`predicted.full`,
+  `predicted.disk_memory`, or `predicted.bloom`); the largest table's
+  once more, since a refresh that rewrites it wholesale loads its next
+  generation beside it; the cache budget; and a third of that total for
+  the process, requests in flight, a load's transient chunks, and the
+  allocator's fragmentation and bookkeeping. With the default budget the
+  condition reads as a rule of thumb: the limit is at least four times
+  the indexes and the largest table's once more. With `cache_bytes` set,
+  it may be at most three quarters of the limit less those indexes. The
   `icetray_allocator_*` gauges show how much of the resident set the
   allocator accounts for.
+- Once the tables serve, and after every reload that applies, icetray
+  applies that rule to itself: it adds each table's resident index bytes
+  (`icetray_index_bytes`), the largest once more, and the cache budget, adds
+  a third of the sum, and compares it with the memory limit, which is the
+  smaller of the container's cgroup limit and the host's memory. When the
+  limit is lower, icetray logs a warning with `needed`, `limit`,
+  `limit_source` (`cgroup` or `host`), and `missing_bytes`, and sets
+  `icetray_cache_budget_shortfall_bytes` to the bytes missing; the gauge
+  reads 0 when the budget fits, and when no limit can be read. It is a
+  warning and not a refusal, since it depends on the replica's memory,
+  which the doctor does not see. Raise the limit, or lower
+  `server.cache_bytes`; a reload measures it again.
 - `server.max_scan_bytes` bounds the response a `Scan` or `MultiScan`
   sends, not what the call holds while it reads. Each file that holds
   the key reads up to the limit's rows of every requested column before
@@ -721,10 +746,13 @@ through settings, mounted files, and environment variables.
   kernel's page cache needs to hold: every `disk` table's chunk files,
   each file counted once however many tables read it, plus
   `storage.local.page_cache_disk_bytes`, whose files the kernel caches
-  too. The limit is the smaller of the container's cgroup limit, read
+  too, plus the part of the cache budget the caches have not yet filled,
+  since the resident set holds only what they have filled so far. The
+  limit is the smaller of the container's cgroup limit, read
   from cgroup v2's `memory.max` or v1's `memory.limit_in_bytes`, and the
   host's memory. On a shortfall icetray logs a warning with `needed`,
-  `limit`, `limit_source` (`cgroup` or `host`), `rss`, and
+  `unfilled_budget_bytes` (the part of `needed` that is the unfilled
+  budget), `limit`, `limit_source` (`cgroup` or `host`), `rss`, and
   `missing_bytes`. The resident set right after loads can include memory
   the allocator has freed and not yet returned to the operating system,
   so the warning can overstate what is missing;
@@ -929,6 +957,10 @@ series with a constant, so its alert routes to its owner without a join.
 - Any `icetray_requests_total{code="resource_exhausted"}`, or
   `icetray_requests_in_flight` near `icetray_max_in_flight`: the replica
   is saturated.
+- `icetray_cache_budget_shortfall_bytes > 0`: the cache budget and the
+  resident indexes need more memory than the limit allows, so the
+  replica can be killed for exceeding it once the caches fill. Raise the
+  limit or lower `server.cache_bytes` ([Memory](#memory)).
 - `icetray_process_rss_bytes` near the container's memory limit.
 - Failing readiness or restarting pods, from the orchestrator.
 

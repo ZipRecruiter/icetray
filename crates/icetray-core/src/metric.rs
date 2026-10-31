@@ -114,6 +114,10 @@ pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
 /// Bytes the row cache holds against its budget (RFD 026): each entry's
 /// value at its allocation size plus the per-entry overhead.
 pub const ROW_CACHE_BYTES: &str = "icetray_row_cache_bytes";
+/// Bytes by which the cache budget, with the resident indexes of the
+/// tables served, overruns the memory limit (RFD 028): zero when they fit
+/// or when no limit can be read.
+pub const CACHE_BUDGET_SHORTFALL_BYTES: &str = "icetray_cache_budget_shortfall_bytes";
 /// Findings the doctor raised on the serving generation, by `table` and
 /// `code`, and by `column` for a code about one value column (RFD 022,
 /// `FindingCode::per_column`).
@@ -210,7 +214,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 57] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 58] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -380,6 +384,11 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 57] = [
         ROW_CACHE_BYTES,
         Kind::Gauge,
         "Bytes the row cache holds against its budget.",
+    ),
+    (
+        CACHE_BUDGET_SHORTFALL_BYTES,
+        Kind::Gauge,
+        "Bytes by which the cache budget and the resident indexes overrun the memory limit, zero when they fit.",
     ),
     (
         FINDINGS,

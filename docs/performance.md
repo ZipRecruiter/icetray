@@ -305,10 +305,11 @@ in memory and about 1.2 bytes on disk, and `bloom` more than `full`,
 because the writer gave each file a 1 MiB filter whatever its key count.
 
 [Memory](operating.md#memory) turns these figures into a container memory
-limit: the predicted bytes for each table's residency, doubled for a
-table a refresh can rewrite wholesale or a reload can change, plus the
-cache budget, `server.cache_bytes`, plus a third of that total for the
-process.
+limit, which is set first and which the cache budget, half of it unless
+`server.cache_bytes` sets it, follows: the predicted bytes for each
+table's residency, the largest table's once more, and the budget, plus a
+third of that total for the process. icetray checks that sum against the
+limit once the tables serve.
 
 ## The row cache
 

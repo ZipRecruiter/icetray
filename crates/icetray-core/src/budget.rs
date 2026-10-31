@@ -3,6 +3,8 @@
 //! derived from the process's memory limit, split between the two by
 //! `server.row_cache_share` with most of it going to rows.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::approx;
 use crate::cache::check_capacity;
 use crate::config::{
@@ -10,6 +12,7 @@ use crate::config::{
     ServerConfig,
 };
 use crate::memory::MemoryLimit;
+use crate::metric;
 
 /// The bytes each cache holds in memory, and the memory limit they were
 /// derived from.
@@ -23,6 +26,39 @@ pub struct Budget {
     /// `cache_bytes`; `None` when it does, or when no limit could be read
     /// and the whole is `FALLBACK_CACHE_BYTES`.
     pub derived_from: Option<MemoryLimit>,
+}
+
+impl Budget {
+    /// The bytes both caches hold together.
+    #[must_use]
+    pub fn whole(&self) -> u64 {
+        self.row_bytes + self.page_bytes
+    }
+}
+
+/// The bytes by which the budget and the resident indexes overrun the
+/// memory limit (RFD 028), as the last check found them: the daemon
+/// records it after the first loads and after each reload, and every scrape
+/// publishes it, since the recorder drops a gauge nothing writes between
+/// two scrapes. Reads zero before the first check.
+#[derive(Debug, Default)]
+pub struct Shortfall(AtomicU64);
+
+impl Shortfall {
+    /// Records `bytes` as what a check found missing; zero when nothing is.
+    pub fn record(&self, bytes: u64) {
+        self.0.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The bytes the last check found missing.
+    pub fn bytes(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Sets `cache_budget_shortfall_bytes` to the bytes recorded.
+    pub fn publish(&self) {
+        metrics::gauge!(metric::CACHE_BUDGET_SHORTFALL_BYTES).set(approx::gauge(self.bytes()));
+    }
 }
 
 /// The budget `server` sets under the memory `limit`, for caches whose

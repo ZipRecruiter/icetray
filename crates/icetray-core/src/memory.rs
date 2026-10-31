@@ -34,6 +34,11 @@ const V1_LIMIT_IN_BYTES: &str = "memory.limit_in_bytes";
 /// What the cgroup v2 line of `/proc/self/cgroup` starts with: hierarchy
 /// id 0 and no controllers, before the group's path.
 const V2_LINE_PREFIX: &str = "0::";
+/// The process's own memory beyond the indexes and the cache budget, as
+/// the divisor of their sum: a third of it, for requests in flight, a
+/// load's transient chunks, and the allocator's fragmentation and
+/// bookkeeping (RFD 012).
+const PROCESS_SHARE_DENOMINATOR: u64 = 3;
 
 /// Where a memory limit comes from. Display gives the log field's value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +184,23 @@ fn read_limit(path: &Path) -> Option<u64> {
 pub fn shortfall(needed: u64, limit: u64, rss: u64) -> Option<u64> {
     let room = limit.saturating_sub(rss);
     (needed > room).then(|| needed - room)
+}
+
+/// The bytes by which the cache `budget` and the resident indexes of the
+/// tables served, `indexes` one entry per table, overrun `limit` (RFD
+/// 028), RFD 012's sizing rule in reverse: the indexes, the largest once
+/// more since a refresh that rewrites a table wholesale loads its next
+/// generation beside it, and the budget, plus a third of that sum for the
+/// process, requests in flight, and the allocator. `None` when they fit.
+pub fn budget_shortfall(indexes: &[u64], budget: u64, limit: u64) -> Option<u64> {
+    let largest = indexes.iter().copied().max().unwrap_or(0);
+    let held = indexes
+        .iter()
+        .fold(budget.saturating_add(largest), |sum, &bytes| {
+            sum.saturating_add(bytes)
+        });
+    let needed = held.saturating_add(held / PROCESS_SHARE_DENOMINATOR);
+    needed.checked_sub(limit).filter(|&missing| missing > 0)
 }
 
 #[cfg(test)]
@@ -375,6 +397,31 @@ mod tests {
             "a resident set over the limit leaves no room"
         );
         assert_eq!(shortfall(0, GIB, TWO_GIB), None, "nothing needed");
+    }
+
+    /// Indexes of one and three gibibytes and a budget of four: the one
+    /// and the three, the three again, and the four, with a third more.
+    #[test]
+    fn test_budget_shortfall_counts_the_largest_table_twice_and_a_third() {
+        assert_eq!(
+            budget_shortfall(&[GIB, 3 * GIB], 4 * GIB, 10 * GIB),
+            Some(44 * GIB / 3 - 10 * GIB)
+        );
+    }
+
+    #[test]
+    fn test_budget_shortfall_is_none_when_it_fits() {
+        let needed = 4 * GIB;
+        assert_eq!(budget_shortfall(&[GIB], GIB, needed), None, "exactly fits");
+        assert_eq!(budget_shortfall(&[GIB], GIB, needed - 1), Some(1));
+        assert_eq!(budget_shortfall(&[GIB, 3 * GIB], GIB, 11 * GIB), None);
+        assert_eq!(budget_shortfall(&[], 0, 0), None, "nothing is held");
+        assert_eq!(
+            budget_shortfall(&[], 3 * GIB, 4 * GIB),
+            None,
+            "a budget alone, and a third"
+        );
+        assert_eq!(budget_shortfall(&[], 3 * GIB, 4 * GIB - 1), Some(1));
     }
 
     #[test]

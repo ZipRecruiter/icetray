@@ -16,7 +16,7 @@ use arc_swap::{ArcSwap, Guard};
 use futures::future::join_all;
 
 use crate::approx;
-use crate::budget::{self, Budget};
+use crate::budget::{self, Budget, Shortfall};
 use crate::cache::{self, PageCache};
 use crate::catalog::TableSource;
 use crate::config::{Config, ConfigError, ConfigViolation, ServerConfig, TableConfig};
@@ -41,6 +41,9 @@ pub struct Opened {
     /// 028): what `open_with` resolved, until `fit_caches` changes the
     /// split. Never held across an `await`.
     budget: Mutex<Budget>,
+    /// What the last check of the budget against the memory limit found
+    /// missing, which a scrape publishes.
+    pub shortfall: Shortfall,
     /// The server settings the budget was resolved under, which a reload
     /// cannot change (RFD 018).
     server: ServerConfig,
@@ -215,6 +218,26 @@ impl Opened {
     /// 028).
     pub fn budget(&self) -> Budget {
         *self.budget.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The resident index bytes of each table served, as
+    /// `icetray_index_bytes` publishes them: one entry per table that
+    /// serves a generation.
+    pub fn index_bytes(&self) -> Vec<u64> {
+        self.tables()
+            .iter()
+            .filter_map(|table| table.current())
+            .map(|generation| approx::count(generation.index_bytes))
+            .collect()
+    }
+
+    /// The part of the budget the caches have not yet filled: the whole
+    /// less what the page cache's memory level and the row cache hold now.
+    /// The resident set holds only what they have filled, so a check of
+    /// memory room adds this to what it needs (RFD 028).
+    pub fn unfilled_cache_bytes(&self) -> u64 {
+        let filled = approx::count(self.cache.usage()).saturating_add(self.row_cache.usage());
+        self.budget().whole().saturating_sub(filled)
     }
 
     /// The split the caches take serving `tables` (RFD 028), which
@@ -558,6 +581,7 @@ pub async fn open_with(
         cache,
         row_cache,
         budget: Mutex::new(budget),
+        shortfall: Shortfall::default(),
         server: config.server.clone(),
         limit,
         local,
@@ -574,7 +598,7 @@ pub async fn open_with(
 /// Logs `budget`, resolved under the memory `limit`, as `cache budget`.
 fn log_budget(budget: &Budget, limit: Option<MemoryLimit>) {
     tracing::info!(
-        cache_bytes = budget.row_bytes + budget.page_bytes,
+        cache_bytes = budget.whole(),
         row_bytes = budget.row_bytes,
         page_bytes = budget.page_bytes,
         limit = limit.map(|limit| limit.bytes),
@@ -1123,6 +1147,37 @@ mod tests {
         assert_eq!(opened.page_cache_needed_bytes(), one_table + disk_level);
         let local = opened.local.as_ref().unwrap();
         assert_eq!(one_table, local.index_bytes_in_use().unwrap());
+    }
+
+    /// Each table served reports its generation's index bytes, which
+    /// `icetray_index_bytes` publishes, and none before it loads; a budget
+    /// nothing has read is entirely unfilled.
+    #[tokio::test]
+    async fn test_index_bytes_lists_each_table_served_and_the_budget_is_unfilled() {
+        let fixture = two_file_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_local(
+            dir.path(),
+            vec![
+                named(FIRST_TABLE, &fixture, Residency::Full),
+                named(FULL_TABLE, &fixture, Residency::Bloom),
+            ],
+        );
+        let opened = open_with(&config, None, storage_for(&config), FindingLog::Events)
+            .await
+            .unwrap();
+        assert!(opened.index_bytes().is_empty(), "nothing loaded");
+        assert_eq!(opened.unfilled_cache_bytes(), opened.budget().whole());
+        for table in opened.tables().iter() {
+            table.load().await.unwrap();
+        }
+        let expected: Vec<u64> = opened
+            .tables()
+            .iter()
+            .map(|table| crate::approx::count(table.current().unwrap().index_bytes))
+            .collect();
+        assert_eq!(opened.index_bytes(), expected);
+        assert!(expected.iter().all(|&bytes| bytes > 0));
     }
 
     #[tokio::test]

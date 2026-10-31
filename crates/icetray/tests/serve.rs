@@ -1462,6 +1462,11 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
             "the one page cache's {name} carries no label in {scrape}"
         );
     }
+    assert_eq!(
+        series_value(&scrape, metric::CACHE_BUDGET_SHORTFALL_BYTES, &[]),
+        Some(0.0),
+        "exposed at zero when the budget fits the limit"
+    );
     assert_in_flight(&scrape, 0, ServerConfig::default().max_in_flight);
     assert_eq!(
         series_value(&scrape, metric::CONFIG_PENDING, &[]),
