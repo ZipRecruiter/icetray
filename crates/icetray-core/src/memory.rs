@@ -206,12 +206,6 @@ pub fn with_process_share(held: u64) -> u64 {
     held.saturating_add(held / PROCESS_SHARE_DENOMINATOR)
 }
 
-/// The bytes by which `budget_needed` overruns `limit`; `None` when it
-/// fits.
-pub fn budget_shortfall(indexes: &[u64], budget: u64, limit: u64) -> Option<u64> {
-    shortfall(budget_needed(indexes, budget), limit, 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,30 +405,20 @@ mod tests {
     /// Indexes of one and three gibibytes and a budget of four: the one
     /// and the three, the three again, and the four, with a third more.
     #[test]
-    fn test_budget_shortfall_counts_the_largest_table_twice_and_a_third() {
+    fn test_budget_needed_counts_the_largest_table_twice_and_a_third() {
         let held = GIB + 3 * GIB + 3 * GIB + 4 * GIB;
         let needed = held + held / PROCESS_SHARE_DENOMINATOR;
         assert_eq!(budget_needed(&[GIB, 3 * GIB], 4 * GIB), needed);
-        let limit = 10 * GIB;
-        assert_eq!(
-            budget_shortfall(&[GIB, 3 * GIB], 4 * GIB, limit),
-            Some(needed - limit)
-        );
     }
 
+    /// One table of a gibibyte, held twice, and a budget of one need four;
+    /// a budget alone of three needs a third more; nothing held needs
+    /// nothing.
     #[test]
-    fn test_budget_shortfall_is_none_when_it_fits() {
-        let needed = 4 * GIB;
-        assert_eq!(budget_shortfall(&[GIB], GIB, needed), None, "exactly fits");
-        assert_eq!(budget_shortfall(&[GIB], GIB, needed - 1), Some(1));
-        assert_eq!(budget_shortfall(&[GIB, 3 * GIB], GIB, 11 * GIB), None);
-        assert_eq!(budget_shortfall(&[], 0, 0), None, "nothing is held");
-        assert_eq!(
-            budget_shortfall(&[], 3 * GIB, 4 * GIB),
-            None,
-            "a budget alone, and a third"
-        );
-        assert_eq!(budget_shortfall(&[], 3 * GIB, 4 * GIB - 1), Some(1));
+    fn test_budget_needed_of_a_table_a_budget_and_nothing() {
+        assert_eq!(budget_needed(&[GIB], GIB), 4 * GIB);
+        assert_eq!(budget_needed(&[], 3 * GIB), 4 * GIB);
+        assert_eq!(budget_needed(&[], 0), 0);
     }
 
     #[test]

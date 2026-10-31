@@ -835,9 +835,6 @@ enum BudgetRoom {
     Fits,
     /// They do not.
     Short {
-        /// The bytes the limit would have to be: its own and what is
-        /// missing.
-        needed: u64,
         /// The limit compared with.
         limit: MemoryLimit,
         /// What exceeds it.
@@ -857,15 +854,20 @@ impl BudgetRoom {
 }
 
 /// Whether a cache budget of `budget` bytes and tables whose resident
-/// indexes are `indexes`, one entry each, fit under `limit`
-/// (`memory::budget_shortfall`).
+/// indexes are `indexes`, one entry each, fit under `limit`: whether what
+/// they need (`memory::budget_needed`) is short of it with nothing beside
+/// (`memory::shortfall`).
 fn budget_room(indexes: &[u64], budget: u64, limit: Option<MemoryLimit>) -> BudgetRoom {
     let Some(limit) = limit else {
         return BudgetRoom::Unknown;
     };
-    match memory::budget_shortfall(indexes, budget, limit.bytes) {
+    let nothing_beside = 0;
+    match memory::shortfall(
+        memory::budget_needed(indexes, budget),
+        limit.bytes,
+        nothing_beside,
+    ) {
         Some(missing_bytes) => BudgetRoom::Short {
-            needed: limit.bytes.saturating_add(missing_bytes),
             limit,
             missing_bytes,
         },
@@ -886,11 +888,10 @@ fn settle_budget(shortfall: &Shortfall, room: &BudgetRoom) {
             tracing::debug!("no memory limit to check the cache budget against");
         }
         BudgetRoom::Short {
-            needed,
             limit,
             missing_bytes,
         } => tracing::warn!(
-            needed,
+            needed = limit.bytes.saturating_add(*missing_bytes),
             limit = limit.bytes,
             limit_source = %limit.of,
             missing_bytes,
@@ -1017,12 +1018,12 @@ async fn page_cache_loop(opened: Arc<Opened>) -> Infallible {
 
 #[cfg(test)]
 mod tests {
-    use icetray_core::budget::{self, Shortfall};
+    use icetray_core::TableSource;
+    use icetray_core::budget::Shortfall;
     use icetray_core::config::{SourceConfig, StorageConfig, TableConfig};
     use icetray_core::memory::LimitSource;
     use icetray_core::metric;
-    use icetray_core::{CallsInFlight, PageCache, RowCache, TableHandles, TableSource};
-    use icetray_testkit::verify::series_value;
+    use icetray_testkit::verify::{self, series_value};
     use metrics_exporter_prometheus::PrometheusBuilder;
     use tokio::sync::oneshot;
 
@@ -1115,9 +1116,9 @@ mod tests {
         );
     }
 
-    /// Indexes of one and three gibibytes and a budget of four need
-    /// `44/3` GiB, which a limit of ten is short of by what exceeds it;
-    /// no limit read is no shortfall to name.
+    /// Indexes of one and three gibibytes and a budget of four need more
+    /// than a limit of ten (`memory::budget_needed`), which is short by
+    /// what exceeds it; no limit read is no shortfall to name.
     #[test]
     fn test_budget_room_names_what_the_limit_is_short_of() {
         let ten = MemoryLimit {
@@ -1125,11 +1126,11 @@ mod tests {
             of: LimitSource::Cgroup,
         };
         let indexes = [GIB.bytes, 3 * GIB.bytes];
-        let missing_bytes = 44 * GIB.bytes / 3 - ten.bytes;
+        let budget = 4 * GIB.bytes;
+        let missing_bytes = memory::budget_needed(&indexes, budget) - ten.bytes;
         assert_eq!(
-            budget_room(&indexes, 4 * GIB.bytes, Some(ten)),
+            budget_room(&indexes, budget, Some(ten)),
             BudgetRoom::Short {
-                needed: ten.bytes + missing_bytes,
                 limit: ten,
                 missing_bytes,
             }
@@ -1138,10 +1139,7 @@ mod tests {
             budget_room(&indexes, GIB.bytes / 4, Some(ten)),
             BudgetRoom::Fits
         );
-        assert_eq!(
-            budget_room(&indexes, 4 * GIB.bytes, None),
-            BudgetRoom::Unknown
-        );
+        assert_eq!(budget_room(&indexes, budget, None), BudgetRoom::Unknown);
     }
 
     /// The bits of the gauge `bytes` publishes as.
@@ -1197,12 +1195,8 @@ mod tests {
         assert_eq!(published(&shortfall), Some(bits(0)));
     }
 
-    /// A table in `residency`, never loaded, over the default cache budget
-    /// split as a server with a table reading rows splits it.
+    /// A table in `residency`, never loaded.
     async fn table_in(residency: Residency) -> Arc<Table> {
-        let server = ServerConfig::default();
-        let page_cache_shards = 1;
-        let budget = budget::resolve(&server, None, true, page_cache_shards).unwrap();
         let source = SourceConfig::Static {
             location: "file:///nowhere".to_string(),
         };
@@ -1220,26 +1214,16 @@ mod tests {
             resident_budget_bytes: None,
             row_cache: None,
         };
-        let handles = TableHandles {
-            storage: Arc::new(Storage::new(StorageConfig::default())),
-            cache: PageCache::new(budget.page_bytes, None).await.unwrap(),
-            row_cache: Some(RowCache::new(budget.row_bytes)),
-            local: None,
-            calls: CallsInFlight::new(),
-            findings: FindingLog::Debug,
-            batch_fan_out: server.batch_fan_out,
-            max_multi_scan_values: server.max_multi_scan_values,
-            max_scan_bytes: server.max_scan_bytes,
-        };
-        Arc::new(Table::new(
+        let served = verify::build(
+            Arc::new(Storage::new(StorageConfig::default())),
             config,
             TableSource::from_config(&source).await.unwrap(),
-            handles,
-            server.load_deadline,
-            server.refresh_deadline,
-            server.get_deadline,
-            server.scan_deadline,
-        ))
+            None,
+            verify::TEST_PAGE_CACHE_BYTES,
+        )
+        .await
+        .unwrap();
+        Arc::new(served.table)
     }
 
     /// A reload checks the memory room again when it starts a `disk`
