@@ -36,6 +36,11 @@ TBLPROPERTIES (
 ALTER TABLE db.kv WRITE LOCALLY ORDERED BY key;
 ```
 
+The sort is local on purpose. `WRITE ORDERED BY key`, without `LOCALLY`,
+also sets `write.distribution-mode` to `range`, replacing the `hash` above,
+so Spark sorts the whole write and may split a bucket across several
+files.
+
 For values of kilobytes per key, the recipe lowers
 `write.parquet.page-size-bytes` to `65536` and sets
 `write.parquet.row-group-check-min-record-count` and
