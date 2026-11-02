@@ -208,16 +208,17 @@ metadata and file footers, before deployment.
 ### Caches and latency
 
 ```mermaid
-flowchart LR
-    get([Get]) --> find{"Find the row<br/>full: memory<br/>disk: local read<br/>bloom: filter, then key page"}
+flowchart TB
+    get([Get]) --> find["Find the row<br/>full: in memory<br/>disk: a local read<br/>bloom: the filter, then the key page"]
     find -- key absent --> miss([Miss])
-    find -- key present --> row{Row cache}
+    find -- key present --> row[Row cache]
+    row -- cache miss --> mem[Page cache, memory level]
+    mem -- cache miss --> disk[Page cache, disk level]
+    disk -- cache miss --> s3[GET from object storage]
     row -- hit --> done([Value])
-    row -- cache miss --> mem{"Page cache<br/>memory level"}
     mem -- hit --> done
-    mem -- cache miss --> disk{"Page cache<br/>disk level"}
     disk -- hit --> done
-    disk -- cache miss --> s3["GET from<br/>object storage"] --> done
+    s3 --> done
 ```
 
 | Served from | Typical latency | Sized by |
