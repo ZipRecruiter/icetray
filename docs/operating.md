@@ -662,7 +662,9 @@ through settings, mounted files, and environment variables.
   `doctor`, `get`, `scan`, and `info`. In the image's name, `<owner>` is the
   GitHub owner of the repository that publishes the release, in lower
   case, and `<version>` is the release's tag without its `v`, such as
-  `0.2.0`.
+  `0.2.0`. The tag `0.2` follows the newest `0.2.x` release, and from 1.0
+  on, `1` follows the newest `1.x`. There is no `latest` tag: below 1.0 a
+  minor release may break a deployment.
 - icetray reads the configuration path from `ICETRAY_CONFIG`, so a pod
   passes no flags. icetray reads TOML and JSON into the same schema. A
   container's configuration sets `listen` and `metrics_listen` to

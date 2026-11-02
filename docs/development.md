@@ -277,6 +277,9 @@ SHA-256 sum. Each archive holds the binary, the README, and both licenses.
 It also pushes a container image for both architectures to the GitHub
 Container Registry, `ghcr.io/<owner>/icetray:<version>`
 ([Deploying](operating.md#deploying) explains the placeholders), built
-from the same binaries on Ubuntu 24.04 by the `Dockerfile`. Run by
+from the same binaries on Ubuntu 24.04 by the `Dockerfile`. A release
+`X.Y.Z` also moves the `X.Y` tag, and from 1.0 on the `X` tag, when no
+release of that line is newer, checked against the repository's `v*`
+tags; a pre-release moves neither. Run by
 hand from the Actions tab, the workflow builds the same archives as run
 artifacts and the same image, and publishes nothing.
