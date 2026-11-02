@@ -207,6 +207,9 @@ metadata and file footers, before deployment.
 
 ### Caches and latency
 
+<details>
+<summary>How a <code>Get</code> is served</summary>
+
 ```mermaid
 flowchart TB
     get([Get]) --> find["Find the row<br/>full: in memory<br/>disk: a local read<br/>bloom: the filter, then the key page"]
@@ -220,6 +223,8 @@ flowchart TB
     disk -- hit --> done
     s3 --> done
 ```
+
+</details>
 
 | Served from | Typical latency | Sized by |
 |---|---|---|
