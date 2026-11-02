@@ -37,8 +37,8 @@ cold page costs one range GET.
   stores, built for writes, are expensive. icetray serves the tables
   directly from the lake.
 - **Each table trades memory for GETs and latency.** A table's residency
-  sets where its key chunks live, and its lookup level sets the cost per
-  lookup its owner accepts, which icetray checks on every snapshot
+  determines where its key chunks are stored, and its lookup level caps what a
+  lookup may cost, which icetray checks on every snapshot
   ([Residency and lookup level](#residency-and-lookup-level)). A team
   weighs memory against GETs and latency, and all three against the
   effort of writing the optimal layout.
@@ -176,7 +176,7 @@ without a restart.
 
 ### Residency and lookup level
 
-Each table sets a **residency**, where its key chunks are stored:
+A table's **residency** determines where its key chunks are stored:
 
 | Residency | Key chunks | Resident memory per key | Cold hit | Miss |
 |---|---|---|---|---|
@@ -184,12 +184,10 @@ Each table sets a **residency**, where its key chunks are stored:
 | `disk` | in local files | a fraction of a byte | 1 GET and 1 local read | 1 local read |
 | `bloom` | only the writer's Bloom filters in memory; key pages read from object storage | the Bloom filter | 2 GETs | none, or 1 GET for a false positive |
 
-A hit served from the row cache or the page cache takes microseconds, and
-a cold hit's GET to object storage takes tens of milliseconds. Resident
-memory is proportional to the key count and independent of value size.
+Resident memory is proportional to the key count and independent of
+value size.
 
-Each table also sets a **lookup level**, `lookups`, the cost per lookup
-its owner accepts:
+A table's **lookup level**, `lookups`, caps what a lookup may cost:
 
 | Level | A lookup costs |
 |---|---|
@@ -206,6 +204,30 @@ metadata and file footers, before deployment.
 [Choosing a residency](docs/configuration.md#choosing-a-residency),
 [Choosing a level](docs/configuration.md#choosing-a-level), and
 [Performance and tuning](docs/performance.md) go deeper.
+
+### Caches and latency
+
+| Served from | Typical latency | Sized by |
+|---|---|---|
+| The row cache, in memory | about 10 µs | `server.row_cache_share` of `server.cache_bytes` |
+| The page cache's memory level | tens of µs | the rest of `server.cache_bytes` |
+| The page cache's disk level | a local read: about 0.1 ms from the kernel's page cache, 0.7 ms from the device | `storage.local.page_cache_disk_bytes` |
+| Object storage, a cold hit | about 80 ms at the median and 170 ms at the 99th percentile in-region, for a file not read lately | not cached |
+
+icetray checks the caches top to bottom and reads object storage only on
+a cache miss in all of them, so a table's median latency depends on its
+cache hit rate, and its tail on its cold hits. A replica restarted on the
+same local volume keeps the disk level's pages, and its memory caches
+start empty and fill from its traffic.
+
+`disk` residency adds a local key-page read to every lookup, and `bloom`
+adds a key-page GET to a cold one.
+
+The figures come from the
+[row cache's skewed-key benchmark](docs/performance.md#skewed-keys-measured),
+[disk-tier latency](docs/analysis/2026-10-07-page-cache-residency.md), and
+[range-GET latency to an object not read recently](docs/analysis/2026-09-29-cold-range-get-latency.md);
+[Performance and tuning](docs/performance.md) covers the settings.
 
 ## Limits and workarounds
 
