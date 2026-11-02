@@ -207,6 +207,19 @@ metadata and file footers, before deployment.
 
 ### Caches and latency
 
+```mermaid
+flowchart LR
+    get([Get]) --> find{"Find the row<br/>full: memory<br/>disk: local read<br/>bloom: filter, then key page"}
+    find -- key absent --> miss([Miss])
+    find -- key present --> row{Row cache}
+    row -- hit --> done([Value])
+    row -- cache miss --> mem{"Page cache<br/>memory level"}
+    mem -- hit --> done
+    mem -- cache miss --> disk{"Page cache<br/>disk level"}
+    disk -- hit --> done
+    disk -- cache miss --> s3["GET from<br/>object storage"] --> done
+```
+
 | Served from | Typical latency | Sized by |
 |---|---|---|
 | The row cache, in memory | about 10 µs | `server.row_cache_share` of `server.cache_bytes` |
@@ -214,11 +227,10 @@ metadata and file footers, before deployment.
 | The page cache's disk level | a local read: about 0.1 ms from the kernel's page cache, 0.7 ms from the device | `storage.local.page_cache_disk_bytes` |
 | Object storage, a cold hit | about 80 ms at the median and 170 ms at the 99th percentile in-region, for a file not read lately | not cached |
 
-icetray checks the caches top to bottom and reads object storage only on
-a cache miss in all of them, so a table's median latency depends on its
-cache hit rate, and its tail on its cold hits. A replica restarted on the
-same local volume keeps the disk level's pages, and its memory caches
-start empty and fill from its traffic.
+A table's median latency depends on its cache hit rate, and its tail on
+its cold hits. A replica restarted on the same local volume keeps the
+disk level's pages, and its memory caches start empty and fill from its
+traffic.
 
 `disk` residency adds a local key-page read to every lookup, and `bloom`
 adds a key-page GET to a cold one.
