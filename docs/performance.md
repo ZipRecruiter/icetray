@@ -6,7 +6,7 @@ and longer for a file no lookup has read for hours. A read from the local
 directory is a memory copy when the operating system's page cache holds
 the file, and a device read when it does not. A lookup's CPU work,
 decoding one key page and decompressing one value page per column it
-reads, takes microseconds to tens of microseconds. Most tuning sets how
+reads, takes microseconds to tens of microseconds. Most tuning changes how
 many lookups wait on a GET, and how much memory or local disk icetray
 spends serving the rest.
 
@@ -176,7 +176,7 @@ fetches count together in the page-cache metrics
 
 A table can be configured with several [value columns](glossary.md), and
 a lookup reads only the columns it requests
-([RFD 022](rfd/022-value-columns.md)). The choice of columns sets which
+([RFD 022](rfd/022-value-columns.md)). The choice of columns determines which
 pages a lookup reads, and so its GETs. icetray issues the GETs of a cold
 hit on several columns concurrently and hedges each on its own. The hit
 waits on the slowest of them, so its tail is wider than a one-column
@@ -408,9 +408,9 @@ uncached page share one GET.
   ([File descriptors](operating.md#file-descriptors)).
 
 A cold hit costs a GET of tens of milliseconds, and a warm hit from
-memory costs microseconds, so the cache's hit rate sets most of a table's
+memory costs microseconds, so the cache's hit rate determines most of a table's
 average lookup latency. icetray caches the whole value page a hit reads,
-so the page size sets how much of the budget one hot key occupies. The
+so the page size determines how much of the budget one hot key occupies. The
 optimal layout bounds value pages by bytes for large values for that
 reason ([Page and file sizes](#page-and-file-sizes)).
 
@@ -510,7 +510,7 @@ The writer fixes several costs when it writes the table, and the
 cheapest:
 
 - **Key pages of 1,000 rows.** A lookup decodes one key page, so the
-  page's row count sets the keys a lookup decodes. The doctor reports
+  page's row count determines the keys a lookup decodes. The doctor reports
   pages above 2,000 rows as `large_key_pages`, which caps the table's
   level at `balanced`.
 - **Value pages bounded by bytes.** A hit fetches, decompresses, and

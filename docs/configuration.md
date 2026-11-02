@@ -154,7 +154,7 @@ A server without a page-cache disk level (one is `storage.local` with a
 `page_cache_disk_bytes` above zero) that serves a table reading through
 the row cache beside tables reading pages alone, ordered tables or
 key-value tables with `row_cache = false`, must set `row_cache_share`.
-Those tables' pages live in the page cache's memory level alone, and no
+Those tables' pages are cached in the page cache's memory level alone, and no
 default share suits both kinds of table there, so icetray refuses the
 file, naming the tables reading pages alone, as `the server has no
 page-cache disk level and serves tables reading through the row cache
@@ -941,7 +941,7 @@ for it:
 One per column declared protobuf whose value page the doctor could not
 read, after the table's `finding` lines. The doctor leaves the column's
 values unchecked and does not refuse the table for it; the table's other
-lines set the exit code:
+lines determine the exit code:
 
 ```json
 {"kind":"unwalked","table":"kv","column":"detail","error_kind":"object_store","message":"object store: Object at location db/kv/data/00000-0.parquet not found"}

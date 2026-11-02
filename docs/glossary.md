@@ -61,7 +61,7 @@ lookup probing one file and decoding one key page of ordinary size;
 a shared edge key; `permissive` covers any snapshot icetray serves
 correctly, including one where a lookup probes several files. Residency,
 the doctor's capping findings, and, for a serving `disk` table, the
-kernel's page cache set the level reached. Each value column has a level, the
+kernel's page cache determine the level reached. Each value column has a level, the
 table's is its dearest column's, and `icetray_table_below_level` reads 1
 while a table is below its configured level. See [Choosing a
 level](configuration.md#choosing-a-level).

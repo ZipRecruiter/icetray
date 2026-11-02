@@ -406,7 +406,7 @@ The [levels](configuration.md#choosing-a-level) of an ordered table are
 read for a `Scan` of one key. A table where every `Scan` reads one file
 can reach `optimal`, whatever the length of its runs: decoding a run's
 edge key pages, and a run that spans row groups, leave it there. How the
-writer commits to the table sets the level it reaches:
+writer commits to the table determines the level it reaches:
 
 - One file per bucket, or files with disjoint key ranges, reaches
   `optimal`.
