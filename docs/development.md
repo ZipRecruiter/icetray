@@ -41,6 +41,15 @@ xfs, or btrfs. Where `/tmp` is tmpfs or overlayfs, as on some
 distributions and in most containers, point `TMPDIR` at a directory on
 disk.
 
+On macOS, a machine that once ran Docker Desktop keeps
+`"credsStore": "desktop"` in `~/.docker/config.json`. Every `docker pull`
+from the host then waits on Docker Desktop's credential helper, which
+hangs while Desktop is stopped, even with colima as the daemon: pulls
+stall with no output while `docker run` of a local image works. Remove
+that line, or point `DOCKER_CONFIG` at a directory whose `config.json`
+holds `{}`. `dev/runtime.sh up` warns when the config it uses names that
+helper.
+
 ## Gated suites
 
 Two suites need fixtures and show as ignored under a plain `cargo test`.
