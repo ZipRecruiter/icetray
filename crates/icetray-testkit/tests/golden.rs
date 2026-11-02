@@ -381,6 +381,30 @@ async fn test_golden_default_layout_is_balanced() -> Result<()> {
     verify_contract_hits(&golden, &keys, |key| golden::value(&long_text(key))).await
 }
 
+/// The writer's default bloom filter is the same size whatever the keys per
+/// file, so at a quarter of the contract's rows the doctor finds it
+/// oversized, and each of Iceberg's two sizing properties brings it within
+/// the doctor's bounds: the recipe's writer honors both.
+#[tokio::test]
+#[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
+async fn test_golden_bloom_sizing_properties_fit_the_filter_to_its_keys() -> Result<()> {
+    let sizing = [FindingCode::BloomOversized, FindingCode::BloomUndersized];
+    let default = open_golden(GoldenTable::BloomDefault100k, false).await?;
+    assert_eq!(level(&default), Level::Optimal);
+    let advice = advice_codes(&default);
+    assert!(advice.contains(&FindingCode::BloomOversized), "{advice:?}");
+    for table in [GoldenTable::BloomNdv100k, GoldenTable::BloomMaxBytes100k] {
+        let sized = open_golden(table, false).await?;
+        assert_eq!(level(&sized), Level::Optimal, "{table}");
+        let advice = advice_codes(&sized);
+        assert!(
+            !advice.iter().any(|code| sizing.contains(code)),
+            "{table}: {advice:?}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "needs ICETRAY_GOLDEN_WAREHOUSE; run dev/test-golden.sh"]
 async fn test_golden_strict_refuses_the_default_layout() -> Result<()> {

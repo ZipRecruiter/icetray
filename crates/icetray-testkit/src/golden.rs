@@ -262,6 +262,15 @@ pub enum GoldenTable {
     /// `default_layout_1m`: the writer's defaults, whose large key pages
     /// the doctor finds cap the level at balanced.
     DefaultLayout1m,
+    /// `bloom_default_100k`: the contract layout at a quarter of its rows per
+    /// file, under Iceberg's default bloom filter.
+    BloomDefault100k,
+    /// `bloom_ndv_100k`: the same, with the bloom filter sized by the key
+    /// column's NDV property.
+    BloomNdv100k,
+    /// `bloom_max_bytes_100k`: the same, with the bloom filter capped by the
+    /// max-bytes property.
+    BloomMaxBytes100k,
     /// `unpartitioned_500k`: no bucket partition.
     Unpartitioned500k,
     /// `overlap_250k`: permuted keys written with skew splitting on, so a
@@ -324,13 +333,16 @@ pub enum GoldenTable {
 
 impl GoldenTable {
     /// Every table the recipe writes.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 28] = [
         Self::Long2m,
         Self::Str2m,
         Self::Bin16_500k,
         Self::LongWide250k,
         Self::LongV3_50k,
         Self::DefaultLayout1m,
+        Self::BloomDefault100k,
+        Self::BloomNdv100k,
+        Self::BloomMaxBytes100k,
         Self::Unpartitioned500k,
         Self::Overlap250k,
         Self::LongMorV2_100k,
@@ -365,6 +377,11 @@ impl GoldenTable {
             Self::LongWide250k => Spec::kv("long_wide_250k", Long, TWO_BUCKETS, ROWS_250K),
             Self::LongV3_50k => Spec::kv("long_v3_50k", Long, FOUR_BUCKETS, ROWS_50K),
             Self::DefaultLayout1m => Spec::kv("default_layout_1m", Long, FOUR_BUCKETS, ROWS_1M),
+            Self::BloomDefault100k => Spec::kv("bloom_default_100k", Long, FOUR_BUCKETS, ROWS_100K),
+            Self::BloomNdv100k => Spec::kv("bloom_ndv_100k", Long, FOUR_BUCKETS, ROWS_100K),
+            Self::BloomMaxBytes100k => {
+                Spec::kv("bloom_max_bytes_100k", Long, FOUR_BUCKETS, ROWS_100K)
+            }
             Self::Unpartitioned500k => {
                 Spec::kv("unpartitioned_500k", Long, UNPARTITIONED, ROWS_500K)
             }

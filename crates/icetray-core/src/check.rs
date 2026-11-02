@@ -577,12 +577,14 @@ pub enum WriterProperty {
     /// Iceberg's per-column bloom filter switch.
     #[serde(rename = "write.parquet.bloom-filter-enabled.column.")]
     BloomFilterEnabled,
-    /// Iceberg's cap on a bloom filter's bytes, honored from Iceberg 1.11
-    /// (prototype findings, finding 7).
+    /// Iceberg's cap on a bloom filter's bytes. Iceberg 1.11 honors it (the
+    /// golden table `bloom_max_bytes_100k`); 1.10.1 did not (prototype
+    /// findings, finding 7).
     #[serde(rename = "write.parquet.bloom-filter-max-bytes")]
     BloomFilterMaxBytes,
     /// Iceberg's per-column distinct value count a bloom filter is sized
-    /// for, honored from Iceberg 1.11 (prototype findings, finding 7).
+    /// for. Iceberg 1.11 honors it (the golden table `bloom_ndv_100k`);
+    /// 1.10.1 did not (prototype findings, finding 7).
     #[serde(rename = "write.parquet.bloom-filter-ndv.column.")]
     BloomFilterNdvColumn,
     /// Spark's adaptive skew splitting, which spreads one bucket's write

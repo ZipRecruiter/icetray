@@ -130,6 +130,16 @@ MERGE_ON_READ = {
     "write.merge.mode": "merge-on-read",
 }
 
+# The bloom tables' keys per file: their rows over their buckets, one file and
+# one row group per bucket. Iceberg's default filter, 1 MiB whatever the key
+# count, is far above what these need at the contract's fpp, which the
+# doctor reports as `bloom_oversized`.
+BLOOM_KEYS_PER_FILE = ROWS_100K // FOUR_BUCKETS
+# A cap under that default and above what `BLOOM_KEYS_PER_FILE` keys need at
+# the contract's fpp, so a writer that honors it writes a filter the doctor
+# finds sized for its keys, and one that ignores it writes the default.
+BLOOM_MAX_BYTES = 65_536
+
 # The ids a merge-on-read table's DELETE removes and its UPDATE rewrites,
 # half-open; disjoint, inside the table's rows, and each spread over every
 # bucket. The golden tests derive every answer from these and the versions.
@@ -652,6 +662,30 @@ TABLES = [
             "write.metadata.metrics.column.key": "truncate(16)",
             "parquet.columnindex.truncate.length": "16",
         },
+    ),
+    # The contract at `BLOOM_KEYS_PER_FILE` keys per file, under Iceberg's
+    # default bloom filter, then under each of the two properties that size
+    # it: whether this writer honors each is what the pair records.
+    Golden("bloom_default_100k", OFF_CONTRACT_GROUP, "BIGINT", FOUR_BUCKETS, ROWS_100K, LONG_KEY, CONTRACT_REPEATS),
+    Golden(
+        "bloom_ndv_100k",
+        OFF_CONTRACT_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
+        ROWS_100K,
+        LONG_KEY,
+        CONTRACT_REPEATS,
+        extra={"write.parquet.bloom-filter-ndv.column.key": str(BLOOM_KEYS_PER_FILE)},
+    ),
+    Golden(
+        "bloom_max_bytes_100k",
+        OFF_CONTRACT_GROUP,
+        "BIGINT",
+        FOUR_BUCKETS,
+        ROWS_100K,
+        LONG_KEY,
+        CONTRACT_REPEATS,
+        extra={"write.parquet.bloom-filter-max-bytes": str(BLOOM_MAX_BYTES)},
     ),
     # No bucket partition: every file is a candidate, narrowed by key range.
     Golden(
