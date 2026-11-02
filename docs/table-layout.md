@@ -60,6 +60,19 @@ range overlaps the older file's, which icetray reports as
 rewrites the bucket. A compaction must use the same file-size target to
 preserve the layout.
 
+A table whose writer should not reach icetray directly, such as a
+merge-on-read or streaming writer behind a compaction job, is served
+through a tag or branch the job moves once a build is done, named by the
+table's `ref` ([Configuration](configuration.md#tables)). In Spark,
+`ALTER TABLE db.kv CREATE OR REPLACE TAG serving` points a tag at the
+current snapshot, creating it the first time; Iceberg's
+[branching and tagging](https://iceberg.apache.org/docs/latest/branching/)
+and [Spark DDL](https://iceberg.apache.org/docs/latest/spark-ddl/#branching-and-tagging-ddl)
+docs cover branches and the retention each kind of ref carries. What
+icetray needs of that retention is that the snapshot the ref named before
+outlive any replica still serving it
+([Refresh and reload](operating.md#refresh-and-reload)).
+
 ## Requirements
 
 When a table misses a requirement, icetray responds in one of three ways:
