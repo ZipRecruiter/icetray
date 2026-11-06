@@ -13,13 +13,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
-use std::iter;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _, stream};
 use iceberg::spec::Snapshot;
 use metrics::{Counter, Histogram};
 use tokio::sync::{MutexGuard, Semaphore};
@@ -692,17 +690,10 @@ impl Lookups {
     /// lookup issues holds one permit of `fan_out`, the batch's bound
     /// (`TableHandles::batch_fan_out`), while it runs, so the batch's
     /// tasks together hold at most that many GETs in flight; this task
-    /// waits on at most that many lookups itself, started in key order and
-    /// taken as each ends, so a lookup waiting on a GET holds back neither
-    /// the lookups after it nor the run's yield. Each poll of the run is
-    /// sliced (`coop::sliced`): once a poll has run `coop::LOOKUP_SLICE`,
-    /// the run yields the worker after the lookup that ends next, so the
-    /// worker can answer a completed GET before the run's other warm
-    /// lookups. The run yields as one task, not lookup by lookup, since
-    /// lookups yielding apart would resume in reverse order and take the
-    /// fan-out's permits tail first. A failing run fails with its first
-    /// failing key's failure in key order, once every key before it has
-    /// passed, and ends there (RFD 010).
+    /// waits on at most that many lookups itself, and yields its worker
+    /// between them once a poll has run long (`coop::in_key_order`). A
+    /// failing run fails with its first failing key's failure in key
+    /// order, once every key before it has passed, and ends there (RFD 010).
     async fn run(
         &self,
         generation: &Generation,
@@ -710,46 +701,15 @@ impl Lookups {
         selection: &Selection,
         fan_out: &Arc<Semaphore>,
     ) -> Result<Vec<Row>> {
-        // The lookups are built before the stream, unpolled, so no closure
-        // taking a key by reference lives in the returned future; one would
-        // make it unprovably `Send`, and the gRPC service needs it `Send`.
+        // The lookups are built before they are driven, unpolled, so no
+        // closure taking a key by reference lives in the returned future;
+        // one would make it unprovably `Send`, and the gRPC service needs it
+        // `Send`.
         let lookups: Vec<_> = keys
             .iter()
-            .enumerate()
-            .map(|(at, key)| {
-                self.one(generation, key, selection, Some(fan_out))
-                    .map(move |row| (at, row))
-            })
+            .map(|key| self.one(generation, key, selection, Some(fan_out)))
             .collect();
-        coop::sliced(async move {
-            let mut ended = stream::iter(lookups).buffer_unordered(self.batch_fan_out);
-            let mut rows: Vec<Option<Row>> = iter::repeat_with(|| None).take(keys.len()).collect();
-            // Keys before `settled` have all passed.
-            let mut settled = 0;
-            let mut first_failure: Option<(usize, Error)> = None;
-            while let Some((at, row)) = ended.next().await {
-                match row {
-                    Ok(row) => rows[at] = Some(row),
-                    Err(error) => {
-                        if first_failure.as_ref().is_none_or(|(first, _)| at < *first) {
-                            first_failure = Some((at, error));
-                        }
-                    }
-                }
-                while rows.get(settled).is_some_and(Option::is_some) {
-                    settled += 1;
-                }
-                if let Some((first, error)) = first_failure.take() {
-                    if first == settled {
-                        return Err(error);
-                    }
-                    first_failure = Some((first, error));
-                }
-                coop::yield_when_overdue().await;
-            }
-            Ok(rows.into_iter().flatten().collect())
-        })
-        .await
+        coop::in_key_order(lookups, self.batch_fan_out).await
     }
 }
 
@@ -1234,17 +1194,15 @@ impl ScanThrough<'_> {
 
     /// Scans of `keys`, answered in their order, at most
     /// `TableHandles::batch_fan_out` read at once on this task, every GET
-    /// holding a permit of the call's fan-out. A failing run fails as
-    /// `Lookups::run` fails: with its first failing key's failure in key
-    /// order.
+    /// holding a permit of the call's fan-out, the task yielding its worker
+    /// between them once a poll has run long (`coop::in_key_order`). A
+    /// failing run fails as `Lookups::run` fails: with its first failing
+    /// key's failure in key order.
     async fn keys(self, keys: &[&Key]) -> Result<Vec<Scanned>> {
-        // Built before the stream, unpolled, as `Lookups::run` builds its
-        // lookups, so the returned future stays provably `Send`.
+        // Built before they are driven, unpolled, as `Lookups::run` builds
+        // its lookups, so the returned future stays provably `Send`.
         let scans: Vec<_> = keys.iter().map(|key| self.key(key)).collect();
-        stream::iter(scans)
-            .buffered(self.reads.lookups.batch_fan_out)
-            .try_collect()
-            .await
+        coop::in_key_order(scans, self.reads.lookups.batch_fan_out).await
     }
 }
 
