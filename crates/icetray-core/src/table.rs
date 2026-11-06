@@ -13,12 +13,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
+use std::iter;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use futures::{StreamExt as _, TryStreamExt as _, stream};
+use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _, stream};
 use iceberg::spec::Snapshot;
 use metrics::{Counter, Histogram};
 use tokio::sync::{MutexGuard, Semaphore};
@@ -30,6 +31,7 @@ use crate::cache::PageCache;
 use crate::catalog::{Resolved, TableSource};
 use crate::check::{self, Capping, ColumnCost, ColumnLevel, Finding, FindingCode, LookupCost};
 use crate::config::{Residency, ServerConfig, TableConfig};
+use crate::coop;
 use crate::deletes::DeleteSummary;
 use crate::error::{Error, ErrorKind, Recurrence, Recurs as _, RefusalReason, Result};
 use crate::generation::{Generation, Lookup, MultiLookup, Row};
@@ -49,10 +51,11 @@ use crate::storage::{HedgeWindow, Storage};
 use crate::time;
 
 /// The keys per run of a split `multi_get`: 8, one run for each 8 keys
-/// or part of 8, up to one per worker (`Lookups::runs`). A warm hit's
-/// decode is on the order of ten microseconds, so eight keys hold about a
-/// hundred microseconds of work, far more than spawning a run costs, and a
-/// batch of a hundred keys still spreads over a dozen workers.
+/// or part of 8, up to one per worker (`Lookups::runs`). A warm lookup
+/// costs tens of microseconds, about 23 for a Full-tier miss and 70 for a
+/// hit at the median in the bench, so eight keys hold a few hundred
+/// microseconds of work, far more than spawning a run costs, and a batch
+/// of a hundred keys still spreads over a dozen workers.
 const MULTI_GET_TASK_KEYS_MIN: usize = 8;
 
 /// The distinct keys per run of a split `multi_scan`: 32, one run for
@@ -689,9 +692,17 @@ impl Lookups {
     /// lookup issues holds one permit of `fan_out`, the batch's bound
     /// (`TableHandles::batch_fan_out`), while it runs, so the batch's
     /// tasks together hold at most that many GETs in flight; this task
-    /// waits on at most that many lookups itself. A failing run fails with
-    /// its first failing key's failure in key order, once every key before
-    /// it has passed, and ends there.
+    /// waits on at most that many lookups itself, started in key order and
+    /// taken as each ends, so a lookup waiting on a GET holds back neither
+    /// the lookups after it nor the run's yield. Each poll of the run is
+    /// sliced (`coop::sliced`): once a poll has run `coop::LOOKUP_SLICE`,
+    /// the run yields the worker after the lookup that ends next, so the
+    /// worker can answer a completed GET before the run's other warm
+    /// lookups. The run yields as one task, not lookup by lookup, since
+    /// lookups yielding apart would resume in reverse order and take the
+    /// fan-out's permits tail first. A failing run fails with its first
+    /// failing key's failure in key order, once every key before it has
+    /// passed, and ends there (RFD 010).
     async fn run(
         &self,
         generation: &Generation,
@@ -704,12 +715,41 @@ impl Lookups {
         // make it unprovably `Send`, and the gRPC service needs it `Send`.
         let lookups: Vec<_> = keys
             .iter()
-            .map(|key| self.one(generation, key, selection, Some(fan_out)))
+            .enumerate()
+            .map(|(at, key)| {
+                self.one(generation, key, selection, Some(fan_out))
+                    .map(move |row| (at, row))
+            })
             .collect();
-        stream::iter(lookups)
-            .buffered(self.batch_fan_out)
-            .try_collect()
-            .await
+        coop::sliced(async move {
+            let mut ended = stream::iter(lookups).buffer_unordered(self.batch_fan_out);
+            let mut rows: Vec<Option<Row>> = iter::repeat_with(|| None).take(keys.len()).collect();
+            // Keys before `settled` have all passed.
+            let mut settled = 0;
+            let mut first_failure: Option<(usize, Error)> = None;
+            while let Some((at, row)) = ended.next().await {
+                match row {
+                    Ok(row) => rows[at] = Some(row),
+                    Err(error) => {
+                        if first_failure.as_ref().is_none_or(|(first, _)| at < *first) {
+                            first_failure = Some((at, error));
+                        }
+                    }
+                }
+                while rows.get(settled).is_some_and(Option::is_some) {
+                    settled += 1;
+                }
+                if let Some((first, error)) = first_failure.take() {
+                    if first == settled {
+                        return Err(error);
+                    }
+                    first_failure = Some((first, error));
+                }
+                coop::yield_when_overdue().await;
+            }
+            Ok(rows.into_iter().flatten().collect())
+        })
+        .await
     }
 }
 

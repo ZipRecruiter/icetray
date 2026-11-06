@@ -28,6 +28,7 @@ metrics = { workspace = true }
 murmur3 = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
+pin-project-lite.workspace = true
 prost = { workspace = true }
 quick_cache = { workspace = true }
 roaring = { workspace = true }

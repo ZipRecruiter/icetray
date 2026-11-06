@@ -15,6 +15,7 @@ pub mod check;
 mod column;
 pub mod config;
 pub mod contract;
+mod coop;
 pub mod deletes;
 pub mod descriptors;
 mod error;
