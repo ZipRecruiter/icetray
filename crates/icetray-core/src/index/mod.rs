@@ -47,7 +47,7 @@ use crate::manifest::TableLayout;
 use crate::order::OrderFacts;
 use crate::parquet_io::{FileHandle, Segments};
 use crate::row_cache::RowKey;
-use build::{check_utf8, checked_values, decode_run, fetch_chunk_parts};
+use build::{check_utf8, checked_values, decode_run, fetch_chunk_parts, find_in_run};
 pub(crate) use inspect::Inspected;
 use inspect::{Layout, ResidentSet, column_chunk_ranges, kept_footer, tiers};
 pub use order_fences::{OrderFences, Pair, PairPart};
@@ -1674,9 +1674,9 @@ impl FileIndex {
         Some((group.row_group, page))
     }
 
-    /// Decodes key page `page` of `row_group` from `segments` and finds
-    /// `key` in it. The page's bytes are ones `verify` checked at build, so
-    /// they are searched as decoded and not checked as UTF-8 again.
+    /// Finds `key` in key page `page` of `row_group`, read from `segments`
+    /// (`find_in_run`). The page's bytes are ones `verify` checked at
+    /// build, so they are searched as read and not checked as UTF-8 again.
     fn search(
         &self,
         key: &Key,
@@ -1686,13 +1686,9 @@ impl FileIndex {
     ) -> Result<Option<RowRef>> {
         let chunk = self.key_column().group(row_group);
         let rows = chunk.page_rows(page);
-        let keys = decode_run(
-            chunk,
-            self.layout.key_shape.run_shape(),
-            rows.clone(),
-            segments,
-        )?;
-        Ok(keys.binary_search(key).ok().map(|at| RowRef {
+        let (found, _decoder) =
+            find_in_run(chunk, self.layout.key_shape, rows.clone(), key, segments)?;
+        Ok(found.map(|at| RowRef {
             row_group,
             row: rows.start + row_offset(at),
         }))

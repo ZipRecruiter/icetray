@@ -951,7 +951,7 @@ impl<'a> RunCheck<'a> {
 
 /// Which decoder reads a row group's keys for `verify`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KeyDecoder {
+pub(super) enum KeyDecoder {
     /// A string or binary key chunk of plain pages sliced in place
     /// (`plain::checked_run`), where the chunk is one it reads; the column
     /// reader otherwise.
@@ -986,6 +986,37 @@ fn check_run<'c>(
     let mut run = RunCheck::new(chunk);
     read_run(chunk, shape, chunks, &mut run)?;
     Ok((run, KeyDecoder::ColumnReader))
+}
+
+/// The offset within rows `rows` of `chunk`, a key column whose values
+/// decode as `shape`, of the key equal to `key`, read from `chunks`;
+/// `None` where the rows do not hold it. Comes with the decoder that read
+/// the rows: the plain reader (`plain::find_key`) for a string or binary
+/// key column it reads, which answers exactly as the column reader would
+/// or not at all, and the column reader otherwise (`decode_run`,
+/// `Keys::binary_search`).
+pub(super) fn find_in_run(
+    chunk: ColumnChunk<'_>,
+    shape: KeyShape,
+    rows: Range<i64>,
+    key: &Key,
+    chunks: Arc<Segments>,
+) -> Result<(Option<usize>, KeyDecoder)> {
+    let wanted: Option<&[u8]> = match (shape, key) {
+        (KeyShape::Str, Key::Str(wanted)) => Some(wanted.as_bytes()),
+        (KeyShape::Bin, Key::Bytes(wanted)) => Some(wanted),
+        (
+            KeyShape::Long | KeyShape::Str | KeyShape::Bin | KeyShape::FixedBin | KeyShape::Uuid,
+            Key::Long(_) | Key::Str(_) | Key::Bytes(_) | Key::Uuid(_),
+        ) => None,
+    };
+    if let Some(wanted) = wanted
+        && let Some(plain::Searched(found)) = plain::find_key(chunk, rows.clone(), wanted, &chunks)
+    {
+        return Ok((found, KeyDecoder::Plain));
+    }
+    let keys = decode_run(chunk, shape.run_shape(), rows, chunks)?;
+    Ok((keys.binary_search(key).ok(), KeyDecoder::ColumnReader))
 }
 
 /// Every key of row group `chunk` decoded from `chunks` by the column
@@ -3485,6 +3516,125 @@ mod tests {
             }
         }
         assert_eq!(compared, expected_compared);
+    }
+
+    /// Keys a search probes beside `key`: one just above it, which the
+    /// fixtures hold for long keys and for no other type.
+    fn just_above(key: &Key) -> Key {
+        match key {
+            Key::Long(n) => Key::Long(n.saturating_add(1)),
+            Key::Str(s) => Key::Str(format!("{s}\0")),
+            Key::Bytes(b) => Key::Bytes([b.as_slice(), &[0]].concat()),
+            Key::Uuid(u) => {
+                let mut above = *u;
+                above[UUID_BYTES - 1] = above[UUID_BYTES - 1].wrapping_add(1);
+                Key::Uuid(above)
+            }
+        }
+    }
+
+    /// Every `PROBE_STRIDE`th key and the first and last keys of every key
+    /// page, of every key type under every layout of `EDITS`, and a key
+    /// just above each, searched for in its key page, and the first and
+    /// last keys of each page in its row group whole: `find_in_run` answers
+    /// what the column reader's decode and binary search answer, and reads
+    /// every page of a string or binary key column written without a
+    /// dictionary plain.
+    #[tokio::test]
+    async fn test_find_in_run_matches_the_column_reader_on_every_fixture_shape() {
+        let fixed_keys: Vec<Option<Key>> = (0..contract_rows())
+            .map(|i| Some(Key::Bytes(count(stepped(i)).to_be_bytes().to_vec())))
+            .collect();
+        let fixtures: [(Fixture, KeyShape); 5] = [
+            (
+                Fixture::contract(KeyType::String, contract_rows()),
+                KeyShape::Str,
+            ),
+            (
+                Fixture::contract(KeyType::Binary, contract_rows()),
+                KeyShape::Bin,
+            ),
+            (
+                Fixture::contract(KeyType::Long, contract_rows()),
+                KeyShape::Long,
+            ),
+            (
+                Fixture::contract(KeyType::Uuid, contract_rows()),
+                KeyShape::Uuid,
+            ),
+            (
+                Fixture::with_keys(KeyColumn::FixedBinary(FIXED_KEY_BYTES), fixed_keys),
+                KeyShape::FixedBin,
+            ),
+        ];
+        let path = location();
+        let mut found_plain = 0;
+        for (mut fixture, shape) in fixtures {
+            let as_written = fixture.layout;
+            for (label, edit, plain_pages) in EDITS {
+                fixture.layout = as_written;
+                fixture.nullable_key = false;
+                edit(&mut fixture);
+                let opened = store(&fixture).await;
+                let metadata = opened.handle.load_metadata().await.unwrap();
+                let chunks = key_chunks(&opened, &metadata, KEY_LEAF).await;
+                let column = Column {
+                    metadata: &metadata,
+                    leaf: KEY_LEAF,
+                    path: &path,
+                };
+                let expected_decoder =
+                    if *plain_pages && matches!(shape, KeyShape::Str | KeyShape::Bin) {
+                        KeyDecoder::Plain
+                    } else {
+                        KeyDecoder::ColumnReader
+                    };
+                for row_group in 0..metadata.num_row_groups() {
+                    let chunk = column.group(row_group);
+                    let whole = 0..chunk.rows();
+                    let group_keys =
+                        decode_run(chunk, shape.run_shape(), whole.clone(), Arc::clone(&chunks))
+                            .unwrap();
+                    for page in 0..chunk.page_locations().len() {
+                        let rows = chunk.page_rows(page);
+                        let keys =
+                            decode_run(chunk, shape.run_shape(), rows.clone(), Arc::clone(&chunks))
+                                .unwrap();
+                        assert!(!keys.is_empty(), "{shape:?} {label}: {rows:?}");
+                        let ends = [0, keys.len() - 1];
+                        let sampled = (0..keys.len()).step_by(PROBE_STRIDE).chain(ends);
+                        let held = sampled.map(|at| (rows.clone(), &keys, at));
+                        let in_group = ends.into_iter().map(|at| {
+                            let in_group = row_index(rows.start) + at;
+                            (whole.clone(), &group_keys, in_group)
+                        });
+                        for (searched, run, at) in held.chain(in_group) {
+                            let key = run.get(at);
+                            for probe in [key.clone(), just_above(&key)] {
+                                let case = format!("{shape:?} {label}: {searched:?} {probe:?}");
+                                let (found, decoder) = find_in_run(
+                                    chunk,
+                                    shape,
+                                    searched.clone(),
+                                    &probe,
+                                    Arc::clone(&chunks),
+                                )
+                                .unwrap();
+                                assert_eq!(found, run.binary_search(&probe).ok(), "{case}");
+                                assert_eq!(decoder, expected_decoder, "{case}");
+                                if probe == key {
+                                    assert_eq!(found, Some(at), "{case}");
+                                }
+                                if decoder == KeyDecoder::Plain && found.is_some() {
+                                    found_plain += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_plain > 0, "some key was found plain");
     }
 
     /// `FEW_ROWS` string keys from `key_for`, with `edit` applied.

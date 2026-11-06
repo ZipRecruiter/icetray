@@ -173,6 +173,74 @@ fn read_pages(
     Some(decoded)
 }
 
+/// What a plain search of key rows found (`find_key`): the offset within
+/// the rows searched of the key sought, `None` where none of them holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Searched(pub(super) Option<usize>);
+
+/// Where `wanted` lies among rows `rows` of `chunk`, a `BYTE_ARRAY` key
+/// column, read plain from `segments`, which hold the pages holding them:
+/// the offset within `rows` of the key whose bytes equal `wanted`, if any
+/// of the rows holds it (`Searched`). `None` when
+/// the chunk is not of the shape the plain readers read (`plain_chunk`) or
+/// any page holding the rows is not one `checked_run` reads exactly, for
+/// the column reader to read instead (`read_plain`). Every value of each
+/// page is walked by its length prefix, so a page is read whole, as
+/// `checked_run` reads it, and a key never comes back from a page the
+/// column reader would fault on.
+pub(super) fn find_key(
+    chunk: ColumnChunk<'_>,
+    rows: Range<i64>,
+    wanted: &[u8],
+    segments: &Arc<Segments>,
+) -> Option<Searched> {
+    let rows = row_index(rows.start)..row_index(rows.end);
+    read_plain(chunk, rows.clone(), segments, |pages, required| {
+        find_in_pages(pages, rows, wanted, required)
+    })
+}
+
+/// The data pages of `pages` holding `rows`, searched plain for `wanted`
+/// (`find_key`): where among `rows` it lies, and the rows read; `None` at
+/// the first page not read exactly. The rows read stop short of `rows`
+/// where the pages run out first, for `ColumnChunk::check_pages_read` to
+/// refuse.
+fn find_in_pages(
+    mut pages: ChunkPages,
+    rows: Range<usize>,
+    wanted: &[u8],
+    required: bool,
+) -> Option<(Searched, usize)> {
+    let mut skip = rows.start.checked_sub(pages.first_row())?;
+    let mut left = rows.len();
+    let mut read = 0;
+    let mut found = None;
+    while left > 0 {
+        // intentional: a page the page reader faults on is the column
+        // reader's to report.
+        let Some(page) = pages.get_next_page().ok()? else {
+            break;
+        };
+        let (mut rest, count) = key_values(&page, required)?;
+        let passed = skip.min(count);
+        let here = (count - passed).min(left);
+        let asked = passed..passed + here;
+        for at in 0..count {
+            let value = next_value(&mut rest)?;
+            if found.is_none() && asked.contains(&at) && value == wanted {
+                found = Some(read + at - passed);
+            }
+        }
+        if !rest.is_empty() {
+            return None;
+        }
+        skip -= passed;
+        left -= here;
+        read += here;
+    }
+    Some((Searched(found), read))
+}
+
 /// Rows `rows` of `chunk`, a value column, read plain from `segments`,
 /// which hold the pages holding them: one entry per row, `None` for a
 /// null. `None` when the chunk is not of the shape the plain readers read
