@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -201,10 +202,15 @@ impl Weighter<RowKey, Option<Bytes>> for RowWeighter {
     }
 }
 
-/// One `quick_cache` and the part of its budget its ghost list holds back.
+/// One `quick_cache`, the part of its budget its ghost list holds back,
+/// and its entries' capacity as last set.
 struct Built {
     cache: Cache<RowKey, Option<Bytes>, RowWeighter>,
     ghosts: GhostReserve,
+    /// The entries' capacity `set_capacity` last gave `cache`, kept apart
+    /// because `quick_cache` sums its capacity under a read lock of every
+    /// shard, and every lookup asks it (`RowCache::is_off`).
+    capacity: AtomicU64,
 }
 
 impl Built {
@@ -228,7 +234,11 @@ impl Built {
             estimated_items,
             approx::count(cache.num_shards()),
         );
-        let built = Self { cache, ghosts };
+        let built = Self {
+            cache,
+            ghosts,
+            capacity: AtomicU64::new(0),
+        };
         built.set_capacity(capacity_bytes);
         built
     }
@@ -239,8 +249,14 @@ impl Built {
     /// held fits.
     fn set_capacity(&self, capacity_bytes: u64) {
         let shards = approx::count(self.cache.num_shards());
-        let entries = self.ghosts.entries_within(capacity_bytes);
-        self.cache.set_capacity(entries / shards * shards);
+        let entries = self.ghosts.entries_within(capacity_bytes) / shards * shards;
+        self.cache.set_capacity(entries);
+        self.capacity.store(entries, Ordering::Relaxed);
+    }
+
+    /// The entries' capacity as last set (`set_capacity`).
+    fn capacity(&self) -> u64 {
+        self.capacity.load(Ordering::Relaxed)
     }
 }
 
@@ -285,7 +301,7 @@ impl RowCache {
     /// given it or a resize set it. A lookup asks this once and then skips
     /// the cache, so it counts no miss and copies no value it cannot keep.
     pub(crate) fn is_off(&self) -> bool {
-        self.0.built.load().cache.capacity() == 0
+        self.0.built.load().capacity() == 0
     }
 
     /// What the cache holds at `key`. Counts a hit, for a null as for a
@@ -332,7 +348,7 @@ impl RowCache {
     /// clone reads from its next call on.
     pub(crate) fn resize(&self, capacity_bytes: u64) {
         let built = self.0.built.load();
-        if built.cache.capacity() > 0 {
+        if built.capacity() > 0 {
             built.set_capacity(capacity_bytes);
         } else if capacity_bytes > 0 {
             self.0.built.store(Arc::new(Built::new(capacity_bytes)));
@@ -340,13 +356,15 @@ impl RowCache {
     }
 
     /// How the cache is built now: what a test compares with a freshly
-    /// built cache's.
+    /// built cache's. The entries' capacity kept beside the cache must be
+    /// `quick_cache`'s own.
     #[cfg(test)]
     fn shape(&self) -> Shape {
         let built = self.0.built.load();
+        assert_eq!(built.capacity(), built.cache.capacity(), "kept capacity");
         Shape {
             shards: built.cache.num_shards(),
-            entries_capacity: built.cache.capacity(),
+            entries_capacity: built.capacity(),
             ghost_bytes: built.ghosts.bytes,
         }
     }
@@ -384,7 +402,7 @@ impl fmt::Debug for RowCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RowCache")
             .field("usage", &self.usage())
-            .field("capacity", &self.0.built.load().cache.capacity())
+            .field("capacity", &self.0.built.load().capacity())
             .finish_non_exhaustive()
     }
 }
@@ -586,15 +604,21 @@ mod tests {
     }
 
     /// The cache is off while its budget is zero, whether built at zero or
-    /// resized to it, and on again once a resize gives it a budget.
+    /// resized to it, and on again once a resize gives it a budget; a
+    /// resize in place keeps it on. Each answer agrees with `quick_cache`'s
+    /// own capacity (`shape`).
     #[test]
     fn test_is_off_follows_the_budget_now() {
         let cache = RowCache::new(0);
         assert!(cache.is_off(), "built at zero");
         cache.resize(ROOMY_BYTES);
         assert!(!cache.is_off(), "grown from zero");
+        cache.resize(ROOMY_BYTES / 2);
+        assert!(!cache.is_off(), "shrunk in place");
+        assert!(cache.shape().entries_capacity > 0, "shrunk in place");
         cache.resize(0);
         assert!(cache.is_off(), "shrunk to zero");
+        assert_eq!(cache.shape().entries_capacity, 0, "shrunk to zero");
         assert!(!RowCache::new(ROOMY_BYTES).is_off());
     }
 
@@ -652,7 +676,7 @@ mod tests {
         );
         for budget in [ROOMY_BYTES, ROOMY_BYTES / 2, 2 * ROOMY_BYTES] {
             cache.resize(budget);
-            let entries = cache.0.built.load().cache.capacity();
+            let entries = cache.shape().entries_capacity;
             let held = entries + cache.0.built.load().ghosts.beside(entries);
             assert!(held <= budget, "{held} over {budget}");
             assert!(
