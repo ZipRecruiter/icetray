@@ -112,13 +112,14 @@ table's owner decides how to split a row into columns, as
 [Value columns](table-layout.md#value-columns) describes.
 
 A key-value table serves a repeated hit from memory: the server keeps
-each value a lookup reads in its row cache, so a later lookup of the same
-key and column reads no value page and issues no value-page GET,
-whichever fields it projects. The first lookup of a key after a server
-starts, or after its row has left the cache, costs what a cold or warm
-hit does. A caller that keeps its own cache of icetray's answers can ask
-the table's owner to turn the row cache off for the table, so the
-server's memory goes to tables whose callers do not
+each value a lookup reads in its row cache, so a later lookup of the
+same key and column reads no page and issues no GET, whichever fields it
+projects, and a repeated presence-only lookup of a present key does the
+same. The first lookup of a key after a server starts, or after its row
+has left the cache, costs what a cold or warm hit does. A caller that
+keeps its own cache of icetray's answers can ask the table's owner to
+turn the row cache off for the table, so the server's memory goes to
+tables whose callers do not
 ([The row cache](performance.md#the-row-cache)). A value a refresh
 deletes or rewrites is never answered from the cache.
 

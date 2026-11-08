@@ -17,12 +17,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use iceberg::spec::{Snapshot, TableMetadata};
 use metrics::Counter;
+use quick_cache::DefaultHashBuilder;
 use tokio::sync::Semaphore;
 
 use crate::approx;
@@ -48,7 +50,7 @@ use crate::manifest::{self, Bucketing, DataFileEntry, DeleteFileEntry, TableLayo
 use crate::metric::LookupResult;
 use crate::order::ScanBounds;
 use crate::parquet_io::{FileHandle, Segments};
-use crate::row_cache::{Cached, RowCache};
+use crate::row_cache::{Caching, Entry, Held, Part, Source, TableRows};
 use crate::scan::{self, Scanned};
 use crate::shard;
 use crate::snapshot::{SequenceNumber, SnapshotId};
@@ -92,6 +94,51 @@ pub struct LoadedFile {
     pub entry: DataFileEntry,
     /// The file's resident index.
     pub index: FileIndex,
+    /// The file's number in this process, which no other load shares.
+    number: FileNumber,
+}
+
+impl LoadedFile {
+    /// `entry`'s file, indexed as `index`, under a number no file loaded
+    /// before it in this process has.
+    pub fn new(entry: DataFileEntry, index: FileIndex) -> Self {
+        Self {
+            entry,
+            index,
+            number: FileNumber::next(),
+        }
+    }
+
+    /// The file's number in this process (`FileNumber`).
+    pub(crate) fn number(&self) -> FileNumber {
+        self.number
+    }
+}
+
+/// A loaded file's number, unique in the process: each load of a data
+/// file, a reload of the same path included, takes the next one. The row
+/// cache records where an entry was read by it (RFD 026), so an entry of a
+/// file loaded again, as a changed table loads every file, names a file
+/// no generation holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FileNumber(u64);
+
+impl FileNumber {
+    /// The number after every number taken so far.
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, AtomicOrdering::Relaxed))
+    }
+
+    /// The number as eight bytes, as the row cache stores it.
+    pub(crate) fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+
+    /// The number `to_le_bytes` gave `bytes`.
+    pub(crate) fn from_le_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_le_bytes(bytes))
+    }
 }
 
 /// One snapshot, fully indexed and ready to serve. `Send + Sync`: a
@@ -115,6 +162,9 @@ pub struct Generation {
     /// Every live data file, sorted by (bucketing, bucket, exact first
     /// key, path).
     pub files: Vec<Arc<LoadedFile>>,
+    /// Each file's place in `files`, by its number: where a row-cache
+    /// entry's file is found (RFD 026).
+    slots: HashMap<FileNumber, usize, DefaultHashBuilder>,
     /// Rows across every file, from the manifests.
     pub records: u64,
     /// Bytes resident across every file index, the rows its deletes
@@ -369,6 +419,11 @@ impl Generation {
             metadata_location: metadata_location.to_string(),
             layout,
             residency,
+            slots: files
+                .iter()
+                .enumerate()
+                .map(|(at, file)| (file.number(), at))
+                .collect(),
             files,
             records,
             index_bytes,
@@ -536,50 +591,69 @@ impl Generation {
     }
 
     /// One lookup reading the value columns at the positions `columns`
-    /// gives in `layout`, in that order, and the `result` label it earns:
-    /// the candidates are probed in probe order and the first whose `find`
+    /// gives in `layout`, in that order, and the `result` label it earns.
+    /// With `rows`, the table's row cache, given and not off
+    /// (`TableRows::is_off`, a budget of zero) as the lookup starts (RFD
+    /// 026), the cache is asked first for each column named, or for the
+    /// row when none is, and an entry is served only where this generation
+    /// holds the entry's file and has not deleted its row (`probe`): that
+    /// row is the key's one live row, since a generation refuses two (RFD
+    /// 005, RFD 021). A lookup the cache answers whole resolves no key,
+    /// reads no page, takes no permit, and is a warm hit. Otherwise the
+    /// candidates are probed in probe order and the first whose `find`
     /// answers with a row its file's deletes do not remove gives the row,
     /// checked against the deletes once whatever the columns (RFD 021); a
-    /// deleted row is passed over with no value page read. Then each column
-    /// named is read from `rows`, the row cache, when given and not off
-    /// (`RowCache::is_off`, a budget of zero) as the lookup starts (RFD
-    /// 026), at the key of the file, the row, and the column's leaf there
-    /// (`FileIndex::row_key`), so the index has chosen the file and row,
-    /// and the deletes have spoken, before the cache is asked: a row
-    /// deleted or rewritten into another file is never served from it. A
-    /// column the row cache lacks is read from the row's value page through
+    /// deleted row is passed over with no value page read. Each column the
+    /// cache did not serve is read from the row's value page through
     /// `cache`, every such column's read at once, each a GET of its own,
-    /// hedged on its own (RFD 013, RFD 022), and its value, or its null, is
-    /// inserted into `rows`; a row of a file written before a column was
-    /// added answers that column's default, reads no page of it, and uses
-    /// no entry (RFD 023). No column named answers presence alone and
-    /// reads no value page. `Present` carries one value per column named,
-    /// each its bytes or `None` for a null; `Absent` is a key no candidate
-    /// holds. The GET cost is the index's: in the Full tier one GET per
-    /// column named for a cold hit, two for a dictionary-encoded column,
-    /// none for a warm hit, a row-cache hit, a default, presence alone, or
-    /// a miss; the key is resolved the same way on a row-cache hit, a key
-    /// page read in the Bloom tier. Each GET the lookup issues, a
-    /// Bloom-tier key page's included, holds one permit of `fan_out`, the
+    /// hedged on its own (RFD 013, RFD 022), and its value, or its null,
+    /// replaces its entry in `rows`, as the row a presence-only lookup
+    /// found replaces its presence entry; a row of a file written before a
+    /// column was added answers that column's default, reads no page of
+    /// it, and is cached nowhere (RFD 023). Every entry the lookup found
+    /// and could not serve, for a key no candidate holds as for a column
+    /// answered by its default, is dropped unless another lookup has
+    /// replaced it. `Present` carries one value per column named, each its
+    /// bytes or `None` for a null; `Absent` is a key no candidate holds.
+    /// The GET cost is the index's: in the Full tier one GET per column
+    /// named and not served from the row cache for a cold hit, two for a
+    /// dictionary-encoded column, none for a warm hit, a default, presence
+    /// alone, or a miss; in the Bloom tier a key page read besides, unless
+    /// the row cache answers the whole lookup. Each GET the lookup issues,
+    /// a Bloom-tier key page's included, holds one permit of `fan_out`, the
     /// batch's, while it runs, and each GET of a value or dictionary page
     /// of the column at position `c` is counted under `value_gets[c]` as it
-    /// is issued, where `value_gets` has it (`Issue`); a row-cache hit
-    /// takes no permit. The label is `Miss` for an absent key; for a
-    /// present one, `ColdHit` when a value or dictionary page of a column
-    /// named came from outside the cache (a fetch this lookup ran or
-    /// joined) and `WarmHit` otherwise, a hit that read no value page, a
-    /// row-cache hit among them, included. Only the columns' pages decide
-    /// it; a key-page GET in the Bloom tier does not.
+    /// is issued, where `value_gets` has it (`Issue`). The label is `Miss`
+    /// for an absent key; for a present one, `ColdHit` when a value or
+    /// dictionary page of a column named came from outside the cache (a
+    /// fetch this lookup ran or joined) and `WarmHit` otherwise, a hit that
+    /// read no value page, a row-cache hit among them, included. Only the
+    /// columns' pages decide it; a key-page GET in the Bloom tier does not.
     pub(crate) async fn lookup(
         &self,
         key: &Key,
         columns: &[usize],
         cache: &PageCache,
-        rows: Option<&RowCache>,
+        rows: Option<&TableRows>,
         fan_out: Option<&Arc<Semaphore>>,
         value_gets: &[Counter],
     ) -> Result<(Row, LookupResult)> {
         let rows = rows.filter(|rows| !rows.is_off());
+        let probes: Vec<Probe> = rows.map_or_else(Vec::new, |rows| {
+            parts(columns)
+                .map(|part| self.probe(rows, key, part))
+                .collect()
+        });
+        let stale: Vec<(Part, Source)> = parts(columns)
+            .zip(&probes)
+            .filter_map(|(part, probe)| probe.stale.map(|source| (part, source)))
+            .collect();
+        if let Some(rows) = rows
+            && let Some(row) = served_whole(&probes, columns.len())
+        {
+            rows.count(probes.len(), 0, 0);
+            return Ok((row, LookupResult::WarmHit));
+        }
         let key_page = Issue {
             fan_out,
             counted: None,
@@ -589,45 +663,57 @@ impl Generation {
                 if self.is_deleted(at, file.index.position(row)) {
                     continue;
                 }
-                let reads = columns.iter().map(|&column| async move {
-                    let cached = rows.and_then(|rows| {
-                        file.index
-                            .row_key(column, row)
-                            .map(|row_key| (rows, row_key))
-                    });
-                    if let Some((row_cache, row_key)) = &cached {
-                        match row_cache.get(row_key) {
-                            Cached::Value(bytes) => return Ok((Some(bytes), false)),
-                            Cached::Null => return Ok((None, false)),
-                            Cached::Absent => {}
+                let source = Source {
+                    file: file.number(),
+                    position: file.index.position(row),
+                };
+                debug_assert!(
+                    probes
+                        .iter()
+                        .filter_map(|probe| probe.served.as_ref())
+                        .all(|(served, _)| *served == source),
+                    "an entry this generation serves names the key's one live row"
+                );
+                let reads = columns.iter().enumerate().map(|(at, &column)| {
+                    let served = probes
+                        .get(at)
+                        .and_then(|probe| probe.served.clone())
+                        .map(|(_, held)| held);
+                    async move {
+                        if let Some(held) = served {
+                            return Ok((held_value(held), false, Served::Cache));
                         }
-                    }
-                    let issue = Issue {
-                        fan_out,
-                        counted: value_gets.get(column),
-                    };
-                    Ok::<_, Error>(
-                        match file
+                        let issue = Issue {
+                            fan_out,
+                            counted: value_gets.get(column),
+                        };
+                        let read = file
                             .index
                             .read_column(column, row, Some(cache), issue)
-                            .await?
-                        {
+                            .await?;
+                        Ok::<_, Error>(match read {
                             Some(read) => {
-                                if let Some((row_cache, row_key)) = cached {
-                                    row_cache.insert(row_key, read.value.as_deref());
+                                if let Some(rows) = rows {
+                                    let held = Caching::Column(read.value.as_deref());
+                                    rows.insert(key, Part::Column(column), source, held);
                                 }
-                                (read.value, read.from_store)
+                                (read.value, read.from_store, Served::Page)
                             }
-                            None => (self.layout.value_columns[column].default.clone(), false),
-                        },
-                    )
+                            None => (
+                                self.layout.value_columns[column].default.clone(),
+                                false,
+                                Served::Default,
+                            ),
+                        })
+                    }
                 });
-                let (values, from_store): (Vec<Option<Bytes>>, Vec<bool>) =
-                    futures::future::try_join_all(reads)
-                        .await?
-                        .into_iter()
-                        .unzip();
-                let result = if from_store.contains(&true) {
+                let read = futures::future::try_join_all(reads).await?;
+                if let Some(rows) = rows {
+                    settle(rows, key, columns, source, &read, &stale);
+                }
+                let from_store = read.iter().any(|(_, from, _)| *from);
+                let values = read.into_iter().map(|(value, _, _)| value).collect();
+                let result = if from_store {
                     LookupResult::ColdHit
                 } else {
                     LookupResult::WarmHit
@@ -635,7 +721,39 @@ impl Generation {
                 return Ok((Row::Present(values), result));
             }
         }
+        if let Some(rows) = rows {
+            for &(part, stale_source) in &stale {
+                rows.remove(key, part, stale_source);
+            }
+            rows.count(0, stale.len(), stale.len());
+        }
         Ok((Row::Absent, LookupResult::Miss))
+    }
+
+    /// What the row cache holds for `part` of `key`'s row, served when
+    /// this generation holds the entry's file and has not deleted its row
+    /// there, else stale.
+    fn probe(&self, rows: &TableRows, key: &Key, part: Part) -> Probe {
+        match rows.get(key, part) {
+            None => Probe::default(),
+            Some(Entry { source, held }) => {
+                let live = self
+                    .slots
+                    .get(&source.file)
+                    .is_some_and(|&at| !self.is_deleted(at, source.position));
+                if live {
+                    Probe {
+                        served: Some((source, held)),
+                        stale: None,
+                    }
+                } else {
+                    Probe {
+                        served: None,
+                        stale: Some(source),
+                    }
+                }
+            }
+        }
     }
 
     /// One Scan of `key` (RFD 025, Cost): its live rows at or above
@@ -1193,6 +1311,95 @@ fn refuse_record_count_mismatch(
     Ok(())
 }
 
+/// What a lookup found in the row cache for one part of the key's row
+/// (`Generation::probe`): the entry its generation serves, with where it
+/// was read, or where an entry it does not serve was read.
+#[derive(Default)]
+struct Probe {
+    served: Option<(Source, Held)>,
+    stale: Option<Source>,
+}
+
+/// Where a lookup took one column's value from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Served {
+    /// The row cache.
+    Cache,
+    /// The column's value page, through the page cache.
+    Page,
+    /// The column's default, in a file written before the column was
+    /// added (RFD 023).
+    Default,
+}
+
+/// The parts of a key's row a lookup naming `columns` asks the row cache
+/// for: each column, or the row itself when none is named.
+fn parts(columns: &[usize]) -> impl Iterator<Item = Part> + '_ {
+    columns
+        .iter()
+        .map(|&column| Part::Column(column))
+        .chain(columns.is_empty().then_some(Part::Presence))
+}
+
+/// The row a lookup naming `columns` columns answers from the row cache
+/// alone, when every part it asks for was served (`probes`): each
+/// column's value, or none for a presence-only lookup.
+fn served_whole(probes: &[Probe], columns: usize) -> Option<Row> {
+    let served: Option<Vec<Held>> = probes
+        .iter()
+        .map(|probe| probe.served.as_ref().map(|(_, held)| held.clone()))
+        .collect();
+    let served = served?;
+    Some(Row::Present(
+        served.into_iter().take(columns).map(held_value).collect(),
+    ))
+}
+
+/// What a lookup of `key` naming `columns`, which found the row at
+/// `source` and took each column's value as `read` says, leaves in `rows`
+/// and counts there: a presence-only lookup caches the row's presence; an
+/// entry found stale for a column answered by its default is dropped, since
+/// no read replaced it; a part served from the cache is a hit, and a part
+/// read through the index is a miss, a stale one among them.
+fn settle(
+    rows: &TableRows,
+    key: &Key,
+    columns: &[usize],
+    source: Source,
+    read: &[(Option<Bytes>, bool, Served)],
+    stale: &[(Part, Source)],
+) {
+    let served = |served: Served| read.iter().filter(|(_, _, by)| *by == served).count();
+    let mut misses = served(Served::Page);
+    if columns.is_empty() {
+        rows.insert(key, Part::Presence, source, Caching::Presence);
+        misses += 1;
+    }
+    for &(part, stale_source) in stale {
+        let by_default = match part {
+            Part::Column(column) => columns
+                .iter()
+                .zip(read)
+                .any(|(&named, (_, _, by))| named == column && *by == Served::Default),
+            Part::Presence => false,
+        };
+        if by_default {
+            rows.remove(key, part, stale_source);
+            misses += 1;
+        }
+    }
+    rows.count(served(Served::Cache), misses, stale.len());
+}
+
+/// A column's value as an entry holds it: its bytes, or `None` for a
+/// null. A presence entry holds no column's value.
+fn held_value(held: Held) -> Option<Bytes> {
+    match held {
+        Held::Value(bytes) => Some(bytes),
+        Held::Null | Held::Present => None,
+    }
+}
+
 /// The order of a generation's files: bucketing, bucket, the exact first
 /// key, then path, so two loads of one snapshot order the same and files
 /// of one bucket are in key order for the overlap sweep.
@@ -1489,7 +1696,7 @@ async fn build_all(
     stream::iter(inspected)
         .map(|(entry, inspected)| async move {
             let index = inspected.build(residency, local, reservation).await?;
-            let file = LoadedFile { entry, index };
+            let file = LoadedFile::new(entry, index);
             refuse_fences_outside_bucket(table, &file)?;
             Ok::<_, Error>(Arc::new(file))
         })
@@ -3606,8 +3813,8 @@ mod tests {
             .await
             .unwrap();
             let bounds = keys.iter().min().zip(keys.iter().max());
-            Arc::new(LoadedFile {
-                entry: DataFileEntry {
+            Arc::new(LoadedFile::new(
+                DataFileEntry {
                     path: Self::location(name),
                     bucket,
                     bucketing,
@@ -3620,7 +3827,7 @@ mod tests {
                     partition: manifest::Partition::unpartitioned(),
                 },
                 index,
-            })
+            ))
         }
 
         /// A file of `keys` with their values.

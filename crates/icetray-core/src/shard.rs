@@ -121,7 +121,12 @@ impl Tally {
 
     /// Counts one event on the calling thread's shard.
     pub(crate) fn increment(&self) {
-        self.shards.mine().fetch_add(1, Ordering::Relaxed);
+        self.add(1);
+    }
+
+    /// Counts `events` events on the calling thread's shard.
+    pub(crate) fn add(&self, events: u64) {
+        self.shards.mine().fetch_add(events, Ordering::Relaxed);
     }
 
     /// The events counted so far, summed over the shards.

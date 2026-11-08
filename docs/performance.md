@@ -6,7 +6,8 @@ and longer for a file no lookup has read for hours. A read from the local
 directory is a memory copy when the operating system's page cache holds
 the file, and a device read when it does not. A lookup's CPU work,
 decoding one key page and decompressing one value page per column it
-reads, takes microseconds to tens of microseconds. Most tuning changes how
+reads, takes microseconds to tens of microseconds, and a row-cache hit,
+which does neither, under a microsecond. Most tuning changes how
 many lookups wait on a GET, and how much memory or local disk icetray
 spends serving the rest.
 
@@ -32,13 +33,15 @@ dictionary-encoded column, and none for a column added after the row's
 data file was written, whose value icetray returns from the column's
 default. A lookup that requests no column returns only whether its key is
 present, and costs only finding the row: nothing outside memory under
-`full`, a local read under `disk`, and the key page's GET under `bloom`.
+`full`, a local read under `disk`, and the key page's GET under `bloom`,
+and nothing once the row cache holds the row's presence.
 
 A cold hit spends nearly all of its time waiting on its GET, so its
-latency is the object store's. A warm hit and a miss under `full` stay in
-memory and take microseconds. Under `disk` they add a local read of one
-key page, a memory copy while the chunk file is in the kernel's page
-cache and a device read when it is not. `icetray get` prints each
+latency is the object store's. A warm hit the row cache does not serve
+and a miss under `full` stay in memory and take microseconds. Under
+`disk` they add a local read of one key page, a memory copy while the
+chunk file is in the kernel's page cache and a device read when it is
+not. `icetray get` prints each
 lookup's `gets`, so an owner can measure a residency's GET count on a
 real table before configuring it.
 
@@ -314,29 +317,35 @@ limit once the tables serve.
 ## The row cache
 
 A key-value table reads each value through the row cache: one value of
-one row, copied out of its page, keyed by the data file, the row's
-position in it, and the column. A repeated hit finds its values there and
-reads no value page, so it neither decompresses one nor waits on a GET.
-It still finds its key as any lookup does, through the resident key page
-under `full`, a local read under `disk`, and the key page's GET or the
-page cache under `bloom`. A miss in the row cache reads the page as
-before and caches the value, and a lookup that requests no column, or a
-column answered by its default, uses no entry.
+one row, copied out of its page, keyed by the table, the key, and the
+column, with the data file and row icetray read it from. icetray asks the
+row cache before it finds the key, so a repeated hit finds no key and
+reads no page under any residency: no key page decoded under `full`, no
+local read under `disk`, and no key-page GET under `bloom`. A lookup that
+requests no column keeps an entry for the row's presence, so a repeated
+presence-only lookup of a present key is served the same way. On a cache
+miss icetray finds the key and reads the page as before and caches what
+it read; a column answered by its default uses no entry, and an absent
+key has none.
 
 The same memory holds many more hot rows than pages: a value page holds a
 hot row beside every row stored next to it, so where hot keys are
 scattered through the key order, as hashed or arbitrarily assigned keys
-are, most of a cached page is rows nobody asked for. Each entry is charged
-its value at its allocation size plus 160 bytes of overhead, so rows of a
-few hundred bytes or more spend most of the budget on values. A value
-larger than one 64 KiB value page is not cached, and a row read once
-leaves before rows that keep being read.
+are, most of a cached page is rows no caller requested. icetray charges
+each entry its key and value, held in one allocation, at the
+allocation's size, plus 160 bytes of overhead, so rows of a few hundred
+bytes or more spend most of the budget on values. icetray does not cache
+a value larger than one 64 KiB value page, and evicts a row read once
+before rows that keep being read.
 
-icetray decides which file and row a key reads, and whether a delete
-removes it, before it asks the row cache, so a deleted or rewritten row
+icetray serves an entry only while the lookup's generation holds the
+entry's file and has not deleted its row, so a deleted or rewritten row
 is never served from it, and nothing is ever invalidated. A refresh keeps
-the entries of every file the new snapshot still lists, and entries of
-files no snapshot lists age out. A restarted replica starts with an empty
+every entry whose file the new snapshot still lists and whose row it
+keeps: after a merge-on-read update only the changed keys' entries fail,
+and after a compaction or a copy-on-write rewrite only the rewritten
+files'. `icetray_row_cache_stale_total` counts the entries icetray found
+and could not serve, and those entries age out. A restarted replica starts with an empty
 row cache and fills it from its traffic.
 
 The row cache holds `server.row_cache_share` of `server.cache_bytes`
@@ -378,13 +387,14 @@ workload; they are not a guarantee for another table, machine, or skew.
 
 | | Value-page GETs per lookup | Lookups/s, 1 task | Lookups/s, 11 tasks | Median latency, 1 task |
 |---|---|---|---|---|
-| Row cache off | 0.68 | 20,900 | 72,100 | 61 µs |
-| Row cache on | 0.39 | 33,300 | 137,800 | 10 µs |
+| Row cache off | 0.68 | 20,900 | 78,600 | 61 µs |
+| Row cache on | 0.41 | 36,900 | 135,600 | 0.96 µs |
 
-The row cache held about one row in sixteen and still served about 61
+The row cache held about one row in nineteen and still served about 59
 percent of lookups, where the page cache alone, holding about one page
 in six, served about 32 percent: each cached page held a few hot rows
-among a thousand cold ones. A table's own gain depends on its skew, its
+among a thousand cold ones. The median lookup is a row-cache hit, which
+finds no key and reads no page. A table's own gain depends on its skew, its
 row size, and its budget, and its hit rate is the one to watch.
 
 ## The page cache

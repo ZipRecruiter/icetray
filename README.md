@@ -212,10 +212,10 @@ metadata and file footers, before deployment.
 
 ```mermaid
 flowchart TB
-    get([Get]) --> find["Find the row<br/>full: in memory<br/>disk: a local read<br/>bloom: the filter, then the key page"]
+    get([Get]) --> row[Row cache]
+    row -- cache miss --> find["Find the row<br/>full: in memory<br/>disk: a local read<br/>bloom: the filter, then the key page"]
     find -- key absent --> miss([Miss])
-    find -- key present --> row[Row cache]
-    row -- cache miss --> mem[Page cache, memory level]
+    find -- key present --> mem[Page cache, memory level]
     mem -- cache miss --> disk[Page cache, disk level]
     disk -- cache miss --> s3[GET from object storage]
     row -- hit --> done([Value])
@@ -228,7 +228,7 @@ flowchart TB
 
 | Served from | Typical latency | Sized by |
 |---|---|---|
-| The row cache, in memory | about 10 µs | `server.row_cache_share` of `server.cache_bytes` |
+| The row cache, in memory | about 1 µs | `server.row_cache_share` of `server.cache_bytes` |
 | The page cache's memory level | tens of µs | the rest of `server.cache_bytes` |
 | The page cache's disk level | a local read: about 0.1 ms from the kernel's page cache, 0.7 ms from the device | `storage.local.page_cache_disk_bytes` |
 | Object storage, a cold hit | about 80 ms at the median and 170 ms at the 99th percentile in-region, for a file not read lately | not cached |
@@ -238,8 +238,8 @@ its cold hits. A replica restarted on the same local volume keeps the
 disk level's pages, and its memory caches start empty and fill from its
 traffic.
 
-`disk` residency adds a local key-page read to every lookup, and `bloom`
-adds a key-page GET to a cold one.
+`disk` residency adds a local key-page read to every lookup the row cache
+does not serve, and `bloom` adds a key-page GET to a cold one.
 
 The figures come from the
 [row cache's skewed-key benchmark](docs/performance.md#skewed-keys-measured),

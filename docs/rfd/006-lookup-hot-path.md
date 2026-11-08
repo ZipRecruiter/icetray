@@ -30,6 +30,9 @@
 > The open question of a decompressed-page cache is answered by caching
 > rows instead. See RFD 026.
 
+> Updated 2026-11-07: icetray checks the row cache for a key-value
+> lookup before the index, and reads no key page for a hit. See RFD 026.
+
 ## Problem
 
 RFD 004 (Resident key-chunk index) settles what stays in memory for each
@@ -64,25 +67,26 @@ segments as an error rather than a fetch.
 
 The path is the same for every table whose key chunks are resident:
 
-1. The fence array picks the one key page that can hold the key.
-2. The column reader decodes that page from the resident key chunk and
+1. icetray answers what it can of a key-value lookup from the row cache
+   (RFD 026 (Row cache)), and reads the rest as below.
+2. The fence array picks the one key page that can hold the key.
+3. The column reader decodes that page from the resident key chunk and
    either finds the row or answers the miss. A miss ends here, before any
    value page is read, and so does a presence-only lookup, which names no
    column.
-3. For each column the lookup names (RFD 022 (Value columns)), a
-   key-value table's row cache supplies the value when it holds the row's
-   value for that column (RFD 026 (Row cache)), and otherwise that
-   column's offset index locates its value page and the page cache
-   supplies it, the columns concurrently. A cold read costs one GET per
+4. For each column the lookup names (RFD 022 (Value columns)) that
+   icetray did not answer from the row cache, that column's offset index
+   locates its value page and the page cache supplies it, the columns
+   concurrently. A cold read costs one GET per
    column, a warm one costs none, and concurrent lookups for one page
    share one GET. A column the file answers by its default (RFD 023
    (Column resolution)) reads nothing.
-4. One row is decoded from each page read, by the plain reader for a
+5. One row is decoded from each page read, by the plain reader for a
    page of plain byte arrays in a column neither nested nor repeated and
    with no dictionary page, and by the column reader for every other
    page, and its value is inserted into the row cache; the values return
    in the order the lookup named their columns.
-5. A value whose read names fields of a column declared protobuf (RFD
+6. A value whose read names fields of a column declared protobuf (RFD
    024 (Field projection)) is walked over its top-level fields and
    trimmed to the ones named, after the row cache and the page cache, so
    the cached value and page stay whole for every caller. The walk is
@@ -127,8 +131,10 @@ cheaper than another.
 
 ## Consequences
 
-Per-lookup CPU is one key page decoded and one value page decompressed per
-named column the row cache does not hold, and, for a projected read, a
+icetray decodes no page for a lookup it answers wholly from the row
+cache. Every other lookup's CPU is one key page decoded and one value
+page decompressed per named column icetray does not answer from it,
+and, for a projected read, a
 walk of the one value, small beside the page it came from. On a warm hit
 of one column from the page cache nearly all of the time goes to decoding
 those two pages, and little to the lookup itself;

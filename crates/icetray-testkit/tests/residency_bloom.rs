@@ -131,10 +131,10 @@ async fn test_bloom_cold_hit_is_two_gets_warm_none() -> Result<()> {
     Ok(())
 }
 
-/// A Bloom-tier row-cache hit still resolves its key: with the page cache
-/// emptied, it reads the key page, and no value page (RFD 026).
+/// A Bloom-tier row-cache hit resolves no key: with the page cache
+/// emptied, it reads neither its key page nor its value page (RFD 026).
 #[tokio::test]
-async fn test_a_bloom_row_cache_hit_still_reads_its_key_page() -> Result<()> {
+async fn test_a_bloom_row_cache_hit_reads_no_page() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
     let fixture = write_fixture(
         catalog.as_ref(),
@@ -153,7 +153,11 @@ async fn test_a_bloom_row_cache_hit_still_reads_its_key_page() -> Result<()> {
     assert_eq!(cold, key_pages + value_pages, "a key page and a value page");
     served.cache.clear();
     let hit = verify::verify_hits(&served, &fixture, &SAMPLE).await?;
-    assert_eq!(hit, key_pages, "the key pages alone");
+    assert_eq!(hit, 0, "no key page and no value page");
+    assert!(
+        key_pages > 0,
+        "a lookup the row cache did not serve reads key pages"
+    );
     Ok(())
 }
 

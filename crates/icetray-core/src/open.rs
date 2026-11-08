@@ -961,10 +961,19 @@ mod tests {
 
     /// Whether the row cache of `opened` keeps a value inserted into it.
     fn row_cache_keeps_a_value(opened: &Opened) -> bool {
-        let file: Arc<str> = Arc::from("mem://w/db/t/data/rows.parquet");
-        let key = crate::row_cache::RowKey::new(&file, crate::index::RowPosition(0), 0);
-        opened.row_cache.insert(key.clone(), Some(b"a value"));
-        opened.row_cache.get(&key) != crate::row_cache::Cached::Absent
+        let rows = opened.row_cache.for_table("t");
+        let (key, part) = (crate::key::Key::Long(0), crate::row_cache::Part::Column(0));
+        let source = crate::row_cache::Source {
+            file: crate::generation::FileNumber::from_le_bytes([0; 8]),
+            position: crate::index::RowPosition(0),
+        };
+        rows.insert(
+            &key,
+            part,
+            source,
+            crate::row_cache::Caching::Column(Some(b"a value")),
+        );
+        rows.get(&key, part).is_some()
     }
 
     /// `opened` after a reload to `tables`: the tables applied, then the

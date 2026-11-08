@@ -24,12 +24,19 @@ pub const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
 /// Page fetches the page cache ran, after coalescing: a span fetch counts
 /// once however many pages it holds.
 pub const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
-/// Value reads the row cache served without reading a page (RFD 026),
-/// a cached null included.
+/// Value reads, and presence-only lookups of present keys, that icetray
+/// served from the row cache without resolving the key or reading a page
+/// (RFD 026), a cached null included.
 pub const ROW_CACHE_HITS_TOTAL: &str = "icetray_row_cache_hits_total";
-/// Value reads the row cache did not hold (RFD 026), each then read from
-/// the page cache.
+/// Value reads, and presence-only lookups of present keys, that icetray
+/// did not serve from the row cache (RFD 026), each then read through the
+/// index and the page cache, and the stale entries it found
+/// (`ROW_CACHE_STALE_TOTAL`).
 pub const ROW_CACHE_MISSES_TOTAL: &str = "icetray_row_cache_misses_total";
+/// Row-cache entries icetray found for a lookup and could not serve,
+/// because the lookup's generation no longer holds the entry's file or has
+/// deleted its row (RFD 026); each is a miss too.
+pub const ROW_CACHE_STALE_TOTAL: &str = "icetray_row_cache_stale_total";
 /// Lookups answered, by `table` and `result`.
 pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
 /// Value-page GETs lookups and Scans issued to object storage, by `table`
@@ -214,7 +221,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 58] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 59] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -258,12 +265,17 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 58] = [
     (
         ROW_CACHE_HITS_TOTAL,
         Kind::Counter,
-        "Value reads the row cache served without reading a page, cached nulls included.",
+        "Value reads and presence-only lookups served from the row cache, cached nulls included.",
     ),
     (
         ROW_CACHE_MISSES_TOTAL,
         Kind::Counter,
-        "Value reads the row cache did not hold and the page cache then served.",
+        "Value reads and presence-only lookups of present keys not served from the row cache.",
+    ),
+    (
+        ROW_CACHE_STALE_TOTAL,
+        Kind::Counter,
+        "Row-cache entries found whose file or row the lookup's generation no longer serves.",
     ),
     (
         LOOKUPS_TOTAL,

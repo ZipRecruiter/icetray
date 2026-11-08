@@ -1,23 +1,29 @@
-//! The row cache (RFD 026): the values of key-value lookups, keyed by data
-//! file, row position, and column, so a repeated hit reads no value page.
-//! One cache serves every table of a server that reads through it, holds
-//! each value as a copy of its own, and evicts by the bytes the values and
-//! their entries take, within one budget. Nothing is invalidated: a data
-//! file never changes, and a row position names the same row for as long as
-//! the file exists.
+//! The row cache (RFD 026): the values of key-value lookups, and the
+//! presence of rows presence-only lookups found, keyed by table, table key,
+//! and column, so a repeated hit resolves no key and reads no page. Each
+//! entry records the loaded file and the row it was read from, and a
+//! lookup serves it only while its generation holds that file and has not
+//! deleted the row (`Generation::lookup`), so nothing is invalidated. One
+//! cache serves every table of a server that reads through it, holds each
+//! entry as one allocation of its own, and evicts by the bytes the entries
+//! take, within one budget.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use quick_cache::sync::{Cache, DefaultLifecycle};
-use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
+use quick_cache::{DefaultHashBuilder, Equivalent, OptionsBuilder, Weighter};
 
 use crate::approx;
 use crate::contract::VALUE_PAGE_BYTES;
+use crate::generation::FileNumber;
 use crate::index::RowPosition;
+use crate::key::Key;
 use crate::metric;
 use crate::shard::Tally;
 
@@ -26,12 +32,11 @@ use crate::shard::Tally;
 /// displace thousands of narrow ones.
 pub(crate) const ROW_CACHE_MAX_VALUE_BYTES: u64 = VALUE_PAGE_BYTES;
 
-/// Bytes of a `quick_cache` slot: its key, hash, links, and `Bytes`
-/// handle, and the key's `Arc<str>` pointer, measured at about 120 bytes
-/// for rows of 100 bytes once the allocator's rounding of the value is
-/// taken out. The file id's own bytes are shared by every entry of the file
-/// and are not charged per entry. A ghost keeps its slot and no value, so
-/// it is charged this much.
+/// Bytes of a `quick_cache` slot: its hash, links, and the `Bytes`
+/// handles of its key and value, measured at about 120 bytes for rows of
+/// 100 bytes, with a key and a value of the same 32 bytes each, once the
+/// allocator's rounding of the value is taken out. A ghost keeps its slot
+/// and no entry, so it is charged this much.
 const ROW_SLOT_BYTES: u64 = 128;
 
 /// Bytes of the shared header the first clone of a cached `Bytes`
@@ -50,7 +55,7 @@ pub(crate) const ROW_ENTRY_OVERHEAD_BYTES: u64 = ROW_SLOT_BYTES + SHARED_HEADER_
 
 /// The weight of an average entry, which `quick_cache` divides the budget by
 /// to choose how many shards to split into: what a value of about a
-/// hundred bytes weighs (`weigh`), rounded down to twice `ROW_SLOT_BYTES`,
+/// hundred bytes is charged (`charged`), rounded down to twice `ROW_SLOT_BYTES`,
 /// so the ghost list's reserve is a sixteenth of the budget
 /// (`GHOST_ITEMS_DIVISOR`). It sets the shard count and the reserve only;
 /// the budget is enforced by weight.
@@ -150,62 +155,254 @@ const fn size_class(len: usize) -> usize {
     len.next_multiple_of(spacing)
 }
 
-/// What an entry holding a value of `value_len` bytes (`None` for a cached
-/// null) is charged against the budget: the allocation the value's copy
-/// takes, in jemalloc's size class, plus `ROW_ENTRY_OVERHEAD_BYTES`.
-pub(crate) fn weigh(value_len: Option<usize>) -> u64 {
-    approx::count(size_class(value_len.unwrap_or(0))) + ROW_ENTRY_OVERHEAD_BYTES
+/// What an entry whose one allocation is `entry_len` bytes is charged
+/// against the budget: the allocation in jemalloc's size class, plus
+/// `ROW_ENTRY_OVERHEAD_BYTES`.
+fn charged(entry_len: usize) -> u64 {
+    approx::count(size_class(entry_len)) + ROW_ENTRY_OVERHEAD_BYTES
 }
 
-/// One cached value's address: a data file's id, a row's position in it,
-/// and a value column's leaf in the file's schema. The leaf, not the
-/// column's place in a table's layout, so two tables listing the same
-/// file's columns in different orders share entries.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct RowKey {
-    file: Arc<str>,
-    position: u64,
-    leaf: u32,
+/// What an entry for a table key of `key_len` bytes and a value of
+/// `value_len` bytes (`None` for a cached null or a presence entry) is
+/// charged (`charged`): its allocation holds the key, where it was read,
+/// and the value, `ENTRY_HEAD_BYTES` beside the two.
+#[cfg(test)]
+pub(crate) fn weigh(key_len: usize, value_len: Option<usize>) -> u64 {
+    charged(ENTRY_HEAD_BYTES + key_len + value_len.unwrap_or(0))
 }
 
-impl RowKey {
-    /// The key of the value at `leaf` of the row at `position` in `file`.
-    pub(crate) fn new(file: &Arc<str>, position: RowPosition, leaf: usize) -> Self {
-        Self {
-            file: Arc::clone(file),
-            position: position.0,
-            leaf: u32::try_from(leaf).expect("a schema's leaf index fits a u32"),
+/// Bytes of an entry's allocation before its table key: the table's
+/// number and the part of the row the entry is for (`Part::code`), four
+/// bytes each.
+const KEY_HEAD_BYTES: usize = 8;
+
+/// Bytes of an entry's allocation between its table key and its value:
+/// where the value was read (`Source`), the file's number and the row's
+/// position, eight bytes each, and what the entry holds (`HELD_*`), one.
+const SOURCE_BYTES: usize = 17;
+
+/// Bytes of an entry's allocation beside its table key and its value.
+const ENTRY_HEAD_BYTES: usize = KEY_HEAD_BYTES + SOURCE_BYTES;
+
+/// The held byte of an entry for a column whose value is null.
+const HELD_NULL: u8 = 0;
+/// The held byte of an entry for a column's value.
+const HELD_VALUE: u8 = 1;
+/// The held byte of a presence entry.
+const HELD_PRESENT: u8 = 2;
+
+/// What of a table key's row an entry is for: one of the table's value
+/// columns, by its place in the table's layout, or, for a presence-only
+/// lookup, the row itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Part {
+    /// The value column at this place in the layout.
+    Column(usize),
+    /// The row, for a presence-only lookup.
+    Presence,
+}
+
+impl Part {
+    /// The part as an entry stores it: a column's place, or `u32::MAX`
+    /// for the row.
+    fn code(self) -> u32 {
+        match self {
+            Self::Column(column) => {
+                let code = u32::try_from(column).expect("a table's value columns fit a u32");
+                assert!(code < u32::MAX, "a table's value columns fit a u32");
+                code
+            }
+            Self::Presence => u32::MAX,
         }
     }
 }
 
-/// What `RowCache::get` finds at a key: a row the cache does not hold, a
-/// null it holds, or a value it holds. A null is a value the lookup read, so
-/// it is told apart from a row never read.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Cached {
-    /// The cache holds nothing at the key.
-    Absent,
-    /// The cache holds a null at the key.
-    Null,
-    /// The cache holds these bytes at the key.
-    Value(Bytes),
+/// Where an entry's value was read: the loaded file, by its number
+/// (`FileNumber`), and the row's position in it. A lookup serves the entry
+/// only while its generation holds that file and has not deleted the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Source {
+    /// The loaded file the row was read from.
+    pub(crate) file: FileNumber,
+    /// The row's position in the file.
+    pub(crate) position: RowPosition,
 }
 
-/// Weighs an entry by `weigh`.
+/// What an entry holds for its part of the row: a column's null, a
+/// column's value, or, for a presence entry, that the row is there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// The column is null in the row.
+    Null,
+    /// The column's value in the row.
+    Value(Bytes),
+    /// The row is there; a presence entry holds no value.
+    Present,
+}
+
+/// What a lookup caches for one part of a row, borrowed from what it read:
+/// a column's value, `None` for its null, or a row's presence.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Caching<'a> {
+    /// A column's value, or `None` for its null.
+    Column(Option<&'a [u8]>),
+    /// The row's presence, for a presence-only lookup.
+    Presence,
+}
+
+/// One entry: where it was read and what it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Entry {
+    /// Where the entry was read.
+    pub(crate) source: Source,
+    /// What it holds.
+    pub(crate) held: Held,
+}
+
+/// Feeds `hasher` an entry's address the one way both `EntryKey` and
+/// `Address` hash it, so a borrowed address finds a stored key.
+fn hash_address<H: Hasher>(table: u32, part: u32, key: &[u8], hasher: &mut H) {
+    hasher.write_u32(table);
+    hasher.write_u32(part);
+    hasher.write(key);
+}
+
+/// A stored entry's key: its table's number, its part's code, and the
+/// table key's bytes (`Key::as_bytes`), the head of the entry's one
+/// allocation, which `EntryValue` shares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EntryKey(Bytes);
+
+impl EntryKey {
+    /// The four bytes at `at` as a number.
+    fn word(&self, at: usize) -> u32 {
+        let bytes: [u8; 4] = self.0[at..at + 4]
+            .try_into()
+            .expect("an entry key holds its head");
+        u32::from_le_bytes(bytes)
+    }
+
+    fn table(&self) -> u32 {
+        self.word(0)
+    }
+
+    fn part(&self) -> u32 {
+        self.word(4)
+    }
+
+    fn key(&self) -> &[u8] {
+        &self.0[KEY_HEAD_BYTES..]
+    }
+}
+
+impl Hash for EntryKey {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        hash_address(self.table(), self.part(), self.key(), hasher);
+    }
+}
+
+/// An entry's address as a lookup holds it, borrowed, so finding an entry
+/// allocates nothing.
+#[derive(Clone, Copy)]
+struct Address<'a> {
+    table: u32,
+    part: u32,
+    key: &'a [u8],
+}
+
+impl Hash for Address<'_> {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        hash_address(self.table, self.part, self.key, hasher);
+    }
+}
+
+impl Equivalent<EntryKey> for Address<'_> {
+    fn equivalent(&self, stored: &EntryKey) -> bool {
+        stored.table() == self.table && stored.part() == self.part && stored.key() == self.key
+    }
+}
+
+/// A stored entry's value: where it was read and what it holds
+/// (`SOURCE_BYTES`), then the value's bytes, the tail of the allocation
+/// `EntryKey` heads.
+#[derive(Clone, Debug)]
+struct EntryValue(Bytes);
+
+impl EntryValue {
+    /// Where the entry was read.
+    fn source(&self) -> Source {
+        let word = |at: usize| -> [u8; 8] {
+            self.0[at..at + 8]
+                .try_into()
+                .expect("an entry value holds its source")
+        };
+        Source {
+            file: FileNumber::from_le_bytes(word(0)),
+            position: RowPosition(u64::from_le_bytes(word(8))),
+        }
+    }
+
+    /// The entry as a lookup reads it, its value a handle on the entry's
+    /// allocation.
+    fn entry(&self) -> Entry {
+        let held = match self.0[SOURCE_BYTES - 1] {
+            HELD_NULL => Held::Null,
+            HELD_PRESENT => Held::Present,
+            HELD_VALUE => Held::Value(self.0.slice(SOURCE_BYTES..)),
+            other => unreachable!("an entry's held byte is a HELD_ constant, not {other}"),
+        };
+        Entry {
+            source: self.source(),
+            held,
+        }
+    }
+}
+
+/// An entry of `table`'s `part` at `key`, read at `source`, holding
+/// `held`, as one allocation its key and value share, so the entry keeps
+/// nothing of the page its value was read from.
+fn entry(
+    table: u32,
+    part: Part,
+    key: &[u8],
+    source: Source,
+    held: Caching<'_>,
+) -> (EntryKey, EntryValue) {
+    let (held_byte, value) = match held {
+        Caching::Presence => (HELD_PRESENT, &[][..]),
+        Caching::Column(None) => (HELD_NULL, &[][..]),
+        Caching::Column(Some(value)) => (HELD_VALUE, value),
+    };
+    let key_len = KEY_HEAD_BYTES + key.len();
+    let mut bytes = Vec::with_capacity(ENTRY_HEAD_BYTES + key.len() + value.len());
+    bytes.extend_from_slice(&table.to_le_bytes());
+    bytes.extend_from_slice(&part.code().to_le_bytes());
+    bytes.extend_from_slice(key);
+    bytes.extend_from_slice(&source.file.to_le_bytes());
+    bytes.extend_from_slice(&source.position.0.to_le_bytes());
+    bytes.push(held_byte);
+    bytes.extend_from_slice(value);
+    let bytes = Bytes::from(bytes);
+    (
+        EntryKey(bytes.slice(..key_len)),
+        EntryValue(bytes.slice(key_len..)),
+    )
+}
+
+/// Weighs an entry by `charged`.
 #[derive(Clone)]
 struct RowWeighter;
 
-impl Weighter<RowKey, Option<Bytes>> for RowWeighter {
-    fn weight(&self, _key: &RowKey, value: &Option<Bytes>) -> u64 {
-        weigh(value.as_ref().map(Bytes::len))
+impl Weighter<EntryKey, EntryValue> for RowWeighter {
+    fn weight(&self, key: &EntryKey, value: &EntryValue) -> u64 {
+        charged(key.0.len() + value.0.len())
     }
 }
 
 /// One `quick_cache`, the part of its budget its ghost list holds back,
 /// and its entries' capacity as last set.
 struct Built {
-    cache: Cache<RowKey, Option<Bytes>, RowWeighter>,
+    cache: Cache<EntryKey, EntryValue, RowWeighter>,
     ghosts: GhostReserve,
     /// The entries' capacity `set_capacity` last gave `cache`, kept apart
     /// because `quick_cache` sums its capacity under a read lock of every
@@ -268,73 +465,61 @@ struct Inner {
     built: ArcSwap<Built>,
     hits: Tally,
     misses: Tally,
+    stale: Tally,
+    /// Each table name's number in the cache, given the first time a table
+    /// of that name asks (`RowCache::for_table`) and kept for the process,
+    /// so two tables' equal keys hold separate entries.
+    tables: Mutex<HashMap<String, u32>>,
 }
 
-/// The row cache (RFD 026): values keyed by file, row, and column,
-/// within a byte budget, evicting what is read least. A clone is another
-/// handle on the same cache.
+/// The row cache (RFD 026): entries keyed by table, table key, and column,
+/// each checked against the generation it is served from, within a byte
+/// budget, evicting what is read least. A clone is another handle on the
+/// same cache.
 #[derive(Clone)]
 pub struct RowCache(Arc<Inner>);
 
 impl RowCache {
-    /// A cache whose entries, as `weigh` charges them, and ghost list
+    /// A cache whose entries, as `charged` charges them, and ghost list
     /// together take at most `capacity_bytes`: the ghost list's slots are
     /// reserved out of it (`GhostReserve`) and the entries hold the rest.
-    /// Its hit and miss counters are registered at zero in the recorder
-    /// current now. It splits into shards chosen for `capacity_bytes`, each
-    /// holding its share of the entries' part, so an entry is cached only
-    /// when it fits its shard's share: a budget under one
-    /// `ROW_CACHE_MAX_VALUE_BYTES` value per shard caches only smaller
-    /// values, and a budget of zero, a server none of whose tables reads
-    /// through the cache, caches nothing.
+    /// Its hit, miss, and stale counters are registered at zero in the
+    /// recorder current now. It splits into shards chosen for
+    /// `capacity_bytes`, each holding its share of the entries' part, so
+    /// an entry is cached only when it fits its shard's share: a budget
+    /// under one `ROW_CACHE_MAX_VALUE_BYTES` value per shard caches only
+    /// smaller values, and a budget of zero, a server none of whose tables
+    /// reads through the cache, caches nothing.
     #[must_use]
     pub fn new(capacity_bytes: u64) -> Self {
         Self(Arc::new(Inner {
             built: ArcSwap::from_pointee(Built::new(capacity_bytes)),
             hits: Tally::new(metrics::counter!(metric::ROW_CACHE_HITS_TOTAL)),
             misses: Tally::new(metrics::counter!(metric::ROW_CACHE_MISSES_TOTAL)),
+            stale: Tally::new(metrics::counter!(metric::ROW_CACHE_STALE_TOTAL)),
+            tables: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// The handle a table named `name` reads the cache through, under the
+    /// name's number: the number an earlier table of the name was given,
+    /// else the next.
+    pub(crate) fn for_table(&self, name: &str) -> TableRows {
+        let mut tables = self.0.tables.lock().unwrap_or_else(PoisonError::into_inner);
+        let next = u32::try_from(tables.len()).expect("a process names fewer than 2^32 tables");
+        let table = *tables.entry(name.to_string()).or_insert(next);
+        TableRows {
+            cache: self.clone(),
+            table,
+        }
     }
 
     /// Whether the cache holds nothing now and can hold nothing: its
     /// entries' capacity is zero, as at a budget of zero, whether `new` was
     /// given it or a resize set it. A lookup asks this once and then skips
-    /// the cache, so it counts no miss and copies no value it cannot keep.
+    /// the cache, so it counts nothing and copies no value it cannot keep.
     pub(crate) fn is_off(&self) -> bool {
         self.0.built.load().capacity() == 0
-    }
-
-    /// What the cache holds at `key`. Counts a hit, for a null as for a
-    /// value, or a miss on the calling thread's shard.
-    pub(crate) fn get(&self, key: &RowKey) -> Cached {
-        match self.0.built.load().cache.get(key) {
-            Some(Some(bytes)) => {
-                self.0.hits.increment();
-                Cached::Value(bytes)
-            }
-            Some(None) => {
-                self.0.hits.increment();
-                Cached::Null
-            }
-            None => {
-                self.0.misses.increment();
-                Cached::Absent
-            }
-        }
-    }
-
-    /// Caches a copy of `value` at `key`, a null for `None`, so the entry
-    /// keeps none of the page the value was read from alive. A value over
-    /// `ROW_CACHE_MAX_VALUE_BYTES` is not cached.
-    pub(crate) fn insert(&self, key: RowKey, value: Option<&[u8]>) {
-        if value.is_some_and(|bytes| approx::count(bytes.len()) > ROW_CACHE_MAX_VALUE_BYTES) {
-            return;
-        }
-        self.0
-            .built
-            .load()
-            .cache
-            .insert(key, value.map(Bytes::copy_from_slice));
     }
 
     /// Sets the budget to `capacity_bytes`, evicting entries until what is
@@ -369,22 +554,105 @@ impl RowCache {
         }
     }
 
-    /// Bytes charged against the budget now: each entry as `weigh` charges
+    /// Bytes charged against the budget now: each entry as `charged` charges
     /// it.
     #[must_use]
     pub fn usage(&self) -> u64 {
         self.0.built.load().cache.weight()
     }
 
-    /// Moves the hits and misses counted since the last call into
-    /// `row_cache_hits_total` and `row_cache_misses_total`, and sets
+    /// Moves the hits, misses, and stale entries counted since the last call
+    /// into `row_cache_hits_total`, `row_cache_misses_total`, and
+    /// `row_cache_stale_total`, and sets
     /// `row_cache_bytes` to `usage`; a scrape calls this, so the counters
     /// read every lookup before it and the gauge reads evictions as well as
     /// inserts. The last clone dropped publishes the counts that remain.
     pub fn publish(&self) {
         self.0.hits.publish();
         self.0.misses.publish();
+        self.0.stale.publish();
         metrics::gauge!(metric::ROW_CACHE_BYTES).set(approx::gauge(self.usage()));
+    }
+}
+
+/// One table's handle on the row cache: the cache and the table's number
+/// in it (`RowCache::for_table`). Entries are found by the table key's
+/// bytes (`Key::as_bytes`), unique within the table's one key type.
+#[derive(Clone)]
+pub(crate) struct TableRows {
+    cache: RowCache,
+    table: u32,
+}
+
+impl TableRows {
+    /// Whether the cache is off (`RowCache::is_off`).
+    pub(crate) fn is_off(&self) -> bool {
+        self.cache.is_off()
+    }
+
+    /// The entry for `part` of `key`'s row, if the cache holds one, counted
+    /// nowhere: the lookup counts what it served (`count`) once it knows.
+    pub(crate) fn get(&self, key: &Key, part: Part) -> Option<Entry> {
+        let key = key.as_bytes();
+        let address = Address {
+            table: self.table,
+            part: part.code(),
+            key: &key,
+        };
+        self.cache
+            .0
+            .built
+            .load()
+            .cache
+            .get(&address)
+            .map(|value| value.entry())
+    }
+
+    /// Caches `part` of `key`'s row as read at `source`, holding `held`,
+    /// replacing any entry there. A value over `ROW_CACHE_MAX_VALUE_BYTES`
+    /// is not cached.
+    pub(crate) fn insert(&self, key: &Key, part: Part, source: Source, held: Caching<'_>) {
+        if let Caching::Column(Some(bytes)) = held
+            && approx::count(bytes.len()) > ROW_CACHE_MAX_VALUE_BYTES
+        {
+            return;
+        }
+        let (key, value) = entry(self.table, part, &key.as_bytes(), source, held);
+        self.cache.0.built.load().cache.insert(key, value);
+    }
+
+    /// Drops the entry for `part` of `key`'s row if it is still the one
+    /// read at `source`, leaving one a later lookup cached in its place.
+    pub(crate) fn remove(&self, key: &Key, part: Part, source: Source) {
+        let key = key.as_bytes();
+        let address = Address {
+            table: self.table,
+            part: part.code(),
+            key: &key,
+        };
+        self.cache
+            .0
+            .built
+            .load()
+            .cache
+            .remove_if(&address, |value| value.source() == source);
+    }
+
+    /// Counts what one lookup did with the cache, on the calling thread's
+    /// shard: `hits` parts it served, `misses` it did not, and `stale`
+    /// entries it found and could not serve, which the caller counts among
+    /// `misses` too.
+    pub(crate) fn count(&self, hits: usize, misses: usize, stale: usize) {
+        let inner = &self.cache.0;
+        for (tally, events) in [
+            (&inner.hits, hits),
+            (&inner.misses, misses),
+            (&inner.stale, stale),
+        ] {
+            if events > 0 {
+                tally.add(approx::count(events));
+            }
+        }
     }
 }
 
@@ -409,8 +677,6 @@ impl fmt::Debug for RowCache {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use bytes::Bytes;
 
     use super::*;
@@ -418,7 +684,10 @@ mod tests {
     use crate::index::RowPosition;
     use crate::metric::testing::{Series, recorded_with};
 
-    const FILE: &str = "s3://bucket/data/a.parquet";
+    /// The table the tests' entries are cached for.
+    const TABLE: &str = "a_table";
+    /// The bytes of a long table key (`Key::as_bytes`).
+    const LONG_KEY_BYTES: usize = 8;
     /// A budget that holds every entry a test makes, in each of the shards
     /// it splits into.
     const ROOMY_BYTES: u64 = GIB;
@@ -426,16 +695,100 @@ mod tests {
     /// them is told to expect, so it splits into several shards.
     const SHARD_ROWS_ESTIMATE: u64 = 4096;
 
-    fn file() -> Arc<str> {
-        Arc::from(FILE)
+    /// An entry's place in the tests: `column` of the row of long key `n`
+    /// in `TABLE`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct At {
+        n: u64,
+        column: usize,
     }
 
-    fn key(position: u64, leaf: usize) -> RowKey {
-        RowKey::new(&file(), RowPosition(position), leaf)
+    fn key(n: u64, column: usize) -> At {
+        At { n, column }
+    }
+
+    fn long(n: u64) -> Key {
+        Key::Long(i64::try_from(n).unwrap())
+    }
+
+    /// Where the tests' entries were read: row `position` of one file.
+    fn source(position: u64) -> Source {
+        Source {
+            file: FileNumber::from_le_bytes(7_u64.to_le_bytes()),
+            position: RowPosition(position),
+        }
+    }
+
+    /// What a test reads back at an entry's place: nothing, a null, or a
+    /// value.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Cached {
+        Absent,
+        Null,
+        Value(Bytes),
+    }
+
+    /// A cache read and written at `At`s through `TABLE`'s handle, each
+    /// entry read at `source(at.n)`.
+    trait AtRows {
+        fn insert(&self, at: At, value: Option<&[u8]>);
+        /// What the cache holds at `at`, counted a hit or a miss.
+        fn get(&self, at: &At) -> Cached;
+        /// Whether the cache holds `at`, counted nowhere and leaving its
+        /// place in the queues as it was.
+        fn holds(&self, at: &At) -> bool;
+        fn shard_of(&self, at: &At) -> usize;
+    }
+
+    impl AtRows for RowCache {
+        fn insert(&self, at: At, value: Option<&[u8]>) {
+            self.for_table(TABLE).insert(
+                &long(at.n),
+                Part::Column(at.column),
+                source(at.n),
+                Caching::Column(value),
+            );
+        }
+
+        fn get(&self, at: &At) -> Cached {
+            let rows = self.for_table(TABLE);
+            let got = rows.get(&long(at.n), Part::Column(at.column));
+            rows.count(usize::from(got.is_some()), usize::from(got.is_none()), 0);
+            match got.map(|entry| entry.held) {
+                None => Cached::Absent,
+                Some(Held::Null) => Cached::Null,
+                Some(Held::Value(bytes)) => Cached::Value(bytes),
+                Some(Held::Present) => panic!("a column's entry holds a value or a null"),
+            }
+        }
+
+        fn holds(&self, at: &At) -> bool {
+            let rows = self.for_table(TABLE);
+            let long = long(at.n);
+            let key = long.as_bytes();
+            let address = Address {
+                table: rows.table,
+                part: Part::Column(at.column).code(),
+                key: &key,
+            };
+            self.0.built.load().cache.contains_key(&address)
+        }
+
+        fn shard_of(&self, at: &At) -> usize {
+            let rows = self.for_table(TABLE);
+            let long = long(at.n);
+            let key = long.as_bytes();
+            let address = Address {
+                table: rows.table,
+                part: Part::Column(at.column).code(),
+                key: &key,
+            };
+            self.0.built.load().cache.shard_index(&address)
+        }
     }
 
     /// Rows of a kibibyte inserted into one shard of a cache, the shard of
-    /// `key(0, 0)`, each at a position not inserted before: eviction is per
+    /// `key(0, 0)`, each at a key not inserted before: eviction is per
     /// shard, so these rows displace one another and nothing else.
     struct OneShard<'a> {
         cache: &'a RowCache,
@@ -447,24 +800,24 @@ mod tests {
 
     impl<'a> OneShard<'a> {
         fn of(cache: &'a RowCache) -> Self {
-            let built = cache.0.built.load();
             Self {
                 cache,
-                shard: built.cache.shard_index(&key(0, 0)),
-                rows: built.cache.shard_capacity() / weigh(Some(approx::length(KIB))),
+                shard: cache.shard_of(&key(0, 0)),
+                rows: cache.0.built.load().cache.shard_capacity()
+                    / weigh(LONG_KEY_BYTES, Some(approx::length(KIB))),
                 next_position: 0,
             }
         }
 
-        /// Inserts `rows` new rows into the shard and returns their keys.
-        fn insert(&mut self, rows: u64) -> Vec<RowKey> {
+        /// Inserts `rows` new rows into the shard and returns their places.
+        fn insert(&mut self, rows: u64) -> Vec<At> {
             let value = vec![0_u8; approx::length(KIB)];
             let mut inserted = Vec::new();
             while approx::count(inserted.len()) < rows {
                 self.next_position += 1;
                 let candidate = key(self.next_position, 0);
-                if self.cache.0.built.load().cache.shard_index(&candidate) == self.shard {
-                    self.cache.insert(candidate.clone(), Some(&value));
+                if self.cache.shard_of(&candidate) == self.shard {
+                    self.cache.insert(candidate, Some(&value));
                     inserted.push(candidate);
                 }
             }
@@ -491,23 +844,95 @@ mod tests {
         assert_eq!(cache.get(&key(7, 2)), Cached::Null);
     }
 
+    /// Entries differing only in their table, their table key, or the part
+    /// of the row they are for are apart, and a presence entry is apart
+    /// from every column's.
     #[test]
-    fn test_keys_differing_only_in_file_position_or_leaf_are_apart() {
+    fn test_entries_differing_only_in_table_key_or_part_are_apart() {
         let cache = RowCache::new(ROOMY_BYTES);
-        let other_file: Arc<str> = Arc::from("s3://bucket/data/b.parquet");
-        let keys = [
-            key(7, 2),
-            RowKey::new(&other_file, RowPosition(7), 2),
-            key(8, 2),
-            key(7, 3),
+        let (ours, theirs) = (cache.for_table("ours"), cache.for_table("theirs"));
+        let places = [
+            (&ours, 7, Part::Column(2)),
+            (&theirs, 7, Part::Column(2)),
+            (&ours, 8, Part::Column(2)),
+            (&ours, 7, Part::Column(3)),
+            (&ours, 7, Part::Presence),
         ];
-        for (index, key) in keys.iter().enumerate() {
-            cache.insert(key.clone(), Some(&[u8::try_from(index).unwrap()]));
+        for (index, &(rows, n, part)) in places.iter().enumerate() {
+            let value = [u8::try_from(index).unwrap()];
+            let held = if part == Part::Presence {
+                Caching::Presence
+            } else {
+                Caching::Column(Some(&value[..]))
+            };
+            rows.insert(&long(n), part, source(u64::try_from(index).unwrap()), held);
         }
-        for (index, key) in keys.iter().enumerate() {
-            let expected = Bytes::copy_from_slice(&[u8::try_from(index).unwrap()]);
-            assert_eq!(cache.get(key), Cached::Value(expected));
+        for (index, &(rows, n, part)) in places.iter().enumerate() {
+            let held = if part == Part::Presence {
+                Held::Present
+            } else {
+                Held::Value(Bytes::copy_from_slice(&[u8::try_from(index).unwrap()]))
+            };
+            let expected = Entry {
+                source: source(u64::try_from(index).unwrap()),
+                held,
+            };
+            assert_eq!(rows.get(&long(n), part), Some(expected), "{index}");
         }
+    }
+
+    /// A table name keeps the number it was first given, and another name
+    /// takes the next.
+    #[test]
+    fn test_a_table_name_keeps_its_number() {
+        let cache = RowCache::new(ROOMY_BYTES);
+        let first = cache.for_table("first").table;
+        let second = cache.for_table("second").table;
+        assert_ne!(first, second);
+        assert_eq!(cache.for_table("first").table, first);
+    }
+
+    /// An entry read again at another source replaces the one there, and
+    /// a removal for the old source leaves it.
+    #[test]
+    fn test_remove_drops_only_the_entry_read_at_its_source() {
+        let cache = RowCache::new(ROOMY_BYTES);
+        let rows = cache.for_table(TABLE);
+        let (key, part) = (long(1), Part::Column(0));
+        rows.insert(&key, part, source(10), Caching::Column(Some(b"old")));
+        rows.insert(&key, part, source(20), Caching::Column(Some(b"new")));
+        rows.remove(&key, part, source(10));
+        assert_eq!(
+            rows.get(&key, part),
+            Some(Entry {
+                source: source(20),
+                held: Held::Value(Bytes::from_static(b"new")),
+            })
+        );
+        rows.remove(&key, part, source(20));
+        assert_eq!(rows.get(&key, part), None);
+        assert_eq!(cache.usage(), 0);
+    }
+
+    /// An entry is charged its key's and value's bytes in one allocation,
+    /// and a presence entry its key's alone.
+    #[test]
+    fn test_usage_charges_each_entry_its_key_and_value() {
+        let cache = RowCache::new(ROOMY_BYTES);
+        let rows = cache.for_table(TABLE);
+        let text = Key::Str("a string key of some length".to_string());
+        rows.insert(
+            &text,
+            Part::Column(0),
+            source(1),
+            Caching::Column(Some(&[0_u8; 300])),
+        );
+        assert_eq!(cache.usage(), weigh(text.as_bytes().len(), Some(300)));
+        rows.insert(&long(1), Part::Presence, source(1), Caching::Presence);
+        assert_eq!(
+            cache.usage(),
+            weigh(text.as_bytes().len(), Some(300)) + weigh(LONG_KEY_BYTES, None)
+        );
     }
 
     #[test]
@@ -527,7 +952,7 @@ mod tests {
 
     #[test]
     fn test_the_cache_holds_its_budget() {
-        let capacity = 64 * weigh(Some(approx::length(KIB)));
+        let capacity = 64 * weigh(LONG_KEY_BYTES, Some(approx::length(KIB)));
         let cache = RowCache::new(capacity);
         let value = vec![0_u8; approx::length(KIB)];
         for position in 0..10 * capacity / KIB {
@@ -541,11 +966,21 @@ mod tests {
         );
     }
 
+    /// An entry is charged its allocation in jemalloc's size class, its
+    /// head and key beside its value.
     #[test]
-    fn test_weigh_rounds_to_jemalloc_size_classes() {
-        assert_eq!(weigh(Some(100)), 112 + ROW_ENTRY_OVERHEAD_BYTES);
-        assert_eq!(weigh(Some(1029)), 1280 + ROW_ENTRY_OVERHEAD_BYTES);
-        assert_eq!(weigh(None), ROW_ENTRY_OVERHEAD_BYTES);
+    fn test_charged_rounds_to_jemalloc_size_classes() {
+        assert_eq!(charged(100), 112 + ROW_ENTRY_OVERHEAD_BYTES);
+        assert_eq!(charged(1029), 1280 + ROW_ENTRY_OVERHEAD_BYTES);
+        assert_eq!(
+            weigh(LONG_KEY_BYTES, Some(100)),
+            charged(ENTRY_HEAD_BYTES + LONG_KEY_BYTES + 100)
+        );
+        assert_eq!(
+            weigh(LONG_KEY_BYTES, Some(100)),
+            160 + ROW_ENTRY_OVERHEAD_BYTES
+        );
+        assert_eq!(weigh(LONG_KEY_BYTES, None), 48 + ROW_ENTRY_OVERHEAD_BYTES);
     }
 
     /// A row hit again after it was cached outlives any number of rows read
@@ -554,13 +989,14 @@ mod tests {
     /// makes, does not push out a row that keeps being asked for.
     #[test]
     fn test_a_row_read_again_outlives_rows_read_once() {
-        let cache = RowCache::new(SHARD_ROWS_ESTIMATE * weigh(Some(approx::length(KIB))));
+        let cache =
+            RowCache::new(SHARD_ROWS_ESTIMATE * weigh(LONG_KEY_BYTES, Some(approx::length(KIB))));
         let mut shard = OneShard::of(&cache);
         let shard_rows = shard.rows;
         shard.insert(shard_rows);
-        let [hit_again] = <[RowKey; 1]>::try_from(shard.insert(1)).unwrap();
+        let [hit_again] = <[At; 1]>::try_from(shard.insert(1)).unwrap();
         assert_ne!(cache.get(&hit_again), Cached::Absent);
-        let [read_once] = <[RowKey; 1]>::try_from(shard.insert(1)).unwrap();
+        let [read_once] = <[At; 1]>::try_from(shard.insert(1)).unwrap();
         let pass = shard.insert(2 * shard_rows);
         assert!(
             pass.iter().any(|row| cache.get(row) == Cached::Absent),
@@ -578,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_resize_shrinks_usage_to_the_new_capacity() {
-        let capacity = 256 * weigh(Some(approx::length(KIB)));
+        let capacity = 256 * weigh(LONG_KEY_BYTES, Some(approx::length(KIB)));
         let cache = RowCache::new(capacity);
         let value = vec![0_u8; approx::length(KIB)];
         for position in 0..capacity / KIB {
@@ -644,7 +1080,7 @@ mod tests {
         let cache = RowCache::new(ROOMY_BYTES);
         let built = cache.0.built.load_full();
         let shards = approx::count(built.cache.num_shards());
-        let half_a_largest_per_shard = shards * weigh(Some(largest.len())) / 2;
+        let half_a_largest_per_shard = shards * weigh(LONG_KEY_BYTES, Some(largest.len())) / 2;
         cache.resize(
             half_a_largest_per_shard + built.ghosts.beside(half_a_largest_per_shard) + shards,
         );
@@ -694,9 +1130,9 @@ mod tests {
         let mut shard = OneShard::of(cache);
         let shard_rows = shard.rows;
         shard.insert(shard_rows);
-        let [evicted] = <[RowKey; 1]>::try_from(shard.insert(1)).unwrap();
+        let [evicted] = <[At; 1]>::try_from(shard.insert(1)).unwrap();
         let mut pushed = 0;
-        while cache.0.built.load().cache.contains_key(&evicted) {
+        while cache.holds(&evicted) {
             assert!(
                 pushed <= 2 * shard_rows,
                 "the row never left the cold queue"
@@ -704,9 +1140,9 @@ mod tests {
             shard.insert(1);
             pushed += 1;
         }
-        cache.insert(evicted.clone(), Some(&vec![0_u8; approx::length(KIB)]));
+        cache.insert(evicted, Some(&vec![0_u8; approx::length(KIB)]));
         shard.insert(2 * shard_rows);
-        cache.0.built.load().cache.contains_key(&evicted)
+        cache.holds(&evicted)
     }
 
     /// A cache resized up from zero is the cache `new` builds for the new
@@ -716,7 +1152,7 @@ mod tests {
     /// shrunk to zero from a budget of its own.
     #[test]
     fn test_resize_from_zero_builds_the_cache_new_builds() {
-        let budget = SHARD_ROWS_ESTIMATE * weigh(Some(approx::length(KIB)));
+        let budget = SHARD_ROWS_ESTIMATE * weigh(LONG_KEY_BYTES, Some(approx::length(KIB)));
         let fresh = RowCache::new(budget);
         assert!(
             readmits_a_ghost_as_hot(&fresh),
@@ -733,7 +1169,8 @@ mod tests {
     }
 
     /// The counters are registered at zero when the cache is made, a scrape's
-    /// `publish` moves the hits and misses counted into them once, and sets
+    /// `publish` moves the hits, misses, and stale entries counted into them
+    /// once, and sets
     /// `row_cache_bytes` to `usage`.
     #[test]
     fn test_publish_moves_the_counts_into_the_series() {
@@ -741,7 +1178,11 @@ mod tests {
         let ((), published) = recorded_with(|snapshotter| async move {
             let cache = RowCache::new(ROOMY_BYTES);
             let registered = Series::of(&snapshotter);
-            for name in [metric::ROW_CACHE_HITS_TOTAL, metric::ROW_CACHE_MISSES_TOTAL] {
+            for name in [
+                metric::ROW_CACHE_HITS_TOTAL,
+                metric::ROW_CACHE_MISSES_TOTAL,
+                metric::ROW_CACHE_STALE_TOTAL,
+            ] {
                 assert_eq!(registered.counter(name, &[]), 0, "{name}");
             }
             assert_eq!(
@@ -754,14 +1195,16 @@ mod tests {
             for _ in 0..hits {
                 assert_eq!(cache.get(&key(1, 0)), Cached::Null);
             }
+            cache.for_table(TABLE).count(0, 1, 1);
             cache.publish();
             cache.publish();
         });
         assert_eq!(published.counter(metric::ROW_CACHE_HITS_TOTAL, &[]), hits);
-        assert_eq!(published.counter(metric::ROW_CACHE_MISSES_TOTAL, &[]), 1);
+        assert_eq!(published.counter(metric::ROW_CACHE_MISSES_TOTAL, &[]), 2);
+        assert_eq!(published.counter(metric::ROW_CACHE_STALE_TOTAL, &[]), 1);
         assert_eq!(
             published.gauge(metric::ROW_CACHE_BYTES, &[]).to_bits(),
-            approx::gauge(weigh(None)).to_bits()
+            approx::gauge(weigh(LONG_KEY_BYTES, None)).to_bits()
         );
     }
 }

@@ -591,11 +591,11 @@ async fn test_a_default_answer_is_counted_a_warm_hit() -> Result<()> {
     Ok(())
 }
 
-/// A lookup answering presence alone, and a column a file written before
-/// it was added answers by its default, read no page and use no row-cache
-/// entry, while a column the file holds does (RFD 026).
+/// A lookup answering presence alone keeps a presence entry, a column a
+/// file written before it was added answers by its default and uses no
+/// entry, and a column the file holds keeps one (RFD 026).
 #[tokio::test]
-async fn test_a_default_and_presence_alone_use_no_entry() -> Result<()> {
+async fn test_a_default_uses_no_entry_and_presence_alone_its_own() -> Result<()> {
     let (_dir, mut fixture) =
         two_bucket_fixture("kv_added_row_cache", FormatVersion::V2, false).await?;
     add_column_then_rows(&mut fixture, StatedDefault::None).await?;
@@ -610,6 +610,8 @@ async fn test_a_default_and_presence_alone_use_no_entry() -> Result<()> {
         served.table.get(&key, &[]).await?.row,
         Row::Present(Vec::new())
     );
+    let presence = rows.usage();
+    assert!(presence > 0, "presence alone keeps an entry");
     assert_eq!(
         served
             .table
@@ -619,7 +621,7 @@ async fn test_a_default_and_presence_alone_use_no_entry() -> Result<()> {
         Row::Present(vec![None]),
         "the default, a null"
     );
-    assert_eq!(rows.usage(), 0, "neither uses an entry");
+    assert_eq!(rows.usage(), presence, "the default uses no entry");
     assert_eq!(
         served
             .table
@@ -628,7 +630,7 @@ async fn test_a_default_and_presence_alone_use_no_entry() -> Result<()> {
             .row,
         fixture.expected(&key)
     );
-    assert!(rows.usage() > 0, "a column the file holds does");
+    assert!(rows.usage() > presence, "a column the file holds keeps one");
     Ok(())
 }
 

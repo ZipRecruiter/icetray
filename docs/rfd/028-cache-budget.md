@@ -41,8 +41,9 @@ the page cache's memory level with most of it going to rows.
   holds its cold neighbors. At a tenth of the table, rows served about
   twice the lookups from memory that pages alone did. The page cache's
   memory level keeps a share, for a few points of misses, to hold
-  `bloom` key pages, which every lookup of such a table reads, row-cache
-  hits included, dictionary pages, a request's neighboring keys, and the
+  `bloom` key pages, which icetray reads for every lookup of such a
+  table it does not answer from the row cache, dictionary pages, a
+  request's neighboring keys, and the
   pages on their way to the disk level.
 - **Following the tables.** When no table the server serves reads
   through the row cache, the page cache's memory level holds the whole

@@ -1956,8 +1956,8 @@ mod tests {
         let (first, last) = index.key_range();
         let (first, last) = (first.clone(), last.clone());
         Built {
-            file: Arc::new(LoadedFile {
-                entry: DataFileEntry {
+            file: Arc::new(LoadedFile::new(
+                DataFileEntry {
                     path: name.to_string(),
                     bucket: place.map_or(0, |(_, bucket)| bucket),
                     bucketing: place.map(|(count, _)| bucketing(count)),
@@ -1970,7 +1970,7 @@ mod tests {
                     partition: manifest::Partition::unpartitioned(),
                 },
                 index,
-            }),
+            )),
             stats: opened.stats(),
             gauged,
             _dir: dir,

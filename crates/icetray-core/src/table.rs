@@ -41,7 +41,7 @@ use crate::manifest::{CheckedReads, ColumnRead, Selection, TableLayout, check_co
 use crate::metric::{self, LookupResult, ScanResult, Temperature};
 use crate::order::{OrderValue, ScanBounds};
 use crate::projection;
-use crate::row_cache::RowCache;
+use crate::row_cache::{RowCache, TableRows};
 use crate::scan::{self, MultiScanLookup, Oversize, ScanLookup, ScanRequestFault, Scanned};
 use crate::shard::{self, Line, Sharded};
 use crate::snapshot::{SequenceNumber, SnapshotId};
@@ -536,10 +536,11 @@ struct Lookups {
     /// The process's page cache, through a handle whose fetches end at the
     /// table's `get_deadline`.
     cache: PageCache,
-    /// The process's row cache, when the table's entry has `row_cache` on
-    /// (`TableConfig::row_cache`); `None` reads every value from its page.
-    /// A change of the setting builds the table anew, so it is fixed here.
-    row_cache: Option<RowCache>,
+    /// The table's handle on the process's row cache, when the table's
+    /// entry has `row_cache` on (`TableConfig::row_cache`); `None` reads
+    /// every value from its page. A change of the setting builds the table
+    /// anew, so it is fixed here.
+    row_cache: Option<TableRows>,
     metrics: LookupMetrics,
     /// The calls in flight on every table sharing the table's handles, its
     /// own among them.
@@ -1278,7 +1279,9 @@ impl Table {
         });
         let lookups = Arc::new(Lookups {
             cache: cache.with_fetch_deadline(get_deadline),
-            row_cache: row_cache.filter(|_| config.row_cache()),
+            row_cache: row_cache
+                .filter(|_| config.row_cache())
+                .map(|rows| rows.for_table(&config.name)),
             metrics: LookupMetrics::new(&config.name, &config.value_column_names()),
             in_flight: calls,
             batch_fan_out: batch_fan_out.min(Semaphore::MAX_PERMITS),
@@ -5800,8 +5803,8 @@ mod tests {
     /// Tables over one source listing their value columns in opposite
     /// orders, and one listing the value column alone, which a table's
     /// layout places first where the others place it second, share one row
-    /// cache and each read each column's own bytes: an entry is keyed by
-    /// the column's leaf in the file, not its place in a table's layout.
+    /// cache and each read each column's own bytes: each table keeps
+    /// entries of its own, by the column's place in its own layout.
     #[tokio::test]
     async fn test_tables_listing_columns_in_another_order_read_their_own_columns() {
         const VALUE_ALONE_TABLE: &str = "value_alone";
@@ -5853,11 +5856,85 @@ mod tests {
                 );
             }
         }
+        let long = Key::Long(0).as_bytes().len();
         assert_eq!(
             rows.usage(),
-            weigh(Some(value.len())) + weigh(Some(detail.len())),
-            "one entry per column, shared by every table"
+            3 * weigh(long, Some(value.len())) + 2 * weigh(long, Some(detail.len())),
+            "one entry per table and column read"
         );
+    }
+
+    /// A table loaded anew under a name, as a reload loads a changed
+    /// table, never answers from its predecessor's entries, though it reads
+    /// the cache under the name's number and its first column is the
+    /// predecessor's other: it loads its files again, so each entry names a
+    /// file its generation does not hold, and the entry found is counted
+    /// stale (RFD 026).
+    #[test]
+    fn test_a_table_loaded_anew_never_serves_its_predecessors_entries() {
+        let ((), series) = recorded(async {
+            let (fixture, all, _gauged) =
+                two_column_fixture(FILE_KEYS, WriterLayout::contract()).await;
+            let (handles, rows) = handles_reading_rows(&fixture).await;
+            let defaults = ServerConfig::default();
+            let listed = lenient(&fixture);
+            let serving = |column: &str| {
+                table_sharing(
+                    &fixture,
+                    TableConfig {
+                        value_columns: vec![ValueColumnConfig::named(column)],
+                        ..listed.clone()
+                    },
+                    handles.clone(),
+                    defaults.load_deadline,
+                    defaults.refresh_deadline,
+                )
+            };
+            let key = Key::Long(all[0]);
+            let value = value_for(all[0]);
+            let detail = detail_of(&value);
+            let before = serving(VALUE_COLUMN);
+            before.load().await.unwrap();
+            let read = |column| [ColumnRead::whole(column)];
+            assert_eq!(
+                only_value(before.get(&key, &read(VALUE_COLUMN)).await.unwrap().row),
+                Some(Bytes::from(value))
+            );
+            let after = serving(DETAIL_COLUMN);
+            after.load().await.unwrap();
+            assert_eq!(
+                only_value(after.get(&key, &read(DETAIL_COLUMN)).await.unwrap().row),
+                Some(Bytes::from(detail))
+            );
+            rows.publish();
+        });
+        assert_eq!(series.counter(metric::ROW_CACHE_STALE_TOTAL, &[]), 1);
+        assert_eq!(series.counter(metric::ROW_CACHE_HITS_TOTAL, &[]), 0);
+    }
+
+    /// A presence-only Get of a present key keeps a presence entry, and the
+    /// next is served from it: one miss, then one hit (RFD 026).
+    #[test]
+    fn test_a_presence_only_get_is_served_from_the_row_cache() {
+        let ((), series) = recorded(async {
+            let fixture = one_file_fixture(WriterLayout::contract()).await;
+            let (table, rows, _pages) = table_reading_rows(&fixture, lenient(&fixture)).await;
+            let key = Key::Long(keys_from(0, FILE_KEYS)[0]);
+            for _ in 0..2 {
+                assert_eq!(
+                    table.get(&key, &[]).await.unwrap().row,
+                    Row::Present(Vec::new())
+                );
+            }
+            assert_eq!(
+                rows.usage(),
+                weigh(key.as_bytes().len(), None),
+                "one presence entry"
+            );
+            rows.publish();
+        });
+        assert_eq!(series.counter(metric::ROW_CACHE_MISSES_TOTAL, &[]), 1);
+        assert_eq!(series.counter(metric::ROW_CACHE_HITS_TOTAL, &[]), 1);
     }
 
     /// Projection trims the value after the row cache: two Gets naming
@@ -5899,7 +5976,7 @@ mod tests {
         assert_eq!(filler_field, Bytes::copy_from_slice(&value[key_record..]));
         assert_eq!(
             rows.usage(),
-            weigh(Some(value.len())),
+            weigh(Key::Long(0).as_bytes().len(), Some(value.len())),
             "one entry, of the whole value"
         );
     }

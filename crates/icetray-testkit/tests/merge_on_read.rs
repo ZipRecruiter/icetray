@@ -238,9 +238,9 @@ async fn gets_during<T>(served: &Served, work: impl Future<Output = T>) -> (T, u
 }
 
 /// A row cached before a position delete removes it is not served after
-/// the refresh that applies the delete: a lookup checks the row against
-/// its file's deletes before it asks the row cache (RFD 026), and the
-/// entry itself is never invalidated.
+/// the refresh that applies the delete: icetray finds the entry, whose row
+/// the new generation deletes, answers the key absent through the index,
+/// and drops the entry (RFD 026).
 #[tokio::test]
 async fn test_a_deleted_row_is_not_served_from_the_row_cache_after_refresh() -> Result<()> {
     let (_dir, catalog) = local_catalog().await?;
@@ -250,8 +250,7 @@ async fn test_a_deleted_row_is_not_served_from_the_row_cache_after_refresh() -> 
         verify::serve_root_reading_rows(&fixture, fixture.config(Residency::Full, false)).await?;
     let id = FIRST_FILE_IDS[0];
     verify::verify_hits(&served, &fixture, &[id]).await?;
-    let cached = served.rows().usage();
-    assert!(cached > 0, "the row is cached");
+    assert!(served.rows().usage() > 0, "the row is cached");
     fixture
         .delete(&[id], DeleteForm::Positions, "deleted")
         .await?;
@@ -264,11 +263,52 @@ async fn test_a_deleted_row_is_not_served_from_the_row_cache_after_refresh() -> 
             .row,
         Row::Absent
     );
-    assert_eq!(
-        served.rows().usage(),
-        cached,
-        "the entry stays, never asked for"
-    );
+    assert_eq!(served.rows().usage(), 0, "the stale entry is dropped");
+    Ok(())
+}
+
+/// After a merge-on-read update, icetray answers each changed key's new
+/// value, its entry naming a row the new generation deletes, and caches
+/// the new row; an unchanged key's entry, whose file the generation reuses
+/// and whose row it keeps, still answers with no page read, in the Full
+/// and the Bloom tiers alike (RFD 026).
+#[tokio::test]
+async fn test_an_update_fails_only_the_changed_keys_entries() -> Result<()> {
+    let untouched = FIRST_FILE_IDS[0] + 1;
+    for (at, residency) in [Residency::Full, Residency::Bloom].into_iter().enumerate() {
+        let (_dir, catalog) = local_catalog().await?;
+        let mut fixture = fixture(catalog.as_ref(), &format!("kv_row_cache_update_{at}")).await?;
+        fixture.write_hint().await?;
+        let served =
+            verify::serve_root_reading_rows(&fixture, fixture.config(residency, false)).await?;
+        let read = [ColumnRead::whole(VALUE_COLUMN)];
+        let mut ids = TOUCHED.to_vec();
+        ids.push(untouched);
+        verify::verify_hits(&served, &fixture, &ids).await?;
+        let old: Vec<Row> = TOUCHED
+            .map(|id| fixture.expected(&fixture.key(id)))
+            .to_vec();
+        fixture
+            .update(&TOUCHED, DeleteForm::Vectors, "updated")
+            .await?;
+        assert!(served.table.refresh().await?);
+        for (id, old) in TOUCHED.into_iter().zip(&old) {
+            let new = fixture.expected(&fixture.key(id));
+            assert_ne!(&new, old, "the update changed the value");
+            assert_eq!(
+                served.table.get(&fixture.key(id), &read).await?.row,
+                new,
+                "{residency}: {id} after the update"
+            );
+        }
+        served.cache.clear();
+        for id in ids {
+            let key = fixture.key(id);
+            let (got, gets) = gets_during(&served, served.table.get(&key, &read)).await;
+            assert_eq!(got?.row, fixture.expected(&key), "{residency}: {id}");
+            assert_eq!(gets, 0, "{residency}: {id} is served from the row cache");
+        }
+    }
     Ok(())
 }
 
