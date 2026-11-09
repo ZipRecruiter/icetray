@@ -14,11 +14,14 @@
 //! order column whose values share a long prefix inside which the writer
 //! cut the column index, which the long-run Scan scenarios read, and two
 //! only loaded and refreshed, one of files rolled by size that share edge
-//! keys and one of overlapping appends of short runs; and, when `--table
+//! keys and one of overlapping appends of short runs; when `--table
 //! scattered` names it, a table shaped like a serving table
-//! (`SCATTERED_ROWS` rows of random-looking string keys and 4 KiB values in
-//! byte-bounded pages, `SCATTERED_ROWS_PER_FILE` rows per file), through
-//! the fixture writer (once, then reused from `--data-dir`), reports how
+//! (`SCATTERED_ROWS_PER_FILE` rows of random-looking string keys and 4 KiB
+//! values in byte-bounded pages per file, in `--scattered-files` files);
+//! and when `--table documents` names it, a table of documents beside it
+//! (`DOCUMENT_ROWS` rows of the same keys and pages and 10,800-byte JSON
+//! documents), through the fixture writer (once, then reused from
+//! `--data-dir`), reports how
 //! far zstd compressed each table's key and value columns, serves them
 //! through `Table` over `Storage`'s `file://` store in every residency
 //! tier, and reports latency percentiles, throughput in operations and in
@@ -45,6 +48,39 @@
 //! with `cargo run -p icetray-testkit --example bench --release -- --help`;
 //! a profile of one scenario narrows `--scenario`, `--tier`, `--table`,
 //! `--values`, and `--mode`, and lengthens `--duration`.
+//!
+//! Workloads. `replay` replays a trace of a service's lookups, which runs
+//! only when named, on each key-value table `--table` names: the scattered
+//! table for traces of 4 KiB values, the documents table for documents. A
+//! trace file is Parquet, one row per request in the order the requests
+//! arrived: `ts`, an int64 of microseconds, optional and read only to
+//! report the span a window replayed, and `keys`, a list of int64, the
+//! request's key ids. An id is any non-negative integer that identifies a
+//! key within the trace, by convention its rank by lookups, 0 the most
+//! read. A request of one key is replayed as a Get, of more as a
+//! `MultiGet` of those keys in order, repeats kept; the bench calls
+//! `Table` directly, so a request of more keys than
+//! `server.max_multi_get_values`, which a server refuses, is replayed
+//! whole. `--trace-sample` keeps each key whose seeded hash falls under
+//! its rate of the hash space, with every lookup of it, drops the requests
+//! left with no key, and scales each cache budget by the rate, as SHARDS
+//! (Waldspurger et al., FAST 2015) samples a trace for a miss ratio curve,
+//! so a sampled run keeps the hit rate's curve against memory on a table
+//! that fits a laptop; each row reports the full-size budget it stands for
+//! and the one it ran. The trace's distinct kept ids, in ascending order,
+//! take the table's first-build ids in a seeded shuffle, so its hot keys
+//! lie scattered through the key order and the files, as hashed keys of a
+//! serving table do; a trace of more distinct kept keys than the table has
+//! rows is refused, naming `--scattered-files` and `--trace-sample`. Each
+//! `--budget` in each mode is a row over a table and caches served for it
+//! alone: the first third of the requests fill the caches, unmeasured,
+//! with `--tasks` tasks, and the window replays the requests after them in
+//! order for `--duration`, with no warm-up, and stops at the trace's end
+//! rather than wrap, which would ask the first requests again of a cache
+//! that serves them better than fresh ones; a row reports whether it
+//! ended there, the requests it replayed, and their span. Latency is per
+//! request, and the bench copies a request's keys before it times it,
+//! so its allocations per operation count one copy of each key.
 //!
 //! Reference mode. Under `--reference WAREHOUSE` the program writes and
 //! reads none of its own tables and serves the golden reference tables
@@ -116,6 +152,7 @@ use icetray_testkit::layout::{KEY_COLUMN, Layout as FileLayout, VALUE_COLUMN};
 use icetray_testkit::protobuf::{
     CHECKSUM_FIELD, FILLER_FIELD, FLAGS_FIELD, GROUP_FIELD, ID_FIELD, NAME_FIELD, SCORES_FIELD,
 };
+use icetray_testkit::workload::{self, KeySample, Requests, SampleRate, Trace};
 use icetray_testkit::{
     FixtureSpec, GetLog, KeyShape, LoggedGet, MINUTE_MICROS, MemoryCatalog, ORDER_COLUMN,
     OrderKind, Ordered, RoundsStore, RowsPerKey, TestScan, ValueKind, absent_key_from, follow,
@@ -382,6 +419,11 @@ enum Scenario {
     /// `scan-bounded-string` through the `COLD_CACHE_BYTES` page cache.
     /// String-ordered table only.
     ScanBoundedStringCold,
+    /// The requests of the trace `--trace` names (the module doc's
+    /// Workloads), sampled by key at `--trace-sample`, replayed in order on
+    /// each key-value table `--table` names, under each `--budget`. Runs
+    /// only when named.
+    Replay,
 }
 
 impl Scenario {
@@ -432,7 +474,18 @@ impl Scenario {
             Self::ScanBoundedStringCold => {
                 Traits::cold("scan-bounded-string-cold").on(TableName::OrderedString)
             }
+            Self::Replay => Traits::of("replay", Cache::Swept).named(),
         }
+    }
+
+    /// The scenarios a run without `--scenario` runs: every one not run
+    /// only when named.
+    fn unnamed() -> Vec<Self> {
+        Self::value_variants()
+            .iter()
+            .copied()
+            .filter(|scenario| scenario.traits().runs != Runs::Named)
+            .collect()
     }
 
     /// The scenario's name in the results.
@@ -448,10 +501,8 @@ struct Traits {
     name: &'static str,
     /// The cache budget it measures.
     cache: Cache,
-    /// Whether `lookups` measures it, per table and tier; the others are
-    /// loads, refreshes, and the scenarios of two tables, which `main`
-    /// runs on their own.
-    lookup: bool,
+    /// Who runs it, and when.
+    runs: Runs,
     /// Whether it reads `SECOND_VALUE_COLUMN` or projects `VALUE_COLUMN`,
     /// which only a protobuf table serves.
     protobuf: bool,
@@ -462,6 +513,20 @@ struct Traits {
     /// it runs on; `None` for the other scenarios, which only a key-value
     /// table serves.
     table: Option<TableName>,
+}
+
+/// Who runs a scenario, and when.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Runs {
+    /// `lookups`, per table and tier, in a run that names it or names no
+    /// scenario.
+    Lookup,
+    /// `main` on its own: a load, a refresh, or a scenario of two tables,
+    /// in a run that names it or names no scenario.
+    Apart,
+    /// `main` on its own, only in a run that names it: a workload, for
+    /// which the run names flags or tables of its own.
+    Named,
 }
 
 /// The cache budget a scenario measures, split between the row cache and
@@ -480,6 +545,10 @@ enum Cache {
     /// None it depends on: a miss, served warm, reads no value page, and a
     /// load or a refresh reads none through it.
     Unread,
+    /// Each of the run's `--budget` budgets, each mode under a table and
+    /// caches served for it alone and filled by the workload's own
+    /// requests.
+    Swept,
 }
 
 impl Traits {
@@ -488,7 +557,7 @@ impl Traits {
         Self {
             name,
             cache,
-            lookup: true,
+            runs: Runs::Lookup,
             protobuf: false,
             projects: false,
             table: None,
@@ -513,7 +582,7 @@ impl Traits {
     /// Not measured by `lookups`.
     const fn apart(self) -> Self {
         Self {
-            lookup: false,
+            runs: Runs::Apart,
             ..self
         }
     }
@@ -531,6 +600,14 @@ impl Traits {
         Self {
             protobuf: true,
             projects: true,
+            ..self
+        }
+    }
+
+    /// Not measured by `lookups`, and run only when named.
+    const fn named(self) -> Self {
+        Self {
+            runs: Runs::Named,
             ..self
         }
     }
@@ -583,10 +660,15 @@ enum TableName {
     String,
     /// A table shaped like a serving table: random-looking string keys,
     /// 4 KiB random values in 64 KiB value pages, and about 37,500 rows per
-    /// file. Runs only when named, and only its load, refresh, cold-hit,
-    /// miss, and skewed-hit scenarios: its value pages outrun the warm
-    /// cache.
+    /// file, in `--scattered-files` files. Runs only when named, and only
+    /// its load, refresh, cold-hit, miss, skewed-hit, and replay
+    /// scenarios: its value pages outrun the warm cache.
     Scattered,
+    /// A table of documents: the scattered table's keys and pages, and
+    /// JSON documents of `DOCUMENT_VALUE_BYTES` bytes (`Values::Json`),
+    /// about 20,700 rows per file. Runs only when named, and only the
+    /// scenarios the scattered table runs.
+    Documents,
     /// Long keys of `ORDERED_ROWS_PER_KEY` rows each by a timestamp order
     /// column, contract layout: the table the first Scan and `MultiScan`
     /// scenarios read, and the only one they read.
@@ -634,14 +716,19 @@ enum Values {
     /// `LARGE_VALUE_ROWS` rows, in value pages bounded by bytes as a
     /// serving table's are.
     ProtobufLarge,
+    /// JSON documents of short fields and long prose
+    /// (`json_value_for_len`), which zstd compresses about as far as
+    /// measured documents compress; the documents table's alone.
+    Json,
 }
 
 impl Values {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Random,
         Self::Text,
         Self::Protobuf,
         Self::ProtobufLarge,
+        Self::Json,
     ];
 
     /// The values' name in the results and, after the key column's, in a
@@ -652,6 +739,7 @@ impl Values {
             Self::Text => "text",
             Self::Protobuf => "protobuf",
             Self::ProtobufLarge => "protobuf_large",
+            Self::Json => "json",
         }
     }
 
@@ -660,6 +748,7 @@ impl Values {
             Self::Random => ValueKind::Random,
             Self::Text => ValueKind::Text,
             Self::Protobuf | Self::ProtobufLarge => ValueKind::Protobuf,
+            Self::Json => ValueKind::Json,
         }
     }
 
@@ -668,7 +757,7 @@ impl Values {
     fn is_protobuf(self) -> bool {
         match self {
             Self::Protobuf | Self::ProtobufLarge => true,
-            Self::Random | Self::Text => false,
+            Self::Random | Self::Text | Self::Json => false,
         }
     }
 }
@@ -713,6 +802,59 @@ impl RowCacheFlag {
     }
 }
 
+/// A byte count on the command line: bytes, or a count of KiB, MiB, or
+/// GiB, such as `512MiB`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Size(u64);
+
+/// The units a `Size` takes after its count, largest first, with their
+/// bytes.
+const SIZE_UNITS: [(&str, u64); 3] = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
+
+/// A `Size` that is not one.
+#[derive(Debug, thiserror::Error)]
+#[error("{text:?} is not a size: bytes, or a count of KiB, MiB, or GiB")]
+struct NotASize {
+    text: String,
+}
+
+impl std::str::FromStr for Size {
+    type Err = NotASize;
+
+    fn from_str(text: &str) -> Result<Self, NotASize> {
+        let refused = || NotASize {
+            text: text.to_string(),
+        };
+        let (count, unit) = SIZE_UNITS
+            .iter()
+            .find_map(|&(suffix, bytes)| text.strip_suffix(suffix).map(|count| (count, bytes)))
+            .unwrap_or((text, 1));
+        let count: u64 = count.trim().parse().map_err(|_| refused())?;
+        count.checked_mul(unit).map(Self).ok_or_else(refused)
+    }
+}
+
+impl std::fmt::Display for Size {
+    /// In the largest unit that divides it, or in bytes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match SIZE_UNITS
+            .iter()
+            .find(|&&(_, bytes)| self.0 >= bytes && self.0.is_multiple_of(bytes))
+        {
+            Some(&(suffix, bytes)) => write!(f, "{}{suffix}", self.0 / bytes),
+            None => write!(f, "{}", self.0),
+        }
+    }
+}
+
+/// The cache budgets a workload sweeps when `--budget` is absent: 512 MiB,
+/// 2 GiB, and 8 GiB, full-size budgets a run scales to its share of the
+/// workload, from about a fortieth of the 20 GB the embedding workload's
+/// 4.77 million distinct values of an hour take to about two fifths, so
+/// the hit rate's rise with memory shows; a sweep that reaches its ceiling
+/// names larger budgets.
+const DEFAULT_BUDGETS: [u64; 3] = [512 << 20, 2 << 30, 8 << 30];
+
 /// The benchmark's command line. Every list flag takes comma-separated
 /// values and, when absent, means all of them.
 #[derive(Parser, Debug)]
@@ -724,7 +866,8 @@ struct Cli {
     /// Residency tiers to run them in.
     #[arg(long, value_enum, value_delimiter = ',')]
     tier: Vec<Tier>,
-    /// Tables to run them over, by keys; `scattered` runs only when named.
+    /// Tables to run them over, by keys; `scattered` and `documents` run
+    /// only when named.
     #[arg(long, value_enum, value_delimiter = ',')]
     table: Vec<TableName>,
     /// Tables to run them over, by values; the protobuf values are on long
@@ -734,10 +877,12 @@ struct Cli {
     /// Single-task latency, multi-task throughput, or both.
     #[arg(long, value_enum, value_delimiter = ',')]
     mode: Vec<Mode>,
-    /// Seconds each lookup scenario is measured for.
+    /// Seconds each lookup scenario is measured for; a workload's window
+    /// ends sooner when its requests run out.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     duration: u64,
-    /// Seconds each lookup scenario runs, unmeasured, before it is measured.
+    /// Seconds each lookup scenario runs, unmeasured, before it is
+    /// measured; a workload's fill takes its place.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     warmup: u64,
     /// Tasks of a multi-task run; the machine's cores when absent.
@@ -754,6 +899,18 @@ struct Cli {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
     )]
     row_group_rows: Option<usize>,
+    /// Files of the scattered table, each of about 37,500 rows, so its
+    /// per-file work stays in proportion: 32 holds 1.2 million rows, 128
+    /// holds 4.8 million, enough for the embedding workload's hour
+    /// unsampled (about 20 GB of disk). The manifest records it and names a
+    /// table of another count apart, so tables of several counts share one
+    /// `--data-dir`.
+    #[arg(
+        long,
+        default_value_t = SCATTERED_BUCKETS,
+        value_parser = clap::value_parser!(u64).range(1..=SCATTERED_FILES_MAX),
+    )]
+    scattered_files: u64,
     /// Where the tables are written and, on later runs, reused from.
     #[arg(long, default_value = "target/bench/tables")]
     data_dir: PathBuf,
@@ -793,6 +950,27 @@ struct Cli {
     /// sweeps; `skewed-hit` is meant to be run both ways.
     #[arg(long, value_enum, default_value_t = RowCacheFlag::Off)]
     row_cache: RowCacheFlag,
+    /// The trace `replay` replays: a Parquet file of one row per request
+    /// in arrival order, `ts` an optional int64 of microseconds and `keys`
+    /// a list of int64 key ids (the module doc's Workloads).
+    #[arg(long, value_name = "FILE")]
+    trace: Option<PathBuf>,
+    /// The share of the trace's keys `replay` keeps, in (0, 1]: each key
+    /// whose seeded hash falls under it, with every lookup of it. The
+    /// cache budgets are scaled by it too, so a sampled run stands for the
+    /// whole trace under each `--budget`.
+    #[arg(long, value_name = "RATE", default_value_t = SampleRate::ALL)]
+    trace_sample: SampleRate,
+    /// The cache budgets `replay` sweeps, each a row: bytes, or a count of
+    /// KiB, MiB, or GiB, such as `512MiB`. Under `--trace-sample` each is
+    /// the budget the sampled run stands for.
+    #[arg(
+        long,
+        value_name = "SIZE",
+        value_delimiter = ',',
+        default_values_t = DEFAULT_BUDGETS.map(Size),
+    )]
+    budget: Vec<Size>,
     /// Serve the golden reference tables under WAREHOUSE, a location whose
     /// `db/` holds them, in place of the program's own tables, which are
     /// neither written nor read (the module doc's Reference mode). A copy
@@ -911,6 +1089,14 @@ fn row_group_rows() -> Option<usize> {
     ROW_GROUP_ROWS.get().copied().flatten()
 }
 
+/// The run's `--scattered-files`.
+static SCATTERED_FILES: OnceLock<u64> = OnceLock::new();
+
+/// `SCATTERED_FILES`, or `SCATTERED_BUCKETS` before `main` sets it.
+fn scattered_files() -> u64 {
+    SCATTERED_FILES.get().copied().unwrap_or(SCATTERED_BUCKETS)
+}
+
 // ---------------------------------------------------------------------------
 // The tables.
 
@@ -930,20 +1116,44 @@ const APPENDED_ROWS: u64 = ROWS / APPEND_DIVISOR;
 /// is there.
 const SCATTERED_ROWS_PER_FILE: u64 = 37_500;
 
-/// Buckets of the scattered table, one file each: enough that per-file
-/// costs show in a load's profile, few enough that the table writes in a
-/// few minutes and takes about 5 GB of disk.
+/// Buckets of the scattered table, one file each, unless
+/// `--scattered-files` says otherwise: enough that per-file costs show in
+/// a load's profile, few enough that the table writes in a few minutes and
+/// takes about 5 GB of disk.
 const SCATTERED_BUCKETS: u64 = 32;
 
-/// Rows of the scattered table's first build: `SCATTERED_ROWS_PER_FILE`
-/// in each of `SCATTERED_BUCKETS`, 1.2 million.
+/// Rows of the scattered table's first build at `SCATTERED_BUCKETS` files:
+/// `SCATTERED_ROWS_PER_FILE` in each, 1.2 million.
 const SCATTERED_ROWS: u64 = SCATTERED_BUCKETS * SCATTERED_ROWS_PER_FILE;
 
-/// Rows the scattered table's second build appends.
-const SCATTERED_APPENDED_ROWS: u64 = SCATTERED_ROWS / APPEND_DIVISOR;
+/// The most files `--scattered-files` takes: as many as leave both builds'
+/// ids inside the scattered key space, the second build appending
+/// `APPEND_DIVISOR`'s share of the first.
+const SCATTERED_FILES_MAX: u64 =
+    SCATTERED_ID_SPACE / (SCATTERED_ROWS_PER_FILE + SCATTERED_ROWS_PER_FILE / APPEND_DIVISOR);
+
+// Both builds' ids have scattered keys at the default file count.
+const _: () = assert!(SCATTERED_BUCKETS <= SCATTERED_FILES_MAX);
+
+/// Rows per file of the documents table: 20,700, about the median file of
+/// a production table of 21.2 million job display documents measured on
+/// 2026-10-28, so its per-file work is in proportion to its rows as it is
+/// there.
+const DOCUMENT_ROWS_PER_FILE: u64 = 20_700;
+
+/// Files of the documents table, one per bucket: enough rows that the
+/// document workload's 959,536 distinct keys of one hour fit unsampled.
+const DOCUMENT_FILES: u64 = 50;
+
+/// Rows of the documents table's first build: 1,035,000.
+const DOCUMENT_ROWS: u64 = DOCUMENT_FILES * DOCUMENT_ROWS_PER_FILE;
+
+/// Bytes per value of the documents table: 10,800, the mean of the
+/// measured documents, JSON of 43 fields.
+const DOCUMENT_VALUE_BYTES: usize = 10_800;
 
 // Both builds' ids have scattered keys.
-const _: () = assert!(SCATTERED_ROWS + SCATTERED_APPENDED_ROWS <= SCATTERED_ID_SPACE);
+const _: () = assert!(DOCUMENT_ROWS + DOCUMENT_ROWS / APPEND_DIVISOR <= SCATTERED_ID_SPACE);
 
 /// Bytes per value of the scattered table and of the large protobuf
 /// table: 4 KiB, a serving table's value, so a 64 KiB value page holds
@@ -1058,9 +1268,10 @@ const SHORT_RUN: Ordered = Ordered {
 /// followed by the append's number.
 const APPEND_PREFIX: &str = "append";
 
-/// The file size target of the scattered table: 256 MiB, above the
-/// ~155 MB a bucket's incompressible rows take, so the rolling writer
-/// keeps each bucket in one file of `SCATTERED_ROWS_PER_FILE` rows.
+/// The file size target of the scattered and documents tables: 256 MiB,
+/// above the ~155 MB a scattered bucket's incompressible rows take and the
+/// ~224 MB a documents bucket's rows take before compression, so the
+/// rolling writer keeps each bucket in one file.
 const SCATTERED_FILE_BYTES: usize = 256 * 1024 * 1024;
 
 /// The column-index truncation of the scattered table: 256 bytes, what the
@@ -1095,7 +1306,10 @@ struct TableShape {
     ordered: Option<Ordered>,
 }
 
-const SHAPES: [TableShape; 12] = [
+/// Every table the program writes, the scattered one at
+/// `SCATTERED_BUCKETS` files; `shapes` gives them at the run's
+/// `--scattered-files`.
+const SHAPES: [TableShape; 13] = [
     TableShape {
         name: TableName::Long,
         key_type: KeyType::Long,
@@ -1170,7 +1384,18 @@ const SHAPES: [TableShape; 12] = [
         value_bytes: SERVING_VALUE_BYTES,
         values: Values::Random,
         rows: SCATTERED_ROWS,
-        appended_rows: SCATTERED_APPENDED_ROWS,
+        appended_rows: SCATTERED_ROWS / APPEND_DIVISOR,
+        ordered: None,
+    },
+    TableShape {
+        name: TableName::Documents,
+        key_type: KeyType::String,
+        key_shape: KeyShape::Scattered,
+        key_bytes: SCATTERED_KEY_FIXED_BYTES,
+        value_bytes: DOCUMENT_VALUE_BYTES,
+        values: Values::Json,
+        rows: DOCUMENT_ROWS,
+        appended_rows: DOCUMENT_ROWS / APPEND_DIVISOR,
         ordered: None,
     },
     TableShape {
@@ -1231,8 +1456,18 @@ const SHAPES: [TableShape; 12] = [
 ];
 
 /// What separates the key column's name from the values' in the name of
-/// a table whose values are not random.
+/// a table whose values are not random, and from its file count in the
+/// name of a scattered table not of `SCATTERED_BUCKETS` files.
 const VALUES_SEPARATOR: &str = "_";
+
+/// What follows the file count in the name of a scattered table not of
+/// `SCATTERED_BUCKETS` files.
+const FILES_SUFFIX: &str = "_files";
+
+/// Every table the program writes as the run writes it (`TableShape::at_run`).
+fn shapes() -> [TableShape; 13] {
+    SHAPES.map(TableShape::at_run)
+}
 
 impl TableName {
     fn as_str(self) -> &'static str {
@@ -1240,6 +1475,7 @@ impl TableName {
             Self::Long => "long",
             Self::String => "string",
             Self::Scattered => "scattered",
+            Self::Documents => "documents",
             Self::Ordered => "ordered",
             Self::OrderedLong => "ordered_long",
             Self::OrderedString => "ordered_string",
@@ -1254,13 +1490,54 @@ impl TableShape {
     /// column's, followed after `VALUES_SEPARATOR` by the values' unless
     /// they are random.
     fn table_name(self) -> String {
-        match self.values {
-            Values::Random => self.name.as_str().to_string(),
-            Values::Text | Values::Protobuf | Values::ProtobufLarge => format!(
-                "{}{VALUES_SEPARATOR}{}",
-                self.name.as_str(),
-                self.values.as_str()
+        let keys = match self.scattered_files() {
+            Some(files) if files != SCATTERED_BUCKETS => format!(
+                "{}{VALUES_SEPARATOR}{files}{FILES_SUFFIX}",
+                self.name.as_str()
             ),
+            Some(_) | None => self.name.as_str().to_string(),
+        };
+        match self.values {
+            Values::Random => keys,
+            Values::Text | Values::Protobuf | Values::ProtobufLarge | Values::Json => {
+                format!("{keys}{VALUES_SEPARATOR}{}", self.values.as_str())
+            }
+        }
+    }
+
+    /// The key space a table of scattered keys was spelled in, which a key's
+    /// spelling depends on; `None` for a table of sequential keys.
+    fn scattered_id_space(self) -> Option<u64> {
+        (self.key_shape == KeyShape::Scattered).then_some(SCATTERED_ID_SPACE)
+    }
+
+    /// The scattered table's files, from its rows; `None` for every other
+    /// table.
+    fn scattered_files(self) -> Option<u64> {
+        (self.name == TableName::Scattered).then_some(self.rows / SCATTERED_ROWS_PER_FILE)
+    }
+
+    /// The table as the run writes it: the scattered table at
+    /// `--scattered-files` files, every other as `SHAPES` holds it.
+    fn at_run(self) -> Self {
+        match self.scattered_files() {
+            Some(_) => Self::scattered(scattered_files()),
+            None => self,
+        }
+    }
+
+    /// The scattered table at `files` files of `SCATTERED_ROWS_PER_FILE`
+    /// rows, its second build appending `APPEND_DIVISOR`'s share.
+    fn scattered(files: u64) -> Self {
+        let rows = files * SCATTERED_ROWS_PER_FILE;
+        let base = SHAPES
+            .into_iter()
+            .find(|shape| shape.name == TableName::Scattered)
+            .expect("SHAPES holds the scattered table");
+        Self {
+            rows,
+            appended_rows: rows / APPEND_DIVISOR,
+            ..base
         }
     }
 
@@ -1314,6 +1591,7 @@ impl TableShape {
             TableName::Long
             | TableName::String
             | TableName::Scattered
+            | TableName::Documents
             | TableName::Ordered
             | TableName::OrderedLong
             | TableName::OrderedString
@@ -1338,6 +1616,7 @@ impl TableShape {
             TableName::Long
             | TableName::String
             | TableName::Scattered
+            | TableName::Documents
             | TableName::Ordered
             | TableName::OrderedLong
             | TableName::OrderedString => None,
@@ -1361,7 +1640,8 @@ impl TableShape {
     /// table keeps the bucket count of the random table with its key
     /// column, so the two differ in their values alone; its files come out
     /// smaller by the values' compression. The scattered table has one
-    /// file of `SCATTERED_ROWS_PER_FILE` rows per bucket. The rolled and
+    /// file of `SCATTERED_ROWS_PER_FILE` rows per bucket, and the documents
+    /// table one of `DOCUMENT_ROWS_PER_FILE`. The rolled and
     /// appended tables take the buckets a contract table of their first
     /// build's rows has, which a compaction of them would write.
     fn buckets(self) -> u32 {
@@ -1377,16 +1657,17 @@ impl TableShape {
                 (self.first_build_rows() * row_bytes).div_ceil(TARGET_FILE_BYTES_MAX)
             }
             TableName::Scattered => self.rows.div_ceil(SCATTERED_ROWS_PER_FILE),
+            TableName::Documents => self.rows.div_ceil(DOCUMENT_ROWS_PER_FILE),
         };
         u32::try_from(buckets).expect("a benchmark table has a few dozen buckets at most")
     }
 
-    /// The Parquet layout: the contract's, or for the scattered table and
-    /// the large protobuf table value pages bounded at the contract's
-    /// `VALUE_PAGE_BYTES` (the byte bound shortens the writer's page-size
-    /// check to every two rows, so a page overshoots it by one value at
-    /// most), and for the scattered table files rolled at
-    /// `SCATTERED_FILE_BYTES`; for the string-ordered table the column
+    /// The Parquet layout: the contract's, or for the scattered and
+    /// documents tables and the large protobuf table value pages bounded at
+    /// the contract's `VALUE_PAGE_BYTES` (the byte bound shortens the
+    /// writer's page-size check to every two rows, so a page overshoots it
+    /// by one value at most), and for the scattered and documents tables
+    /// files rolled at `SCATTERED_FILE_BYTES`; for the string-ordered table the column
     /// index cut to `ORDER_INDEX_TRUNCATE_BYTES`, and for the rolled table
     /// files rolled at `ROLLED_FILE_BYTES`; every table's row groups of the
     /// run's `--row-group-rows` when it sets them.
@@ -1416,10 +1697,12 @@ impl TableShape {
                 ..FileLayout::contract()
             },
             TableName::Long | TableName::String => match self.values {
-                Values::Random | Values::Text | Values::Protobuf => FileLayout::contract(),
+                Values::Random | Values::Text | Values::Protobuf | Values::Json => {
+                    FileLayout::contract()
+                }
                 Values::ProtobufLarge => byte_pages,
             },
-            TableName::Scattered => FileLayout {
+            TableName::Scattered | TableName::Documents => FileLayout {
                 target_file_bytes: SCATTERED_FILE_BYTES,
                 column_index_truncate: Some(SCATTERED_COLUMN_INDEX_TRUNCATE),
                 ..byte_pages
@@ -1451,11 +1734,11 @@ impl TableShape {
     }
 
     /// Whether the command line selects the table: named by `--table`, or
-    /// `--table` absent and the table not the scattered one, and its values
-    /// among `values`.
+    /// `--table` absent and the table neither the scattered nor the
+    /// documents one, and its values among `values`.
     fn selected(self, tables: &[TableName], values: &[Values]) -> bool {
         let named = if tables.is_empty() {
-            self.name != TableName::Scattered
+            !matches!(self.name, TableName::Scattered | TableName::Documents)
         } else {
             tables.contains(&self.name)
         };
@@ -1495,7 +1778,9 @@ struct Prepared {
 impl Prepared {
     /// The table as the manifest records it; `rows` and `appended_rows`
     /// are keys, an ordered table records its `rows_per_key` beside them,
-    /// the appended table its `overlapping_appends`, and a run that sets
+    /// the appended table its `overlapping_appends`, the scattered table
+    /// its `scattered_files`, a table of scattered keys the
+    /// `SCATTERED_ID_SPACE` that spelled them, and a run that sets
     /// `--row-group-rows` that count.
     fn to_json(&self) -> Json {
         let mut table = json!({
@@ -1514,6 +1799,12 @@ impl Prepared {
         }
         if self.shape.overlapping_appends() > 0 {
             table["overlapping_appends"] = json!(self.shape.overlapping_appends());
+        }
+        if let Some(files) = self.shape.scattered_files() {
+            table["scattered_files"] = json!(files);
+        }
+        if let Some(space) = self.shape.scattered_id_space() {
+            table["scattered_id_space"] = json!(space);
         }
         if let Some(rows) = row_group_rows() {
             table["row_group_rows"] = json!(rows);
@@ -1661,8 +1952,8 @@ fn write_manifest(dir: &Path, tables: &[Prepared]) -> BenchResult<()> {
 }
 
 /// The tables the manifest under `dir` records as this program writes them
-/// now, whose builds' metadata files are still there; none when it is
-/// absent.
+/// now, whose builds' metadata files are still there, a scattered table of
+/// any file count among them; none when it is absent.
 fn read_manifest(dir: &Path) -> BenchResult<Vec<Prepared>> {
     let path = dir.join(MANIFEST_FILE);
     if !path.exists() {
@@ -1674,8 +1965,10 @@ fn read_manifest(dir: &Path) -> BenchResult<Vec<Prepared>> {
     };
     let mut recorded = Vec::with_capacity(tables.len());
     for table in tables {
-        let Some(shape) = SHAPES
+        let other_files = table["scattered_files"].as_u64().map(TableShape::scattered);
+        let Some(shape) = shapes()
             .into_iter()
+            .chain(other_files)
             .find(|shape| table["name"].as_str() == Some(shape.table_name().as_str()))
         else {
             continue;
@@ -1693,6 +1986,8 @@ fn read_manifest(dir: &Path) -> BenchResult<Vec<Prepared>> {
             && table["rows_per_key"].as_u64() == shape.ordered.map(|_| shape.rows_per_key())
             && table["overlapping_appends"].as_u64()
                 == Some(shape.overlapping_appends()).filter(|&appends| appends > 0)
+            && table["scattered_files"].as_u64() == shape.scattered_files()
+            && table["scattered_id_space"].as_u64() == shape.scattered_id_space()
             && table["row_group_rows"].as_u64() == row_group_rows().map(approx::count);
         if current && local_path(&first)?.exists() && local_path(&second)?.exists() {
             recorded.push(Prepared {
@@ -2241,9 +2536,9 @@ fn skewed_pools(shape: TableShape) -> (Arc<Vec<Key>>, Arc<Vec<Key>>) {
 }
 
 /// Runs operations `0..ops` of `op`, `tasks` at a time, outside any
-/// measured window: one pass over the skewed scenario's fill pool
-/// (`skewed_pools`), which fills its caches with the rows and pages its
-/// distribution reads most.
+/// measured window, so a run measures caches already holding what its
+/// keys read most: the skewed scenario's pass over its fill pool
+/// (`skewed_pools`), and a workload's first requests (`sweep`).
 async fn fill_from(served: &Served, op: &Op, tasks: usize, ops: usize) -> BenchResult<()> {
     let handles: Vec<tokio::task::JoinHandle<BenchResult<()>>> = (0..tasks)
         .map(|task| {
@@ -2261,6 +2556,24 @@ async fn fill_from(served: &Served, op: &Op, tasks: usize, ops: usize) -> BenchR
         handle.await??;
     }
     Ok(())
+}
+
+/// The skewed scenario's op over `shape`, its measured pool
+/// (`skewed_pools`), once `served` is filled by a pass of its fill pool
+/// with `settings.tasks` tasks (`fill_from`), its resident set read around
+/// the pass.
+async fn skewed(served: &mut Served, shape: TableShape, settings: &RunSettings) -> BenchResult<Op> {
+    let (fill, measured) = skewed_pools(shape);
+    served.filled = Filled::now();
+    fill_from(
+        served,
+        &get(&fill, true, WHOLE_VALUE),
+        settings.tasks,
+        KEY_POOL,
+    )
+    .await?;
+    served.filled = served.filled.ended();
+    Ok(get(&measured, true, WHOLE_VALUE))
 }
 
 /// Pools of hits and misses over `shape`'s key space: the `hit_ids` as
@@ -2584,6 +2897,14 @@ enum Op {
         value_bytes: usize,
         cold: Option<PageCache>,
     },
+    /// Request `i` of a workload, by places in `keys`: a `get` of its one
+    /// key or a `multi_get` of its keys in order, repeats kept, reading
+    /// `VALUE_COLUMN` whole, every key present. There is no operation past
+    /// the last request (`Op::end`), so a run of it never wraps.
+    Requests {
+        requests: Arc<Requests<u32>>,
+        keys: Arc<Vec<Key>>,
+    },
 }
 
 /// One request of a reference op: the keys it asks, by key index and as
@@ -2656,6 +2977,7 @@ impl Op {
                 let at = i % requests.len();
                 at..at + 1
             }
+            Self::Requests { .. } => i..i + 1,
             Self::MultiGet { keys, batch, .. } | Self::MultiScan { keys, batch, .. } => {
                 let start = (i * batch) % (keys.len() - batch);
                 start..start + batch
@@ -2674,6 +2996,40 @@ impl Op {
             Self::Get { .. } | Self::Scan { .. } => 1,
             Self::MultiGet { batch, .. } | Self::MultiScan { batch, .. } => *batch,
             Self::Reference { requests, .. } => requests[i % requests.len()].keys.len(),
+            Self::Requests { requests, .. } => requests.get(i).len(),
+        }
+    }
+
+    /// The operations there are: a workload's requests; `None` for an op
+    /// that cycles through its pool.
+    fn end(&self) -> Option<usize> {
+        match self {
+            Self::Requests { requests, .. } => Some(requests.len()),
+            Self::Get { .. }
+            | Self::MultiGet { .. }
+            | Self::Scan { .. }
+            | Self::MultiScan { .. }
+            | Self::Reference { .. } => None,
+        }
+    }
+
+    /// What operation `i` needs built before it is timed: a workload
+    /// request's keys, cloned out of its op's keys by place; `None` for
+    /// every other op, whose keys are in place already.
+    fn stage(&self, i: usize) -> Option<Vec<Key>> {
+        match self {
+            Self::Requests { requests, keys } => Some(
+                requests
+                    .get(i)
+                    .iter()
+                    .map(|&place| keys[approx::length(place)].clone())
+                    .collect(),
+            ),
+            Self::Get { .. }
+            | Self::MultiGet { .. }
+            | Self::Scan { .. }
+            | Self::MultiScan { .. }
+            | Self::Reference { .. } => None,
         }
     }
 
@@ -2690,15 +3046,28 @@ impl Op {
             | Self::Get { .. }
             | Self::MultiGet { .. }
             | Self::Scan { .. }
-            | Self::MultiScan { .. } => {}
+            | Self::MultiScan { .. }
+            | Self::Requests { .. } => {}
         }
     }
 
     /// Runs operation `i` and returns the value bytes it read and
-    /// returned; an answer of the wrong presence, or a Scan's answer that
-    /// disagrees with the model, is an error, so a run that measured
-    /// nothing but failures cannot pass for fast.
+    /// returned (`run_staged`), its keys staged first (`stage`).
     async fn run(&self, table: &Table, i: usize) -> BenchResult<ValueBytes> {
+        self.run_staged(table, i, self.stage(i)).await
+    }
+
+    /// Runs operation `i` over the keys `stage` built for it, and returns
+    /// the value bytes it read and returned; an answer of the wrong
+    /// presence, or a Scan's answer that disagrees with the model, is an
+    /// error, so a run that measured nothing but failures cannot pass for
+    /// fast.
+    async fn run_staged(
+        &self,
+        table: &Table,
+        i: usize,
+        staged: Option<Vec<Key>>,
+    ) -> BenchResult<ValueBytes> {
         let at = self.pool_range(i);
         match self {
             Self::Get {
@@ -2752,6 +3121,26 @@ impl Op {
                 let asked = (request.keys.as_slice(), request.multi, request.bounds());
                 checked_scan(table, asked, request.cases.iter(), *value_bytes, i).await
             }
+            Self::Requests { .. } => {
+                let keys = staged.or_else(|| self.stage(i)).unwrap_or_default();
+                let returned = match keys.as_slice() {
+                    [key] => {
+                        let lookup = table.get(key, &VALUE_READS).await?;
+                        returned_bytes(&lookup.row, VALUE_READS.len())
+                            .ok_or_else(|| format!("request {i} answered its key absent"))?
+                    }
+                    keys => {
+                        let lookup = table.multi_get(keys, &VALUE_READS).await?;
+                        let mut returned = 0;
+                        for row in &lookup.rows {
+                            returned += returned_bytes(row, VALUE_READS.len())
+                                .ok_or_else(|| format!("request {i} answered a key absent"))?;
+                        }
+                        returned
+                    }
+                };
+                Ok(ValueBytes::of(returned, returned))
+            }
         }
     }
 
@@ -2771,7 +3160,7 @@ impl Op {
                 let request = &requests[at.start];
                 Some((&request.keys, request.multi, request.bounds()))
             }
-            Self::Get { .. } | Self::MultiGet { .. } => None,
+            Self::Get { .. } | Self::MultiGet { .. } | Self::Requests { .. } => None,
         }
     }
 }
@@ -2829,7 +3218,9 @@ async fn verify_answers(
 async fn verify_scans(op: &Op, table: &Table, shape: TableShape) -> BenchResult<()> {
     let cases = match op {
         Op::Scan { cases, .. } | Op::MultiScan { cases, .. } => cases,
-        Op::Get { .. } | Op::MultiGet { .. } | Op::Reference { .. } => return Ok(()),
+        Op::Get { .. } | Op::MultiGet { .. } | Op::Reference { .. } | Op::Requests { .. } => {
+            return Ok(());
+        }
     };
     let ordered = shape.order()?;
     let ids = hit_ids(shape);
@@ -2860,12 +3251,13 @@ enum Pace {
 /// returned.
 type Done = (usize, Vec<Duration>, Looked);
 
-/// The keys a run's operations looked up and the value bytes they read
-/// and returned.
+/// The keys a run's operations looked up, the value bytes they read and
+/// returned, and the highest operation any of them was.
 #[derive(Clone, Copy, Debug, Default)]
 struct Looked {
     keys: u64,
     bytes: ValueBytes,
+    last: Option<usize>,
 }
 
 impl Looked {
@@ -2873,13 +3265,15 @@ impl Looked {
         Self {
             keys: self.keys + other.keys,
             bytes: self.bytes.plus(other.bytes),
+            last: self.last.max(other.last),
         }
     }
 }
 
 /// One task's share of a run whose operations start at `first`:
-/// operations `first + task`, `first + task + tasks`, ... until `until`,
-/// each timed into `samples` when it is given.
+/// operations `first + task`, `first + task + tasks`, ... until `until` or
+/// the op's last operation (`Op::end`), each timed into `samples` when it
+/// is given, its keys staged before its timing starts (`Op::stage`).
 async fn task_loop(
     table: Arc<Table>,
     op: Op,
@@ -2892,15 +3286,20 @@ async fn task_loop(
     let mut looked = Looked::default();
     while Instant::now() < until {
         let i = first + done * tasks + task;
+        if op.end().is_some_and(|end| i >= end) {
+            break;
+        }
         op.before();
+        let staged = op.stage(i);
         let started = Instant::now();
-        let bytes = op.run(&table, i).await?;
+        let bytes = op.run_staged(&table, i, staged).await?;
         if let Some(samples) = samples.as_mut() {
             samples.push(started.elapsed());
         }
         looked = looked.plus(Looked {
             keys: approx::count(op.keys_of(i)),
             bytes,
+            last: Some(i),
         });
         done += 1;
         if let Pace::Yielding = pace {
@@ -2914,15 +3313,16 @@ async fn task_loop(
 type Loops = Vec<tokio::task::JoinHandle<BenchResult<Done>>>;
 
 /// `tasks` task loops of `op` over `table` at `pace` from operation
-/// `first` until `until`, each reserving `reserve` samples when
-/// recording, spawned and not yet joined.
+/// `first` until `until`, each recording into its own of `samples` when
+/// given, spawned and not yet joined.
 fn spawn_loops(
     table: &Arc<Table>,
     (op, pace): (&Op, Pace),
     (first, tasks): (usize, usize),
     until: Instant,
-    reserve: Option<usize>,
+    samples: Option<Vec<Vec<Duration>>>,
 ) -> Loops {
+    let mut buffers = samples.map(Vec::into_iter);
     (0..tasks)
         .map(|task| {
             tokio::spawn(task_loop(
@@ -2931,21 +3331,28 @@ fn spawn_loops(
                 (first, task, tasks),
                 pace,
                 until,
-                reserve.map(Vec::with_capacity),
+                buffers.as_mut().and_then(Iterator::next),
             ))
         })
         .collect()
 }
 
-/// `tasks` task loops from operation `first` for `length`, each
-/// reserving `reserve` samples when recording; the operations done, the
-/// samples, and the keys and value bytes, merged.
+/// A buffer of `reserve` samples for each of `tasks` task loops, allocated
+/// before a window's counters are first read, so recording allocates
+/// nothing the window counts.
+fn sample_buffers(tasks: usize, reserve: usize) -> Vec<Vec<Duration>> {
+    (0..tasks).map(|_| Vec::with_capacity(reserve)).collect()
+}
+
+/// `tasks` task loops from operation `first` for `length`, each recording
+/// into its own of `samples` when given; the operations done, the samples,
+/// and the keys and value bytes, merged.
 async fn spawn_run(
     served: &Served,
     op: &Op,
     (first, tasks): (usize, usize),
     length: Duration,
-    reserve: Option<usize>,
+    samples: Option<Vec<Vec<Duration>>>,
 ) -> BenchResult<Done> {
     let until = Instant::now() + length;
     join_loops(spawn_loops(
@@ -2953,7 +3360,7 @@ async fn spawn_run(
         (op, Pace::Straight),
         (first, tasks),
         until,
-        reserve,
+        samples,
     ))
     .await
 }
@@ -3306,9 +3713,19 @@ impl Window {
     }
 }
 
+/// What sets a run apart from its scenario's other runs on one table and
+/// tier, its budget, sample, or workload: a label for the printed table
+/// and fields for its JSON row.
+struct Case {
+    label: String,
+    fields: Json,
+}
+
 /// A measured run.
 struct Measured {
     label: RunLabel,
+    /// What sets it apart from its scenario's other runs, if anything does.
+    case: Option<Case>,
     window: Window,
     /// The rounds of GETs an operation waits on, counted apart from the
     /// window (`count_rounds`); `None` where they are not counted.
@@ -3324,6 +3741,7 @@ impl Measured {
                 tasks: run.tasks,
                 ..label
             },
+            case: None,
             window: run.window,
             rounds: run.rounds,
         }
@@ -3341,8 +3759,15 @@ impl Measured {
                 "batch_fan_out": self.label.batch_fan_out,
                 "beside": self.label.beside.map(TableShape::table_name),
                 "row_cache": serving().row_cache,
+                "case": self.case.as_ref().map(|case| case.label.as_str()),
             }),
-            [self.window.to_json(), rounds_json(self.rounds)],
+            [
+                self.window.to_json(),
+                rounds_json(self.rounds),
+                self.case
+                    .as_ref()
+                    .map_or_else(|| json!({}), |case| case.fields.clone()),
+            ],
         )
     }
 }
@@ -3386,34 +3811,53 @@ async fn measure_window(
     settings: &RunSettings,
 ) -> BenchResult<(Window, usize)> {
     let (warm_ops, _, _) = spawn_run(served, op, (first, tasks), settings.warmup, None).await?;
-    let windows = approx::length(settings.windows);
-    let reserve = (warm_ops / tasks + 1) * windows * SAMPLE_HEADROOM;
+    let reserve = settings.reserve(warm_ops, tasks);
     if let Some(log) = &served.gets {
         log.restart();
     }
-    let before = Counters::read(served);
-    let rss = RssSampler::start();
-    let started = Instant::now();
-    let (ops, samples, looked) = spawn_run(
+    let window = measured_run(
         served,
         op,
         (first + warm_ops, tasks),
         settings.duration,
-        Some(reserve),
+        reserve,
     )
     .await?;
+    let after = first + warm_ops + window.ops;
+    Ok((window, after))
+}
+
+/// `tasks` task loops of `op` over `served` from operation `first` for
+/// `length`, or to the op's end (`Op::end`), each recording into a buffer
+/// of `reserve` samples, measured: the counters before and after, the
+/// resident set sampled throughout (`RssSampler`), and what the caches held
+/// after. The buffers are allocated and the sampler started before the
+/// counters are first read, so the window's allocations are its
+/// operations' and the loops' spawning.
+async fn measured_run(
+    served: &Served,
+    op: &Op,
+    (first, tasks): (usize, usize),
+    length: Duration,
+    reserve: usize,
+) -> BenchResult<Window> {
+    let buffers = sample_buffers(tasks, reserve);
+    let rss = RssSampler::start();
+    let before = Counters::read(served);
+    let started = Instant::now();
+    let (ops, samples, looked) =
+        spawn_run(served, op, (first, tasks), length, Some(buffers)).await?;
     let elapsed = started.elapsed();
     let counters = Counters::read(served).since(before);
     let rss_peak = rss.stop().peak;
-    let window = Window {
+    Ok(Window {
         ops,
         elapsed,
         latencies: Latencies::of(samples),
         counters,
         looked,
         memory: Memory::of(served, rss_peak),
-    };
-    Ok((window, first + warm_ops + ops))
+    })
 }
 
 /// Asks every page of the table, of every column it serves, at least once,
@@ -3491,6 +3935,15 @@ struct RunSettings {
     windows: u64,
 }
 
+impl RunSettings {
+    /// The samples each of `tasks` loops reserves for a window after a
+    /// warm-up of `warm_ops` operations: the warm-up's rate per task over
+    /// the window's length, `SAMPLE_HEADROOM` times over.
+    fn reserve(&self, warm_ops: usize, tasks: usize) -> usize {
+        (warm_ops / tasks + 1) * approx::length(self.windows) * SAMPLE_HEADROOM
+    }
+}
+
 /// One table served in one tier under each cache budget its selected
 /// scenarios measure, loaded; `None` for a budget none of them does.
 struct Budgets {
@@ -3539,6 +3992,7 @@ impl Budgets {
             Cache::Warm | Cache::Unread => &self.warm,
             Cache::Cold => &self.cold,
             Cache::Skewed => &self.skewed,
+            Cache::Swept => &None,
         }
         .as_ref()
         .expect("a table is served for every selected scenario")
@@ -3590,20 +4044,7 @@ async fn lookups(
     for &scenario in scenarios {
         let op = match scenario {
             Scenario::WarmHit | Scenario::ColdHit => get(&hits, true, WHOLE_VALUE),
-            Scenario::SkewedHit => {
-                let (fill, measured) = skewed_pools(shape);
-                let served = budgets.skewed_mut();
-                served.filled = Filled::now();
-                fill_from(
-                    served,
-                    &get(&fill, true, WHOLE_VALUE),
-                    settings.tasks,
-                    KEY_POOL,
-                )
-                .await?;
-                served.filled = served.filled.ended();
-                get(&measured, true, WHOLE_VALUE)
-            }
+            Scenario::SkewedHit => skewed(budgets.skewed_mut(), shape, settings).await?,
             Scenario::Miss => get(&misses, false, WHOLE_VALUE),
             Scenario::MultiGet100 | Scenario::MultiGet100Cold => {
                 multi(&hits, SMALL_BATCH_KEYS, WHOLE_VALUE)
@@ -3637,7 +4078,11 @@ async fn lookups(
             | Scenario::ScanBoundedLongCold
             | Scenario::ScanBoundedStringCold => scan_pool(&bounded_in_run(shape)?)?,
             Scenario::ScanHeadLong => scan_one(head_of_run())?,
-            Scenario::Load | Scenario::Refresh | Scenario::TwoTable | Scenario::KvBesideOrdered => {
+            Scenario::Load
+            | Scenario::Refresh
+            | Scenario::TwoTable
+            | Scenario::KvBesideOrdered
+            | Scenario::Replay => {
                 continue;
             }
         };
@@ -3675,7 +4120,7 @@ async fn count_rounds(served: &Served, op: &Op) -> BenchResult<Option<Rounds>> {
     let one_key = match op {
         Op::Scan { .. } => true,
         Op::Reference { requests, .. } => !requests[0].multi,
-        Op::Get { .. } | Op::MultiGet { .. } | Op::MultiScan { .. } => false,
+        Op::Get { .. } | Op::MultiGet { .. } | Op::MultiScan { .. } | Op::Requests { .. } => false,
     };
     let (Some(store), true) = (&served.rounds, one_key) else {
         return Ok(None);
@@ -3961,8 +4406,8 @@ async fn two_tables(
     let (warm_hits, _, _) = join_loops(hit_loops).await?;
     let (warm_batches, _, _) = join_loops(batch_loops).await?;
 
-    let windows = approx::length(settings.windows);
-    let reserve = |ops: usize, tasks: usize| Some((ops / tasks + 1) * windows * SAMPLE_HEADROOM);
+    let reserve =
+        |ops: usize, tasks: usize| Some(sample_buffers(tasks, settings.reserve(ops, tasks)));
     let rss = RssSampler::start();
     let started = Instant::now();
     let until = started + settings.duration;
@@ -3998,6 +4443,7 @@ async fn two_tables(
     let rows = vec![
         Measured {
             label: label(string.shape, Mode::Single, one),
+            case: None,
             window: Window {
                 ops: batch_ops,
                 elapsed,
@@ -4010,6 +4456,7 @@ async fn two_tables(
         },
         Measured {
             label: label(long.shape, Mode::Multi, tasks),
+            case: None,
             window: Window {
                 ops: hit_ops,
                 elapsed,
@@ -4025,6 +4472,302 @@ async fn two_tables(
         eprintln!("{}", row(run));
     }
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Workloads.
+
+/// The seed of the hash a trace's keys are sampled by (`KeySample`), fixed
+/// so every run of one rate keeps the same keys.
+const TRACE_SAMPLE_SEED: u64 = 0x1ce7_4a7b_e4c4_0004;
+
+/// The seed of the shuffle that places a workload's keys on a table's ids
+/// (`workload::scatter`), fixed so every run places them alike.
+const PLACE_SEED: u64 = 0x1ce7_4a7b_e4c4_0005;
+
+/// A workload's requests over its fill: the first third fill the caches,
+/// and the run measures those after them.
+const FILL_DIVISOR: usize = 3;
+
+/// A workload as the bench runs it on one table: its requests as an op
+/// over the table's keys by place, the share of the full workload they
+/// stand for, which scales each budget, each request's arrival time when
+/// known, and what every row of it reports of it.
+struct Workload {
+    /// What the printed table's case starts with, before the budget.
+    name: String,
+    op: Op,
+    sample: SampleRate,
+    ts: Option<Arc<Vec<i64>>>,
+    fields: Json,
+}
+
+impl Workload {
+    /// The requests there are.
+    fn requests(&self) -> usize {
+        self.op.end().unwrap_or(0)
+    }
+
+    /// The microseconds from request `first`'s arrival, the earliest a
+    /// window replayed, to that of request `last`, the latest it replayed,
+    /// which in a window of several tasks is not `first` plus its requests:
+    /// the tasks stride the requests and stop at different places. `None`
+    /// when arrivals are unknown, the window replayed none, or the trace's
+    /// times are too far apart to subtract.
+    fn span(&self, first: usize, last: Option<usize>) -> Option<i64> {
+        let ts = self.ts.as_ref()?;
+        ts.get(last?)?.checked_sub(*ts.get(first)?)
+    }
+}
+
+/// `requests` over `shape`'s keys: each place a key of the table's first
+/// build, place `p` the id `ids[p]`.
+fn placed(shape: TableShape, requests: Arc<Requests<u32>>, ids: Vec<u64>) -> Op {
+    let keys = ids.into_iter().map(|id| shape.key(id)).collect();
+    Op::Requests {
+        requests,
+        keys: Arc::new(keys),
+    }
+}
+
+/// A trace read once for the run: its kept requests by place among its
+/// distinct kept keys (`Requests::densified`), the count of those keys,
+/// its arrival times, and what every row reports of it.
+struct ReadTrace {
+    requests: Arc<Requests<u32>>,
+    distinct: usize,
+    sample: SampleRate,
+    ts: Option<Arc<Vec<i64>>>,
+    fields: Json,
+}
+
+impl ReadTrace {
+    /// The trace at `path` under `sample` (`Trace::read`), its requests
+    /// densified.
+    fn read(path: &Path, sample: SampleRate) -> BenchResult<Self> {
+        let started = Instant::now();
+        let trace = Trace::read(path, KeySample::new(sample, TRACE_SAMPLE_SEED))?;
+        let (requests, distinct) = trace.requests.densified()?;
+        let ts = trace.ts.map(Arc::new);
+        let whole_span = ts
+            .as_ref()
+            .and_then(|ts| ts.last()?.checked_sub(*ts.first()?));
+        eprintln!(
+            "read {} under a sample of {sample}: {} of {} requests, {} of {} lookups, {} distinct keys ({:.1?})",
+            path.display(),
+            requests.len(),
+            trace.read_requests,
+            requests.lookups(),
+            trace.read_lookups,
+            distinct.len(),
+            started.elapsed()
+        );
+        let fields = json!({
+            "trace": path.display().to_string(),
+            "trace_sample": sample.as_f64(),
+            "trace_requests_read": trace.read_requests,
+            "trace_lookups_read": trace.read_lookups,
+            "trace_requests": requests.len(),
+            "trace_lookups": requests.lookups(),
+            "trace_distinct_keys": distinct.len(),
+            "trace_span_us": whole_span,
+        });
+        Ok(Self {
+            requests: Arc::new(requests),
+            distinct: distinct.len(),
+            sample,
+            ts,
+            fields,
+        })
+    }
+
+    /// What stops the trace from replaying on `shape`, if anything: more
+    /// distinct kept keys than the share of its rows they are placed on
+    /// (`workload::share_of_rows`), the sample's.
+    fn problem_on(&self, shape: TableShape) -> Option<String> {
+        let ids = workload::share_of_rows(shape.rows, self.sample.fraction());
+        let advice = if shape.name == TableName::Scattered {
+            "raise --scattered-files; a lower --trace-sample shrinks both in proportion"
+        } else {
+            "no --trace-sample fits it, since a lower one shrinks both in proportion"
+        };
+        (approx::count(self.distinct) > ids).then(|| {
+            format!(
+                "replay on {}: the trace keeps {} distinct keys under --trace-sample {}, more \
+                 than the {ids} of its {} rows that share holds: {advice}",
+                shape.table_name(),
+                self.distinct,
+                self.sample,
+                shape.rows
+            )
+        })
+    }
+
+    /// The trace as a workload on `shape`: its distinct kept keys scattered
+    /// over the sample's share of the table's rows
+    /// (`workload::scatter_share`), so they fill its pages as densely as
+    /// the whole trace's keys fill the whole table's. The placement is
+    /// checked first (`problem_on`).
+    fn on(&self, shape: TableShape) -> BenchResult<Workload> {
+        let ids = workload::scatter_share(
+            self.distinct,
+            shape.rows,
+            self.sample.fraction(),
+            PLACE_SEED,
+        )?;
+        Ok(Workload {
+            name: if self.sample == SampleRate::ALL {
+                String::new()
+            } else {
+                format!("r={} ", self.sample)
+            },
+            op: placed(shape, Arc::clone(&self.requests), ids),
+            sample: self.sample,
+            ts: self.ts.clone(),
+            fields: self.fields.clone(),
+        })
+    }
+}
+
+/// `workload` on `prepared` in `tier` as `scenario`, under each of
+/// `budgets` in each selected mode: each budget the full-size one, scaled
+/// by the workload's sample for the run (`SampleRate::of`), and each mode
+/// over a table and caches served for it alone and loaded, filled by the
+/// workload's first third of requests with `settings.tasks` tasks,
+/// unmeasured, and then measured over the requests after them, from the
+/// first, for `--duration` or until the requests run out, with no warm-up
+/// and no wrap. Every mode and budget is filled alike, so their rows
+/// compare.
+async fn sweep(
+    prepared: &Prepared,
+    tier: Tier,
+    (scenario, workload): (Scenario, &Workload),
+    budgets: &[Size],
+    settings: &RunSettings,
+) -> BenchResult<Vec<Measured>> {
+    let requests = workload.requests();
+    let fill = requests / FILL_DIVISOR;
+    let mut results = Vec::new();
+    for &budget in budgets {
+        let actual = workload.sample.of(budget.0);
+        for &mode in &settings.modes {
+            let tasks = match mode {
+                Mode::Single => 1,
+                Mode::Multi => settings.tasks,
+            };
+            let mut served = serve_loaded(prepared, None, tier, actual).await?;
+            served.filled = Filled::now();
+            fill_from(&served, &workload.op, settings.tasks, fill).await?;
+            served.filled = served.filled.ended();
+            let reserve = (requests - fill) / tasks + 1;
+            let window = measured_run(
+                &served,
+                &workload.op,
+                (fill, tasks),
+                settings.duration,
+                reserve,
+            )
+            .await?;
+            let ended = fill + window.ops == requests;
+            let case = Case {
+                label: format!("{}{budget}", workload.name),
+                fields: merged(
+                    json!({
+                        "budget_nominal_bytes": budget.0,
+                        "budget_bytes": actual,
+                        "fill_requests": fill,
+                        "window_first_request": fill,
+                        "window_requests": window.ops,
+                        "window_ended_at_end": ended,
+                        "window_span_us": workload.span(fill, window.looked.last),
+                    }),
+                    [workload.fields.clone()],
+                ),
+            };
+            let measured = Measured {
+                label: RunLabel {
+                    scenario,
+                    table: prepared.shape,
+                    tier,
+                    mode,
+                    tasks,
+                    batch_fan_out: serving().batch_fan_out,
+                    beside: None,
+                },
+                case: Some(case),
+                window,
+                rounds: None,
+            };
+            eprintln!("{}", row(&measured));
+            if ended {
+                eprintln!("  the window ended at the workload's last request");
+            }
+            results.push(measured);
+        }
+    }
+    Ok(results)
+}
+
+/// The replay scenario: `trace` swept over `--budget` (`sweep`) on each
+/// key-value table of `tables` in each of `tiers`.
+async fn replays(
+    cli: &Cli,
+    trace: &ReadTrace,
+    tables: &[&Prepared],
+    tiers: &[Tier],
+    settings: &RunSettings,
+) -> BenchResult<Vec<Measured>> {
+    let mut measured = Vec::new();
+    for table in replay_tables(tables) {
+        let workload = trace.on(table.shape)?;
+        for &tier in tiers {
+            let scenario = (Scenario::Replay, &workload);
+            measured.extend(sweep(table, tier, scenario, &cli.budget, settings).await?);
+        }
+    }
+    Ok(measured)
+}
+
+/// The tables of `tables` a replay runs on: the key-value ones.
+fn replay_tables<'a>(tables: &'a [&'a Prepared]) -> impl Iterator<Item = &'a Prepared> {
+    tables
+        .iter()
+        .copied()
+        .filter(|table| table.shape.ordered.is_none())
+}
+
+/// The workload scenarios a run makes, checked before anything is
+/// measured: the trace `replay` replays, read once under `--trace-sample`.
+struct WorkloadPlan {
+    trace: Option<ReadTrace>,
+}
+
+impl WorkloadPlan {
+    /// The plan of the workload scenarios `scenarios` selects, `replay` on
+    /// `tables`, or every problem that would stop one of them partway:
+    /// a replay without `--trace`, and a trace that does not fit a table it
+    /// replays on (`ReadTrace::problem_on`).
+    fn checked(cli: &Cli, scenarios: &[Scenario], tables: &[&Prepared]) -> BenchResult<Self> {
+        let mut problems = Vec::new();
+        let mut trace = None;
+        if scenarios.contains(&Scenario::Replay) {
+            match &cli.trace {
+                Some(path) => {
+                    let read = ReadTrace::read(path, cli.trace_sample)?;
+                    problems.extend(
+                        replay_tables(tables).filter_map(|table| read.problem_on(table.shape)),
+                    );
+                    trace = Some(read);
+                }
+                None => problems.push("the replay scenario needs --trace FILE".to_string()),
+            }
+        }
+        if problems.is_empty() {
+            Ok(Self { trace })
+        } else {
+            Err(format!("nothing was measured: {}", problems.join("; ")).into())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4498,8 +5241,9 @@ const PERCENT: f64 = 100.0;
 /// The column headings of the lookup table.
 fn header() -> String {
     format!(
-        "{:<24} {:<19} {:<6} {:<7} {:>5} {}",
+        "{:<24} {:<24} {:<19} {:<6} {:<7} {:>5} {}",
         "scenario",
+        "case",
         "table",
         "tier",
         "mode",
@@ -4537,8 +5281,9 @@ fn window_header() -> String {
 
 fn row(run: &Measured) -> String {
     format!(
-        "{:<24} {:<19} {:<6} {:<7} {:>5} {}",
+        "{:<24} {:<24} {:<19} {:<6} {:<7} {:>5} {}",
         run.label.scenario.name(),
+        run.case.as_ref().map_or("-", |case| case.label.as_str()),
         run.label.table_label(),
         run.label.tier.name(),
         run.label.mode.name(),
@@ -5523,13 +6268,13 @@ fn print_prepared(prepared: &[Prepared]) {
 /// of random values and the ordered table.
 fn select_shapes(cli: &Cli, scenarios: &[Scenario]) -> (Vec<TableShape>, Vec<TableShape>) {
     let values = or_all(&cli.values, &Values::ALL);
-    let measured: Vec<TableShape> = SHAPES
+    let measured: Vec<TableShape> = shapes()
         .into_iter()
         .filter(|shape| shape.selected(&cli.table, &values))
         .collect();
     let two_table = scenarios.contains(&Scenario::TwoTable) && !cli.prepare;
     let beside_ordered = scenarios.contains(&Scenario::KvBesideOrdered) && !cli.prepare;
-    let needed = SHAPES
+    let needed = shapes()
         .into_iter()
         .filter(|shape| {
             let random = shape.values == Values::Random;
@@ -5633,7 +6378,16 @@ fn print_results(machine: &Json, measured: &[Measured], loaded: &[Loaded]) {
 /// constants that shape the tables and scenarios, and the tables as
 /// written with their columns' compression.
 fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Json {
-    json!({
+    let workloads = json!({
+        "budgets": cli.budget.iter().map(|budget| budget.0).collect::<Vec<_>>(),
+        "trace": cli.trace.as_ref().map(|path| path.display().to_string()),
+        "trace_sample": cli.trace_sample.as_f64(),
+        "trace_sample_seed": TRACE_SAMPLE_SEED,
+        "place_seed": PLACE_SEED,
+        "fill_divisor": FILL_DIVISOR,
+        "scattered_files": cli.scattered_files,
+    });
+    let settings = json!({
         "key_pool": KEY_POOL,
         "key_seed": KEY_SEED,
         "warm_cache_bytes": WARM_CACHE_BYTES,
@@ -5670,7 +6424,8 @@ fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Js
         "tables": prepared.iter().map(Prepared::to_json).collect::<Vec<_>>(),
         "compression": compression,
         "rss_sampling": rss_sampling(),
-    })
+    });
+    merged(settings, [workloads])
 }
 
 /// The settings every lookup run of `cli` shares.
@@ -5715,6 +6470,9 @@ async fn main() -> BenchResult<()> {
     ROW_GROUP_ROWS
         .set(cli.row_group_rows)
         .expect("main sets the row groups once");
+    SCATTERED_FILES
+        .set(cli.scattered_files)
+        .expect("main sets the scattered files once");
     if cfg!(debug_assertions) {
         eprintln!("warning: an unoptimized build; pass --release or --profile profiling");
     }
@@ -5730,7 +6488,7 @@ async fn main() -> BenchResult<()> {
         }
         return reference_main(&cli, warehouse, &settings).await;
     }
-    let scenarios = or_all(&cli.scenario, Scenario::value_variants());
+    let scenarios = or_all(&cli.scenario, &Scenario::unnamed());
     let (measured_shapes, needed) = select_shapes(&cli, &scenarios);
     let prepared = prepare(&cli.data_dir, cli.rewrite, &needed).await?;
     let compression = compression(&prepared)?;
@@ -5753,13 +6511,14 @@ async fn main() -> BenchResult<()> {
     let lookup_scenarios: Vec<Scenario> = scenarios
         .iter()
         .copied()
-        .filter(|s| s.traits().lookup)
+        .filter(|s| s.traits().runs == Runs::Lookup)
         .collect();
     let tiers = or_all(&cli.tier, &Tier::ALL);
     let tables: Vec<&Prepared> = prepared
         .iter()
         .filter(|table| measured_shapes.contains(&table.shape))
         .collect();
+    let plan = WorkloadPlan::checked(&cli, &scenarios, &tables)?;
     let machine = machine(tasks, !cli.no_metrics);
     eprintln!("{machine}");
     eprintln!("{}", header());
@@ -5781,6 +6540,9 @@ async fn main() -> BenchResult<()> {
                 loaded.extend(refreshes(table, tier, cli.load_rounds).await?);
             }
         }
+    }
+    if let Some(trace) = &plan.trace {
+        measured.extend(replays(&cli, trace, &tables, &tiers, &settings).await?);
     }
     if scenarios.contains(&Scenario::TwoTable) {
         for &tier in &tiers {

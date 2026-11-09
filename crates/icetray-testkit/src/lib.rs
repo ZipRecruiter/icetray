@@ -4,8 +4,9 @@
 //! brute-force merge-on-read oracle, the deterministic simulation
 //! transport, a store that counts GETs per object, one that counts the
 //! rounds a read's GETs take, and one that logs each GET's range and
-//! latency, shared assertions, the golden-table locator (RFD 014), and the
-//! truth file a check replays against a running server.
+//! latency, shared assertions, the golden-table locator (RFD 014), the
+//! truth file a check replays against a running server, and the lookup
+//! workloads the benchmark replays.
 
 pub mod aws_catalog;
 pub mod counting;
@@ -25,6 +26,7 @@ pub mod s3;
 pub mod sim;
 pub mod truth;
 pub mod verify;
+pub mod workload;
 
 pub use counting::CountingStore;
 pub use error::{Result, TestkitError};

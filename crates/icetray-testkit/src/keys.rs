@@ -100,11 +100,13 @@ const SCATTERED_CHARS: u32 = SCATTERED_VALUE_BITS / BASE64_BITS;
 const SCATTERED_DIGIT_MASK: u8 = (1 << BASE64_BITS) - 1;
 
 /// The top bits of a scattered key's value, which hold the id; the rest
-/// are pseudo-random. Twenty-one bits admit about two million ids, which
-/// the benchmark's scattered table and its append fill more than half of,
-/// so its keys spread over most of the value space and neighbors in one
-/// bucket share only their first few characters, as sorted random keys do.
-const SCATTERED_ID_BITS: u32 = 21;
+/// are pseudo-random. Twenty-three bits admit about 8.4 million ids, room
+/// for the benchmark's scattered table at `--scattered-files 128` and its
+/// append, 4.85 million, while neighbors in one bucket of its smallest
+/// table share only their first few characters, as sorted random keys do.
+/// A key's spelling depends on this, so the benchmark's manifest records
+/// `SCATTERED_ID_SPACE` and writes a table recorded under another again.
+const SCATTERED_ID_BITS: u32 = 23;
 
 /// The ids a scattered key exists for: `0..SCATTERED_ID_SPACE`.
 pub const SCATTERED_ID_SPACE: u64 = 1 << SCATTERED_ID_BITS;
@@ -245,7 +247,7 @@ fn scattered_value(i: u64) -> u128 {
 
 /// splitmix64's output for `state`: a bijective mix whose outputs for
 /// neighboring states share no visible pattern.
-fn splitmix64(state: u64) -> u64 {
+pub(crate) fn splitmix64(state: u64) -> u64 {
     let mut z = state.wrapping_add(SPLITMIX_GAMMA);
     z = (z ^ (z >> SPLITMIX_FIRST_SHIFT)).wrapping_mul(SPLITMIX_FIRST_MULTIPLIER);
     z = (z ^ (z >> SPLITMIX_SECOND_SHIFT)).wrapping_mul(SPLITMIX_SECOND_MULTIPLIER);
@@ -394,6 +396,10 @@ pub enum ValueKind {
     /// `protobuf::value`: a protobuf message of every wire type, written by
     /// hand, for a column declared protobuf (RFD 024).
     Protobuf,
+    /// `json_value_for_len`: a JSON document of short fields and long
+    /// prose, whose words are common ones or made of random syllables, so
+    /// a page of them compresses about as far as documents of listings do.
+    Json,
 }
 
 /// The `len`-byte value of `kind` stored for `key`.
@@ -402,6 +408,7 @@ pub fn value_of_kind(key: &Key, len: usize, kind: ValueKind) -> Vec<u8> {
         ValueKind::Random => value_for_len(key, len),
         ValueKind::Text => text_value_for_len(key, len),
         ValueKind::Protobuf => protobuf::value(key, len, FIRST_VERSION),
+        ValueKind::Json => json_value_for_len(key, len),
     }
 }
 
@@ -498,6 +505,127 @@ pub fn text_value_for_len(key: &Key, len: usize) -> Vec<u8> {
     bytes
 }
 
+/// The fields of a JSON document that hold a few words each, written in
+/// this order after its id, before its prose.
+const JSON_SHORT_FIELDS: [&str; 6] = ["title", "company", "city", "category", "schedule", "pay"];
+
+/// The words of a short field.
+const JSON_SHORT_WORDS: u64 = 3;
+
+/// The field of a JSON document that holds its prose marked up.
+const JSON_HTML_FIELD: &str = "html_description";
+
+/// The field of a JSON document that holds its prose bare, to its end.
+const JSON_PROSE_FIELD: &str = "description";
+
+/// The common words of a document's prose, drawn uniformly.
+const JSON_COMMON_WORDS: [&str; 32] = [
+    "the",
+    "and",
+    "of",
+    "to",
+    "a",
+    "in",
+    "for",
+    "with",
+    "on",
+    "is",
+    "you",
+    "our",
+    "will",
+    "be",
+    "as",
+    "are",
+    "team",
+    "work",
+    "this",
+    "we",
+    "your",
+    "or",
+    "an",
+    "at",
+    "by",
+    "from",
+    "experience",
+    "skills",
+    "role",
+    "customer",
+    "support",
+    "required",
+];
+
+/// In 256ths, the share of a document's words that are common
+/// (`JSON_COMMON_WORDS`); the rest are made-up words
+/// (`JSON_MADE_UP_WORDS`). The share decides how far zstd compresses the
+/// prose: at 90, the documents table's value pages of 10,800-byte
+/// documents compress 4.4 times, about the 4.3 of measured documents.
+const JSON_COMMON_SHARE: u64 = 90;
+
+/// The consonants a made-up word's syllables start with.
+const JSON_CONSONANTS: &[u8; 16] = b"bcdfghjklmnprstv";
+
+/// The vowels a made-up word's syllables end with.
+const JSON_VOWELS: &[u8; 4] = b"aeio";
+
+/// The bits of a stream draw that pick a syllable's consonant.
+const JSON_CONSONANT_BITS: u32 = JSON_CONSONANTS.len().trailing_zeros();
+
+/// The bits of a stream draw one syllable takes, its consonant's and its
+/// vowel's.
+const JSON_SYLLABLE_BITS: u32 = JSON_CONSONANT_BITS + JSON_VOWELS.len().trailing_zeros();
+
+/// The made-up words of a document's prose, each the same syllables
+/// wherever it is drawn, so a page repeats them as prose repeats its
+/// vocabulary.
+const JSON_MADE_UP_WORDS: u64 = 4096;
+
+/// The most syllables of a made-up word; it has from one to this many.
+const JSON_MOST_SYLLABLES: u64 = 3;
+
+/// The `len`-byte JSON document stored for `key` in a table of documents:
+/// a 32-bit id, then `JSON_SHORT_FIELDS` of `JSON_SHORT_WORDS` words each,
+/// then one passage of prose twice, as a document of a listing holds its
+/// description once marked up and once plain: `JSON_HTML_FIELD` with the
+/// passage in paragraph tags, then `JSON_PROSE_FIELD` with it bare, cut
+/// where the document reaches `len` bytes and closed with a brace. A word
+/// is common at `JSON_COMMON_SHARE` or one of `JSON_MADE_UP_WORDS` made of
+/// random syllables. Drawn from the key's xorshift stream, so it is
+/// deterministic and distinct for neighboring keys.
+pub fn json_value_for_len(key: &Key, len: usize) -> Vec<u8> {
+    let mut stream = Stream::from_key(key);
+    let id = stream.next() & u64::from(u32::MAX);
+    let mut text = format!("{{\"id\":{id}");
+    for field in JSON_SHORT_FIELDS {
+        write!(text, ",\"{field}\":\"").expect("writing to a String does not fail");
+        for word in 0..JSON_SHORT_WORDS {
+            if word > 0 {
+                text.push(' ');
+            }
+            stream.json_word(&mut text);
+        }
+        text.push('"');
+    }
+    let mut passage = String::new();
+    while text.len() + 2 * passage.len() < len {
+        stream.json_word(&mut passage);
+        passage.push(' ');
+    }
+    write!(
+        text,
+        ",\"{JSON_HTML_FIELD}\":\"<div><p>{passage}</p></div>\",\"{JSON_PROSE_FIELD}\":\"{passage}\""
+    )
+    .expect("writing to a String does not fail");
+    while text.len() < len {
+        text.push(' ');
+    }
+    let mut bytes = text.into_bytes();
+    bytes.truncate(len.saturating_sub(1));
+    if len > 0 {
+        bytes.push(b'}');
+    }
+    bytes
+}
+
 /// A key's xorshift64 stream: seeded from the key (a long's bits, or FNV-1a
 /// over the key's bytes) spread by `SEED_MULTIPLIER`.
 pub(crate) struct Stream {
@@ -528,6 +656,36 @@ impl Stream {
         self.state ^= self.state >> XORSHIFT_RIGHT;
         self.state ^= self.state << XORSHIFT_SECOND_LEFT;
         self.state
+    }
+
+    /// Appends a word of a JSON document's prose to `text`: common at
+    /// `JSON_COMMON_SHARE`, else one of `JSON_MADE_UP_WORDS` drawn
+    /// uniformly, each one to `JSON_MOST_SYLLABLES` syllables of a
+    /// consonant and a vowel fixed by the word's own hash.
+    fn json_word(&mut self, text: &mut String) {
+        let draw = self.next();
+        let byte_mask = u64::from(u8::MAX);
+        if draw & byte_mask < JSON_COMMON_SHARE {
+            let words = u64::try_from(JSON_COMMON_WORDS.len()).expect("a few dozen words");
+            let at = (draw >> u8::BITS) % words;
+            text.push_str(
+                JSON_COMMON_WORDS[usize::try_from(at).expect("an index below the word count")],
+            );
+            return;
+        }
+        let word = (draw >> u8::BITS) % JSON_MADE_UP_WORDS;
+        let mut bits = splitmix64(word);
+        let syllables = 1 + bits % JSON_MOST_SYLLABLES;
+        bits >>= u8::BITS;
+        let pick = |letters: &[u8], bits: u64| {
+            let count = u64::try_from(letters.len()).expect("a handful of letters");
+            char::from(letters[usize::try_from(bits % count).expect("an index below the count")])
+        };
+        for _ in 0..syllables {
+            text.push(pick(JSON_CONSONANTS, bits));
+            text.push(pick(JSON_VOWELS, bits >> JSON_CONSONANT_BITS));
+            bits >>= JSON_SYLLABLE_BITS;
+        }
     }
 
     /// A word of `TEXT_WORDS`: the lesser of two uniform draws, so the word
@@ -845,6 +1003,28 @@ mod tests {
             value_for(&key)
         );
         assert!(text_value_for_len(&key, 0).is_empty());
+    }
+
+    #[test]
+    fn test_json_value_has_the_length_and_is_deterministic_and_distinct_for_neighbors() {
+        let len = 10_800;
+        for id in SAMPLE_IDS {
+            let key = scattered_key_at(id, 0);
+            let value = json_value_for_len(&key, len);
+            assert_eq!(value.len(), len);
+            assert_eq!(value, json_value_for_len(&key, len));
+            assert_ne!(value, json_value_for_len(&scattered_key_at(id + 1, 0), len));
+            assert!(value.starts_with(b"{\"id\":"), "{value:?}");
+            assert_eq!(value.last(), Some(&b'}'));
+            let text = String::from_utf8(value).unwrap();
+            assert!(text.contains("\"description\":\""), "{text}");
+        }
+        let key = scattered_key_at(SAMPLE_IDS[5], 0);
+        assert_eq!(
+            value_of_kind(&key, len, ValueKind::Json),
+            json_value_for_len(&key, len)
+        );
+        assert!(json_value_for_len(&key, 0).is_empty());
     }
 
     #[test]

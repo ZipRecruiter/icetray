@@ -25,6 +25,7 @@ jiff.workspace = true
 object_store = { workspace = true }
 parquet = { workspace = true }
 pin-project-lite = { workspace = true }
+rand.workspace = true
 roaring = { workspace = true }
 s3s = { workspace = true }
 s3s-fs = { workspace = true }
@@ -49,7 +50,6 @@ icetray = { path = "../icetray" }
 icetray-proto.workspace = true
 libc.workspace = true
 memory-stats.workspace = true
-rand.workspace = true
 tikv-jemalloc-ctl.workspace = true
 tikv-jemallocator.workspace = true
 tonic.workspace = true

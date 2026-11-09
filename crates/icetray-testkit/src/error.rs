@@ -1,10 +1,10 @@
 //! The one error type of the testkit: every library failure a fixture or
-//! an assertion can meet, one variant per source, plus the four faults
+//! an assertion can meet, one variant per source, plus the five faults
 //! this crate raises itself: a fixture specification the writer refuses, a
 //! helper called in a state it cannot measure, a truth-file line that
-//! cannot be read, and a snapshot the merge-on-read oracle cannot answer
-//! for. A test matches the variant; the message is for a person
-//! reading the failure.
+//! cannot be read, a snapshot the merge-on-read oracle cannot answer
+//! for, and a workload that cannot be read or placed. A test matches the
+//! variant; the message is for a person reading the failure.
 
 use std::env::VarError;
 
@@ -14,6 +14,7 @@ use icetray_core::{Key, KeyType, OrderValue};
 use crate::golden::{REWRITE_VAR, WAREHOUSE_VAR};
 use crate::ordered::OrderKind;
 use crate::truth::TruthFault;
+use crate::workload::WorkloadFault;
 
 /// The environment variable that names the REST catalog the container-gated
 /// test writes through (`dev/test-int.sh` exports it).
@@ -62,6 +63,9 @@ pub enum TestkitError {
     /// The merge-on-read oracle found a snapshot it cannot answer for.
     #[error("merge oracle: {0}")]
     Oracle(#[from] OracleFault),
+    /// A workload that cannot be read or placed.
+    #[error("workload: {0}")]
+    Workload(#[from] WorkloadFault),
 }
 
 impl From<s3s_fs::Error> for TestkitError {
