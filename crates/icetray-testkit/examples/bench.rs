@@ -21,13 +21,20 @@
 //! the fixture writer (once, then reused from `--data-dir`), reports how
 //! far zstd compressed each table's key and value columns, serves them
 //! through `Table` over `Storage`'s `file://` store in every residency
-//! tier, and reports latency percentiles, throughput, allocations per
-//! operation, the bytes an operation read from the store and the local
-//! directory, the value bytes it read and returned, and for a Scan the
-//! rounds of GETs it waited on (`RoundsStore`); plus the wall time, CPU
-//! time, allocations, reads, and peak resident set of a load, of a load
-//! over the chunk files a Disk load left (a restart), and of a refresh,
-//! with an ordered table's rounds of GETs and the bytes its uniqueness
+//! tier, and reports latency percentiles, throughput in operations and in
+//! lookups, allocations per operation, the bytes an operation read from
+//! the store and the local directory, the value bytes it read and
+//! returned, and for a Scan the rounds of GETs it waited on
+//! (`RoundsStore`); for every lookup run the cache budget and its split,
+//! the bytes and entries the row cache and the page cache held at the
+//! window's end, each cache's hits, misses or fetches, and hit rate over
+//! the window, the process's resident set and jemalloc's allocated and
+//! resident bytes before and after the pass that filled or primed the
+//! caches and at the window's end, the resident set's peak during the
+//! window, and the bytes per row entry, charged and allocated (`Memory`);
+//! plus the wall time, CPU time, allocations, reads, and peak resident set
+//! of a load, of a load over the chunk files a Disk load left (a restart),
+//! and of a refresh, with an ordered table's rounds of GETs and the bytes its uniqueness
 //! merge held and had in flight, the resident index's bytes by part, and
 //! the chunk files' bytes. Key-value tables read through the row cache
 //! (RFD 026) under `--row-cache on` and through the page cache alone under
@@ -84,6 +91,7 @@ use clap::{Parser, ValueEnum};
 use futures::future::OptionFuture;
 use iceberg::spec::MAIN_BRANCH;
 use icetray_core::ColumnRead;
+use icetray_core::budget::Budget;
 use icetray_core::config::{
     Config, LocalConfig, Residency, RewriteRule, ServerConfig, SourceConfig, StorageConfig,
     TableConfig, ValueColumnConfig, ValueFormat, least_max_multi_scan_values, reads_rows,
@@ -1864,6 +1872,14 @@ struct Served {
     beside: Option<Arc<Table>>,
     storage: Arc<Storage>,
     cache: PageCache,
+    /// The row cache `stack` built beside `cache`, which holds nothing
+    /// when no table served reads through it.
+    row_cache: RowCache,
+    /// The cache budget and its split between `row_cache` and `cache`.
+    budget: Budget,
+    /// The process's resident set around the pass that filled or primed
+    /// the caches before a run measured them (`Filled`).
+    filled: Filled,
     /// The local directory under the Disk tier, whose chunk files the
     /// sizing reports.
     local: Option<Arc<LocalDir>>,
@@ -1884,10 +1900,77 @@ struct Served {
 /// part is below the one a server's shards would hold it to.
 const BUDGET_SHARDS: usize = 1;
 
-/// What a process's tables are served over: the handles, and the local
-/// directory under the Disk tier, which must live as long as they do.
+/// What the process held at one moment: its resident set, as
+/// `resident_bytes` reads it, and the bytes jemalloc has allocated to the
+/// program and holds resident, read after advancing its epoch so they are
+/// current. jemalloc's allocated bytes leave out what it keeps of memory
+/// freed earlier, which the resident set counts.
+#[derive(Clone, Copy, Debug, Default)]
+struct Snapshot {
+    rss: u64,
+    allocated: u64,
+    resident: u64,
+}
+
+impl Snapshot {
+    fn now() -> Self {
+        // intentional: jemalloc's statistics read as zero where they cannot
+        // be read, as `resident_bytes` reads an unknown resident set.
+        let advanced = tikv_jemalloc_ctl::epoch::advance().is_ok();
+        let stat = |read: fn() -> tikv_jemalloc_ctl::Result<usize>| {
+            read().ok().filter(|_| advanced).map_or(0, approx::count)
+        };
+        Self {
+            rss: resident_bytes(),
+            allocated: stat(tikv_jemalloc_ctl::stats::allocated::read),
+            resident: stat(tikv_jemalloc_ctl::stats::resident::read),
+        }
+    }
+}
+
+/// What the process held before and after the pass that filled or primed
+/// a served table's caches (`Snapshot`). A table measured without such a
+/// pass has both read once its load ends (`serve_loaded`).
+#[derive(Clone, Copy, Debug, Default)]
+struct Filled {
+    before: Snapshot,
+    after: Snapshot,
+}
+
+impl Filled {
+    /// Before any reading: zero, which every path that measures a served
+    /// table replaces once its load ends (`serve_loaded`, and the reference
+    /// tables' own).
+    fn unfilled() -> Self {
+        Self::default()
+    }
+
+    /// What the process holds now, before a fill and after it alike.
+    fn now() -> Self {
+        let now = Snapshot::now();
+        Self {
+            before: now,
+            after: now,
+        }
+    }
+
+    /// `self`, its `after` read now.
+    fn ended(self) -> Self {
+        Self {
+            after: Snapshot::now(),
+            ..self
+        }
+    }
+}
+
+/// What a process's tables are served over: the handles, the row cache
+/// among them and the budget split between it and the page cache, and the
+/// local directory under the Disk tier, which must live as long as they
+/// do.
 struct Stack {
     handles: TableHandles,
+    row_cache: RowCache,
+    budget: Budget,
     local: Option<Arc<LocalDir>>,
     dir: Option<TempDir>,
 }
@@ -1915,16 +1998,19 @@ async fn stack(
     server.batch_fan_out = serving.batch_fan_out;
     server.max_multi_scan_values = serving.max_multi_scan_values;
     let budget = budget::resolve(&server, None, rows_read, BUDGET_SHARDS)?;
+    let row_cache = RowCache::new(budget.row_bytes);
     let handles = TableHandles::new(
         &server,
         Arc::clone(storage),
         PageCache::new(budget.page_bytes, None).await?,
-        Some(RowCache::new(budget.row_bytes)),
+        Some(row_cache.clone()),
         local.clone(),
         FindingLog::Events,
     );
     Ok(Stack {
         handles,
+        row_cache,
+        budget,
         local,
         dir,
     })
@@ -1958,6 +2044,8 @@ async fn serve(
     let rows_read = reads_rows(beside.iter().map(|(_, entry)| entry).chain([&config]));
     let Stack {
         handles,
+        row_cache,
+        budget,
         local,
         dir,
     } = stack(&storage, tier, cache_bytes, rows_read, reuse).await?;
@@ -1977,6 +2065,9 @@ async fn serve(
         beside,
         storage,
         cache,
+        row_cache,
+        budget,
+        filled: Filled::unfilled(),
         local,
         rounds,
         gets: None,
@@ -2577,12 +2668,12 @@ impl Op {
         &cases[i % cases.len()]
     }
 
-    /// Lookups per operation: one, or a batch's keys.
-    fn keys_per_op(&self) -> usize {
+    /// The keys operation `i` looks up: one, a batch's, or its request's.
+    fn keys_of(&self, i: usize) -> usize {
         match self {
             Self::Get { .. } | Self::Scan { .. } => 1,
             Self::MultiGet { batch, .. } | Self::MultiScan { batch, .. } => *batch,
-            Self::Reference { requests, .. } => requests[0].keys.len(),
+            Self::Reference { requests, .. } => requests[i % requests.len()].keys.len(),
         }
     }
 
@@ -2765,8 +2856,26 @@ enum Pace {
 }
 
 /// What a run's task loops did: the operations, their samples when
-/// recorded, and the value bytes they read and returned.
-type Done = (usize, Vec<Duration>, ValueBytes);
+/// recorded, and the keys they looked up and the value bytes they read and
+/// returned.
+type Done = (usize, Vec<Duration>, Looked);
+
+/// The keys a run's operations looked up and the value bytes they read
+/// and returned.
+#[derive(Clone, Copy, Debug, Default)]
+struct Looked {
+    keys: u64,
+    bytes: ValueBytes,
+}
+
+impl Looked {
+    fn plus(self, other: Self) -> Self {
+        Self {
+            keys: self.keys + other.keys,
+            bytes: self.bytes.plus(other.bytes),
+        }
+    }
+}
 
 /// One task's share of a run whose operations start at `first`:
 /// operations `first + task`, `first + task + tasks`, ... until `until`,
@@ -2780,22 +2889,25 @@ async fn task_loop(
     mut samples: Option<Vec<Duration>>,
 ) -> BenchResult<Done> {
     let mut done = 0;
-    let mut bytes = ValueBytes::default();
+    let mut looked = Looked::default();
     while Instant::now() < until {
         let i = first + done * tasks + task;
         op.before();
         let started = Instant::now();
-        let op_bytes = op.run(&table, i).await?;
+        let bytes = op.run(&table, i).await?;
         if let Some(samples) = samples.as_mut() {
             samples.push(started.elapsed());
         }
-        bytes = bytes.plus(op_bytes);
+        looked = looked.plus(Looked {
+            keys: approx::count(op.keys_of(i)),
+            bytes,
+        });
         done += 1;
         if let Pace::Yielding = pace {
             tokio::task::yield_now().await;
         }
     }
-    Ok((done, samples.unwrap_or_default(), bytes))
+    Ok((done, samples.unwrap_or_default(), looked))
 }
 
 /// The task loops of a run, as they are spawned.
@@ -2827,7 +2939,7 @@ fn spawn_loops(
 
 /// `tasks` task loops from operation `first` for `length`, each
 /// reserving `reserve` samples when recording; the operations done, the
-/// samples, and the value bytes, merged.
+/// samples, and the keys and value bytes, merged.
 async fn spawn_run(
     served: &Served,
     op: &Op,
@@ -2847,22 +2959,24 @@ async fn spawn_run(
 }
 
 /// Waits for every loop of `handles`; the operations they did, their
-/// samples, and their value bytes, merged.
+/// samples, and their keys and value bytes, merged.
 async fn join_loops(handles: Loops) -> BenchResult<Done> {
     let mut done = 0;
     let mut samples = Vec::new();
-    let mut bytes = ValueBytes::default();
+    let mut looked = Looked::default();
     for handle in handles {
-        let (ops, mut task_samples, task_bytes) = handle.await??;
+        let (ops, mut task_samples, task_looked) = handle.await??;
         done += ops;
         samples.append(&mut task_samples);
-        bytes = bytes.plus(task_bytes);
+        looked = looked.plus(task_looked);
     }
-    Ok((done, samples, bytes))
+    Ok((done, samples, looked))
 }
 
 /// Counters of a served table and the process, read before and after a
-/// measured window; page fetches and hits are the page cache's.
+/// measured window; page fetches and hits are the page cache's, and the
+/// row hits, misses, and stale entries the row cache's, counted by parts
+/// of a lookup as the core counts them (`RowCache::hits`).
 #[derive(Clone, Copy, Debug, Default)]
 struct Counters {
     allocations: Allocations,
@@ -2875,6 +2989,10 @@ struct Counters {
     hedges: u64,
     fetches: u64,
     hits: u64,
+    row_hits: u64,
+    /// Parts read through the index, the stale entries' among them.
+    row_misses: u64,
+    row_stale: u64,
 }
 
 impl Counters {
@@ -2889,6 +3007,9 @@ impl Counters {
             hedges: stats.hedges(),
             fetches: served.cache.fetches(),
             hits: served.cache.hits(),
+            row_hits: served.row_cache.hits(),
+            row_misses: served.row_cache.misses(),
+            row_stale: served.row_cache.stale(),
         }
     }
 
@@ -2902,7 +3023,108 @@ impl Counters {
             hedges: self.hedges - earlier.hedges,
             fetches: self.fetches - earlier.fetches,
             hits: self.hits - earlier.hits,
+            row_hits: self.row_hits - earlier.row_hits,
+            row_misses: self.row_misses - earlier.row_misses,
+            row_stale: self.row_stale - earlier.row_stale,
         }
+    }
+
+    /// The row cache's hits over its hits and misses; `None` when it
+    /// counted neither.
+    fn row_hit_rate(self) -> Option<f64> {
+        hit_rate(self.row_hits, self.row_misses)
+    }
+
+    /// The page cache's hits over its hits and fetches; `None` when it
+    /// counted neither. A lookup that joined another's fetch counts under
+    /// neither (`PageCache::hits`).
+    fn page_hit_rate(self) -> Option<f64> {
+        hit_rate(self.hits, self.fetches)
+    }
+}
+
+/// `hits` over `hits` and `others`; `None` when both are zero.
+fn hit_rate(hits: u64, others: u64) -> Option<f64> {
+    let total = hits + others;
+    (total > 0).then(|| approx::ratio(hits, total))
+}
+
+/// What a run's caches and process held: the cache budget and its split,
+/// the bytes each cache was charged and the entries it held when the
+/// window ended, what the process held around the fill (`Filled`) and
+/// when the window ended, and its resident set's peak during the window,
+/// as an `RssSampler` saw it. The process's figures are the whole
+/// process's: every table the run serves at once, the bench's own key
+/// pools, and, in the resident set, what the allocator kept of memory
+/// freed earlier in the run.
+#[derive(Clone, Copy, Debug, Default)]
+struct Memory {
+    row_budget: u64,
+    page_budget: u64,
+    row_usage: u64,
+    row_entries: u64,
+    page_usage: u64,
+    pages: u64,
+    filled: Filled,
+    end: Snapshot,
+    rss_peak: u64,
+    /// Whether the run's key-value tables read through the row cache, the
+    /// only runs whose allocated bytes per row entry mean anything.
+    rows_read: bool,
+}
+
+impl Memory {
+    /// `served`'s caches as they are now, after a window whose resident
+    /// set peaked at `rss_peak`.
+    fn of(served: &Served, rss_peak: u64) -> Self {
+        Self {
+            row_budget: served.budget.row_bytes,
+            page_budget: served.budget.page_bytes,
+            row_usage: served.row_cache.usage(),
+            row_entries: served.row_cache.entries(),
+            page_usage: served.cache.usage(),
+            pages: served.cache.pages(),
+            filled: served.filled,
+            end: Snapshot::now(),
+            rss_peak,
+            rows_read: served.budget.row_bytes > 0,
+        }
+    }
+
+    /// The bytes the fill made jemalloc allocate, over the row entries
+    /// held at the window's end: an entry's whole cost, its share of the
+    /// page cache's growth beside it included; `None` without row entries.
+    fn allocated_per_row_entry(self) -> Option<f64> {
+        let grown = self
+            .filled
+            .after
+            .allocated
+            .saturating_sub(self.filled.before.allocated);
+        (self.rows_read && self.row_entries > 0).then(|| approx::ratio(grown, self.row_entries))
+    }
+
+    fn to_json(self) -> Json {
+        json!({
+            "cache_budget_bytes": self.row_budget + self.page_budget,
+            "row_cache_budget_bytes": self.row_budget,
+            "page_cache_budget_bytes": self.page_budget,
+            "row_cache_usage_bytes": self.row_usage,
+            "row_cache_entries": self.row_entries,
+            "page_cache_usage_bytes": self.page_usage,
+            "page_cache_pages": self.pages,
+            "row_cache_bytes_per_entry": (self.row_entries > 0)
+                .then(|| approx::ratio(self.row_usage, self.row_entries)),
+            "allocated_per_row_entry": self.allocated_per_row_entry(),
+            "rss_before_fill_bytes": self.filled.before.rss,
+            "rss_after_fill_bytes": self.filled.after.rss,
+            "rss_window_peak_bytes": self.rss_peak,
+            "jemalloc_allocated_before_fill_bytes": self.filled.before.allocated,
+            "jemalloc_allocated_after_fill_bytes": self.filled.after.allocated,
+            "jemalloc_allocated_window_end_bytes": self.end.allocated,
+            "jemalloc_resident_before_fill_bytes": self.filled.before.resident,
+            "jemalloc_resident_after_fill_bytes": self.filled.after.resident,
+            "jemalloc_resident_window_end_bytes": self.end.resident,
+        })
     }
 }
 
@@ -3018,15 +3240,18 @@ impl RunLabel {
 /// What separates a measured table's name from the one served beside it.
 const BESIDE_SEPARATOR: &str = "+";
 
-/// What one measured window of a run's operations did.
+/// What one measured window of a run's operations did, and what its
+/// caches and process held.
 struct Window {
     ops: usize,
     elapsed: Duration,
     /// Every operation's latency.
     latencies: Latencies,
     counters: Counters,
-    /// The value bytes the operations read and returned.
-    bytes: ValueBytes,
+    /// The keys the operations looked up and the value bytes they read
+    /// and returned.
+    looked: Looked,
+    memory: Memory,
 }
 
 /// One second, the unit of the throughput figure.
@@ -3035,6 +3260,10 @@ const SECOND: Duration = Duration::from_secs(1);
 impl Window {
     fn ops_per_second(&self) -> f64 {
         approx::gauge(approx::count(self.ops)) * SECOND.div_duration_f64(self.elapsed)
+    }
+
+    fn lookups_per_second(&self) -> f64 {
+        approx::gauge(self.looked.keys) * SECOND.div_duration_f64(self.elapsed)
     }
 
     fn per_op(&self, total: u64) -> f64 {
@@ -3048,6 +3277,9 @@ impl Window {
             "ops": self.ops,
             "elapsed_us": micros(self.elapsed),
             "ops_per_second": self.ops_per_second(),
+            "lookups": self.looked.keys,
+            "lookups_per_second": self.lookups_per_second(),
+            "keys_per_op": self.per_op(self.looked.keys),
             "allocations_per_op": self.per_op(counters.allocations.calls),
             "allocated_bytes_per_op": self.per_op(counters.allocations.bytes),
             "page_fetches_per_op": self.per_op(counters.fetches),
@@ -3057,18 +3289,26 @@ impl Window {
             "local_reads_per_op": self.per_op(counters.local_reads),
             "local_bytes_per_op": self.per_op(counters.local_bytes),
             "hedges": counters.hedges,
-            "value_bytes_read_per_op": self.per_op(self.bytes.read),
-            "value_bytes_returned_per_op": self.per_op(self.bytes.returned),
+            "value_bytes_read_per_op": self.per_op(self.looked.bytes.read),
+            "value_bytes_returned_per_op": self.per_op(self.looked.bytes.returned),
+            "row_cache_hits": counters.row_hits,
+            "row_cache_misses": counters.row_misses,
+            "row_cache_stale": counters.row_stale,
+            "row_cache_hit_rate": counters.row_hit_rate(),
+            "page_cache_hits": counters.hits,
+            "page_cache_fetches": counters.fetches,
+            "page_cache_hit_rate": counters.page_hit_rate(),
         });
-        merged(fields, [percentiles_json(&self.latencies)])
+        merged(
+            fields,
+            [self.memory.to_json(), percentiles_json(&self.latencies)],
+        )
     }
 }
 
 /// A measured run.
 struct Measured {
     label: RunLabel,
-    /// Lookups per operation: one, or a `MultiGet`'s batch.
-    keys_per_op: usize,
     window: Window,
     /// The rounds of GETs an operation waits on, counted apart from the
     /// window (`count_rounds`); `None` where they are not counted.
@@ -3076,16 +3316,14 @@ struct Measured {
 }
 
 impl Measured {
-    /// `run` of an op of `keys_per_op` keys, labeled `label` with its mode
-    /// and tasks.
-    fn of(label: RunLabel, keys_per_op: usize, run: ModeRun) -> Self {
+    /// `run`, labeled `label` with its mode and tasks.
+    fn of(label: RunLabel, run: ModeRun) -> Self {
         Self {
             label: RunLabel {
                 mode: run.mode,
                 tasks: run.tasks,
                 ..label
             },
-            keys_per_op,
             window: run.window,
             rounds: run.rounds,
         }
@@ -3102,7 +3340,6 @@ impl Measured {
                 "tasks": self.label.tasks,
                 "batch_fan_out": self.label.batch_fan_out,
                 "beside": self.label.beside.map(TableShape::table_name),
-                "keys_per_op": self.keys_per_op,
                 "row_cache": serving().row_cache,
             }),
             [self.window.to_json(), rounds_json(self.rounds)],
@@ -3155,8 +3392,9 @@ async fn measure_window(
         log.restart();
     }
     let before = Counters::read(served);
+    let rss = RssSampler::start();
     let started = Instant::now();
-    let (ops, samples, bytes) = spawn_run(
+    let (ops, samples, looked) = spawn_run(
         served,
         op,
         (first + warm_ops, tasks),
@@ -3166,12 +3404,14 @@ async fn measure_window(
     .await?;
     let elapsed = started.elapsed();
     let counters = Counters::read(served).since(before);
+    let rss_peak = rss.stop().peak;
     let window = Window {
         ops,
         elapsed,
         latencies: Latencies::of(samples),
         counters,
-        bytes,
+        looked,
+        memory: Memory::of(served, rss_peak),
     };
     Ok((window, first + warm_ops + ops))
 }
@@ -3277,11 +3517,12 @@ impl Budgets {
         let serve_if = |wanted: bool, cache_bytes| {
             OptionFuture::from(wanted.then(|| serve_loaded(prepared, beside, tier, cache_bytes)))
         };
-        let warm = serve_if(uses(Cache::Warm) || uses(Cache::Unread), WARM_CACHE_BYTES)
+        let mut warm = serve_if(uses(Cache::Warm) || uses(Cache::Unread), WARM_CACHE_BYTES)
             .await
             .transpose()?;
-        if let Some(served) = &warm {
+        if let Some(served) = &mut warm {
             prime_cache(&served.table, prepared.shape).await?;
+            served.filled = served.filled.ended();
         }
         let cold = serve_if(uses(Cache::Cold), COLD_CACHE_BYTES)
             .await
@@ -3302,6 +3543,13 @@ impl Budgets {
         .as_ref()
         .expect("a table is served for every selected scenario")
     }
+
+    /// The table served under the skewed budget, for its fill.
+    fn skewed_mut(&mut self) -> &mut Served {
+        self.skewed
+            .as_mut()
+            .expect("a table is served for every selected scenario")
+    }
 }
 
 /// Every selected lookup scenario of one table in one tier, each in every
@@ -3319,7 +3567,7 @@ async fn lookups(
 ) -> BenchResult<Vec<Measured>> {
     let shape = prepared.shape;
     let (hits, misses) = key_pools(shape);
-    let budgets = Budgets::serve(prepared, beside, tier, scenarios).await?;
+    let mut budgets = Budgets::serve(prepared, beside, tier, scenarios).await?;
     let whole = scenarios
         .iter()
         .any(|s| s.traits().projects)
@@ -3344,7 +3592,8 @@ async fn lookups(
             Scenario::WarmHit | Scenario::ColdHit => get(&hits, true, WHOLE_VALUE),
             Scenario::SkewedHit => {
                 let (fill, measured) = skewed_pools(shape);
-                let served = budgets.of(Cache::Skewed);
+                let served = budgets.skewed_mut();
+                served.filled = Filled::now();
                 fill_from(
                     served,
                     &get(&fill, true, WHOLE_VALUE),
@@ -3352,6 +3601,7 @@ async fn lookups(
                     KEY_POOL,
                 )
                 .await?;
+                served.filled = served.filled.ended();
                 get(&measured, true, WHOLE_VALUE)
             }
             Scenario::Miss => get(&misses, false, WHOLE_VALUE),
@@ -3404,7 +3654,7 @@ async fn lookups(
             beside: beside.map(|other| other.shape),
         };
         for run in measure_modes(served, &op, rounds, settings).await? {
-            let measured = Measured::of(label, op.keys_per_op(), run);
+            let measured = Measured::of(label, run);
             eprintln!("{}", row(&measured));
             results.push(measured);
         }
@@ -3464,8 +3714,9 @@ async fn serve_loaded(
     tier: Tier,
     cache_bytes: u64,
 ) -> BenchResult<Served> {
-    let served = serve(prepared, beside, tier, cache_bytes, pinned(prepared), None).await?;
+    let mut served = serve(prepared, beside, tier, cache_bytes, pinned(prepared), None).await?;
     served.table.load().await?;
+    served.filled = Filled::now();
     Ok(served)
 }
 
@@ -3669,8 +3920,9 @@ async fn kv_beside_ordered(
 /// worker, and the batch and its runs would wait for the window to end.
 /// One row per table. Neither row carries counters: both tables'
 /// operations run in one window over one storage and one cache, so no
-/// count belongs to either row alone; each carries the value bytes its own
-/// loops read and returned.
+/// count belongs to either row alone; each carries the keys and value
+/// bytes its own loops looked up, read, and returned, and both carry what
+/// the one budget and process they share held (`Memory`).
 async fn two_tables(
     prepared: &[Prepared],
     tier: Tier,
@@ -3678,7 +3930,7 @@ async fn two_tables(
 ) -> BenchResult<Vec<Measured>> {
     let long = random_table(prepared, TableName::Long)?;
     let string = random_table(prepared, TableName::String)?;
-    let served = serve(
+    let mut served = serve(
         long,
         Some(string),
         tier,
@@ -3688,7 +3940,9 @@ async fn two_tables(
     )
     .await?;
     served.table.load().await?;
+    served.filled = Filled::now();
     prime_cache(&served.table, long.shape).await?;
+    served.filled = served.filled.ended();
     let long_table = &served.table;
     let string_table = served
         .beside
@@ -3709,6 +3963,7 @@ async fn two_tables(
 
     let windows = approx::length(settings.windows);
     let reserve = |ops: usize, tasks: usize| Some((ops / tasks + 1) * windows * SAMPLE_HEADROOM);
+    let rss = RssSampler::start();
     let started = Instant::now();
     let until = started + settings.duration;
     let hit_loops = spawn_loops(
@@ -3725,9 +3980,10 @@ async fn two_tables(
         until,
         reserve(warm_batches, one),
     );
-    let (hit_ops, hit_samples, hit_bytes) = join_loops(hit_loops).await?;
-    let (batch_ops, batch_samples, batch_bytes) = join_loops(batch_loops).await?;
+    let (hit_ops, hit_samples, hit_looked) = join_loops(hit_loops).await?;
+    let (batch_ops, batch_samples, batch_looked) = join_loops(batch_loops).await?;
     let elapsed = started.elapsed();
+    let memory = Memory::of(&served, rss.stop().peak);
 
     let batch_fan_out = serving().batch_fan_out;
     let label = |table, mode, tasks| RunLabel {
@@ -3742,25 +3998,25 @@ async fn two_tables(
     let rows = vec![
         Measured {
             label: label(string.shape, Mode::Single, one),
-            keys_per_op: LARGE_BATCH_KEYS,
             window: Window {
                 ops: batch_ops,
                 elapsed,
                 latencies: Latencies::of(batch_samples),
                 counters: Counters::default(),
-                bytes: batch_bytes,
+                looked: batch_looked,
+                memory,
             },
             rounds: None,
         },
         Measured {
             label: label(long.shape, Mode::Multi, tasks),
-            keys_per_op: 1,
             window: Window {
                 ops: hit_ops,
                 elapsed,
                 latencies: Latencies::of(hit_samples),
                 counters: Counters::default(),
-                bytes: hit_bytes,
+                looked: hit_looked,
+                memory,
             },
             rounds: None,
         },
@@ -4236,6 +4492,9 @@ fn mib(bytes: u64) -> f64 {
     approx::gauge(bytes) / MEBIBYTE
 }
 
+/// A rate's percent, for the printed hit rates.
+const PERCENT: f64 = 100.0;
+
 /// The column headings of the lookup table.
 fn header() -> String {
     format!(
@@ -4252,8 +4511,9 @@ fn header() -> String {
 /// The headings of a window's figures (`window_cells`).
 fn window_header() -> String {
     format!(
-        "{:>11} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8} {:>10} {:>10} {:>11} {:>6}",
+        "{:>11} {:>11} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10} {:>8} {:>8} {:>10} {:>10} {:>11} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8} {:>9}",
         "ops/s",
+        "keys/s",
         "p50",
         "p90",
         "p99",
@@ -4265,7 +4525,13 @@ fn window_header() -> String {
         "read B/op",
         "ret B/op",
         "store B/op",
-        "rounds"
+        "rounds",
+        "row %",
+        "page %",
+        "row MiB",
+        "page MiB",
+        "rss MiB",
+        "alloc MiB"
     )
 }
 
@@ -4281,12 +4547,20 @@ fn row(run: &Measured) -> String {
     )
 }
 
-/// A window's figures and its rounds, under `window_header`.
+/// A window's figures and its rounds, under `window_header`: the row and
+/// page caches' hit rates in percent, the bytes each held at the window's
+/// end, the resident set's peak during it, and the bytes jemalloc had
+/// allocated once the fill ended.
 fn window_cells(window: &Window, rounds: Option<Rounds>) -> String {
     let counters = window.counters;
+    let percent = |rate: Option<f64>| {
+        rate.map_or_else(|| "-".to_string(), |rate| format!("{:.1}", rate * PERCENT))
+    };
+    let memory = window.memory;
     format!(
-        "{:>11.0} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?} {:>9.1} {:>10.0} {:>8.3} {:>8.3} {:>10.0} {:>10.0} {:>11.0} {:>6}",
+        "{:>11.0} {:>11.0} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?} {:>9.1} {:>10.0} {:>8.3} {:>8.3} {:>10.0} {:>10.0} {:>11.0} {:>6} {:>6} {:>6} {:>8.1} {:>8.1} {:>8.0} {:>9.0}",
         window.ops_per_second(),
+        window.lookups_per_second(),
         window.latencies.percentile(P50),
         window.latencies.percentile(P90),
         window.latencies.percentile(P99),
@@ -4295,13 +4569,19 @@ fn window_cells(window: &Window, rounds: Option<Rounds>) -> String {
         window.per_op(counters.allocations.bytes),
         window.per_op(counters.fetches),
         window.per_op(counters.gets + counters.local_reads),
-        window.per_op(window.bytes.read),
-        window.per_op(window.bytes.returned),
+        window.per_op(window.looked.bytes.read),
+        window.per_op(window.looked.bytes.returned),
         window.per_op(counters.get_bytes + counters.local_bytes),
         rounds.map_or_else(
             || "-".to_string(),
             |rounds| format!("{:.2}", rounds.per_op())
         ),
+        percent(counters.row_hit_rate()),
+        percent(counters.page_hit_rate()),
+        mib(memory.row_usage),
+        mib(memory.page_usage),
+        mib(memory.rss_peak),
+        mib(memory.filled.after.allocated),
     )
 }
 
@@ -4686,6 +4966,8 @@ async fn serve_reference(
     let config = reference_config(warehouse, table, tier);
     let Stack {
         handles,
+        row_cache,
+        budget,
         local,
         dir,
     } = stack(&storage, tier, cache_bytes, config.row_cache(), reuse).await?;
@@ -4696,6 +4978,9 @@ async fn serve_reference(
         beside: None,
         storage,
         cache,
+        row_cache,
+        budget,
+        filled: Filled::unfilled(),
         local,
         rounds: counted,
         gets: logged,
@@ -5046,8 +5331,10 @@ async fn reference_lookups_in(
         (wanted(true), COLD_CACHE_BYTES, &mut cold),
     ] {
         if wanted {
-            let table_served = serve_reference(warehouse, table, tier, cache_bytes, None).await?;
+            let mut table_served =
+                serve_reference(warehouse, table, tier, cache_bytes, None).await?;
             table_served.table.load().await?;
+            table_served.filled = Filled::now();
             *served = Some(table_served);
         }
     }
@@ -5062,7 +5349,7 @@ async fn reference_lookups_in(
         .scan_rows()
         .ok_or("an ordered table has a max_scan_rows")?;
     let lookups = reference_lookups(&selection.scenarios, &selection.rows_tiers, max);
-    if let Some(warm) = &warm {
+    if let Some(warm) = &mut warm {
         let primed: BTreeSet<u64> = lookups
             .iter()
             .filter(|lookup| !lookup.scenario.cold())
@@ -5071,6 +5358,7 @@ async fn reference_lookups_in(
         for &id in &primed {
             page_through(&warm.table, &golden::ordered_key(table, id), &VALUE_READS).await?;
         }
+        warm.filled = warm.filled.ended();
     }
     let mut results = Vec::new();
     for lookup in lookups {
