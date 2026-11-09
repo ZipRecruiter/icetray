@@ -561,6 +561,36 @@ impl RowCache {
         self.0.built.load().cache.weight()
     }
 
+    /// Entries held now, of every table.
+    #[must_use]
+    pub fn entries(&self) -> u64 {
+        approx::count(self.0.built.load().cache.len())
+    }
+
+    /// Parts of lookups icetray served from the cache since it was built,
+    /// summed over the threads' shards. `publish` moves no count out of
+    /// these, so a caller reads them the same with or without a scrape
+    /// between.
+    #[must_use]
+    pub fn hits(&self) -> u64 {
+        self.0.hits.counted()
+    }
+
+    /// Parts of lookups icetray read through the index since the cache was
+    /// built, a stale entry's among them (`stale`), counted as `hits` is.
+    #[must_use]
+    pub fn misses(&self) -> u64 {
+        self.0.misses.counted()
+    }
+
+    /// Entries icetray found for a lookup and could not serve since the
+    /// cache was built, because their file or row had left the lookup's
+    /// generation, counted as `hits` is.
+    #[must_use]
+    pub fn stale(&self) -> u64 {
+        self.0.stale.counted()
+    }
+
     /// Moves the hits, misses, and stale entries counted since the last call
     /// into `row_cache_hits_total`, `row_cache_misses_total`, and
     /// `row_cache_stale_total`, and sets
@@ -1206,5 +1236,76 @@ mod tests {
             published.gauge(metric::ROW_CACHE_BYTES, &[]).to_bits(),
             approx::gauge(weigh(LONG_KEY_BYTES, None)).to_bits()
         );
+    }
+
+    #[test]
+    fn test_hits_misses_and_stale_count_every_lookup_through_publish() {
+        let cache = RowCache::new(ROOMY_BYTES);
+        let rows = cache.for_table(TABLE);
+        assert_eq!(
+            (cache.hits(), cache.misses(), cache.stale()),
+            (0, 0, 0),
+            "a new cache has counted nothing"
+        );
+        assert_eq!(cache.get(&key(1, 0)), Cached::Absent);
+        cache.insert(key(1, 0), Some(b"value"));
+        let hits = 3;
+        for _ in 0..hits {
+            assert_eq!(
+                cache.get(&key(1, 0)),
+                Cached::Value(Bytes::from_static(b"value"))
+            );
+        }
+        rows.count(0, 2, 2);
+        cache.publish();
+        assert_eq!(cache.hits(), hits, "a publish leaves the hits counted");
+        assert_eq!(cache.misses(), 3, "one absent, two stale");
+        assert_eq!(cache.stale(), 2);
+        cache.publish();
+        rows.count(1, 0, 0);
+        assert_eq!(
+            (cache.hits(), cache.misses(), cache.stale()),
+            (hits + 1, 3, 2),
+            "counts keep rising across publishes"
+        );
+    }
+
+    #[test]
+    fn test_hits_are_summed_over_the_threads_that_counted_them() {
+        let cache = RowCache::new(ROOMY_BYTES);
+        let threads = 4;
+        let per_thread = 1_000;
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let rows = cache.for_table(TABLE);
+                scope.spawn(move || {
+                    for _ in 0..per_thread {
+                        rows.count(1, 1, 0);
+                    }
+                });
+            }
+        });
+        assert_eq!(cache.hits(), threads * per_thread);
+        assert_eq!(cache.misses(), threads * per_thread);
+        assert_eq!(cache.stale(), 0);
+    }
+
+    #[test]
+    fn test_entries_follow_inserts_removals_and_evictions() {
+        let cache = RowCache::new(ROOMY_BYTES);
+        assert_eq!(cache.entries(), 0);
+        let inserted = 10;
+        for n in 0..inserted {
+            cache.insert(key(n, 0), Some(b"value"));
+        }
+        cache.insert(key(0, 0), Some(b"other"));
+        assert_eq!(cache.entries(), inserted, "a replaced entry is one entry");
+        cache
+            .for_table(TABLE)
+            .remove(&long(0), Part::Column(0), source(0));
+        assert_eq!(cache.entries(), inserted - 1);
+        cache.resize(0);
+        assert_eq!(cache.entries(), 0, "a budget of zero holds no entry");
+        assert_eq!(cache.usage(), 0);
     }
 }

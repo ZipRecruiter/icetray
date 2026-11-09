@@ -892,10 +892,20 @@ impl PageCache {
 
     /// Bytes charged against the memory budget: each page in memory at its
     /// length plus the per-entry overhead. The disk level is not counted.
-    pub(crate) fn usage(&self) -> u64 {
+    #[must_use]
+    pub fn usage(&self) -> u64 {
         approx::count(match self.level.as_ref() {
             Level::Memory(cache) => cache.usage(),
             Level::Hybrid { cache, .. } => cache.memory().usage(),
+        })
+    }
+
+    /// Pages held in memory now. The disk level is not counted.
+    #[must_use]
+    pub fn pages(&self) -> u64 {
+        approx::count(match self.level.as_ref() {
+            Level::Memory(cache) => cache.entries(),
+            Level::Hybrid { cache, .. } => cache.memory().entries(),
         })
     }
 
@@ -2641,7 +2651,7 @@ mod tests {
     #[tokio::test]
     async fn test_usage_grows_by_page_bytes_plus_overhead() {
         let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
-        assert_eq!(cache.usage(), 0);
+        assert_eq!((cache.usage(), cache.pages()), (0, 0));
         let runs = Arc::new(AtomicU64::new(0));
         cache
             .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
@@ -2660,6 +2670,7 @@ mod tests {
             cache.usage(),
             count(PAGE.len() + OTHER_PAGE.len() + 2 * ENTRY_OVERHEAD_BYTES)
         );
+        assert_eq!(cache.pages(), 2);
     }
 
     #[tokio::test]
@@ -2675,8 +2686,9 @@ mod tests {
                 .unwrap();
         }
         assert_eq!((cache.fetches(), cache.hits()), (1, 1));
+        assert_eq!(cache.pages(), 1);
         cache.clear();
-        assert_eq!(cache.usage(), 0);
+        assert_eq!((cache.usage(), cache.pages()), (0, 0));
         let (page, origin) = cache
             .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
                 answering(PAGE, &runs)
