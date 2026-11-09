@@ -441,6 +441,18 @@ A fitted draw spreads each key's reads evenly through the run, so a trace
 that reads keys again within a fraction of a second hits its caches more
 often than its fitted workload does at small budgets.
 
+A cache the kernel has compressed or swapped out still answers, at the
+swap's latency, so a row measured under memory pressure reports the swap
+as icetray's. Before a sweep serves a table, the program refuses a budget
+the machine's available memory cannot hold: the process grows by up to
+1.6 times its scaled budget, since jemalloc rounds each cached page up to
+a size class and holds memory freed by evictions for a while, and by
+about 1 GiB beside it. Each row records how much of the process the
+kernel held compressed or swapped out before its fill, after it, and at
+the window's end. Once that grows by more than 64 MiB within a run, the
+program stops measuring, writes the rows it has with the reason under
+`stopped`, and exits with an error.
+
 ## The page cache
 
 icetray caches value pages compressed, keyed by file and offset. Iceberg

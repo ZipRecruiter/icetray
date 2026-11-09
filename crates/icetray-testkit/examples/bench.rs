@@ -162,6 +162,7 @@ use icetray_testkit::fixture::{NAMESPACE, SECOND_VALUE_COLUMN, memory_catalog_lo
 use icetray_testkit::golden::{
     self, GoldenTable, REFERENCE_TIER_SAMPLES, REFERENCE_VALUE_BYTES, RowsTier,
 };
+use icetray_testkit::headroom;
 use icetray_testkit::keys::{
     FIRST_VERSION, SCATTERED_ID_SPACE, SCATTERED_KEY_FIXED_BYTES, STRING_KEY_FIXED_BYTES,
     VALUE_BYTES,
@@ -2321,15 +2322,18 @@ struct Served {
 const BUDGET_SHARDS: usize = 1;
 
 /// What the process held at one moment: its resident set, as
-/// `resident_bytes` reads it, and the bytes jemalloc has allocated to the
+/// `resident_bytes` reads it, the bytes jemalloc has allocated to the
 /// program and holds resident, read after advancing its epoch so they are
-/// current. jemalloc's allocated bytes leave out what it keeps of memory
-/// freed earlier, which the resident set counts.
+/// current, and the bytes of it the kernel holds compressed or swapped out
+/// (`headroom::compressed_or_swapped_bytes`), `None` where the platform
+/// does not say. jemalloc's allocated bytes leave out what it keeps of
+/// memory freed earlier, which the resident set counts.
 #[derive(Clone, Copy, Debug, Default)]
 struct Snapshot {
     rss: u64,
     allocated: u64,
     resident: u64,
+    compressed_or_swapped: Option<u64>,
 }
 
 impl Snapshot {
@@ -2344,6 +2348,7 @@ impl Snapshot {
             rss: resident_bytes(),
             allocated: stat(tikv_jemalloc_ctl::stats::allocated::read),
             resident: stat(tikv_jemalloc_ctl::stats::resident::read),
+            compressed_or_swapped: headroom::compressed_or_swapped_bytes(),
         }
     }
 }
@@ -3662,6 +3667,9 @@ impl Memory {
             "jemalloc_resident_before_fill_bytes": self.filled.before.resident,
             "jemalloc_resident_after_fill_bytes": self.filled.after.resident,
             "jemalloc_resident_window_end_bytes": self.end.resident,
+            "compressed_or_swapped_before_fill_bytes": self.filled.before.compressed_or_swapped,
+            "compressed_or_swapped_after_fill_bytes": self.filled.after.compressed_or_swapped,
+            "compressed_or_swapped_window_end_bytes": self.end.compressed_or_swapped,
         })
     }
 }
@@ -4163,6 +4171,9 @@ async fn lookups(
     };
     let mut results = Vec::new();
     for &scenario in scenarios {
+        if stopped() {
+            break;
+        }
         let label = RunLabel {
             scenario,
             table: shape,
@@ -4225,7 +4236,7 @@ async fn lookups(
         let rounds = count_rounds(served, &op).await?;
         for run in measure_modes(served, &op, rounds, settings).await? {
             let measured = Measured::of(label, run);
-            eprintln!("{}", row(&measured));
+            print_row(&measured);
             results.push(measured);
         }
     }
@@ -4245,6 +4256,9 @@ async fn skewed_hits(
 ) -> BenchResult<Vec<Measured>> {
     let mut results = Vec::new();
     for &exponent in &settings.zipf_exponents {
+        if stopped() {
+            break;
+        }
         let mut served = serve_loaded(prepared, beside, label.tier, SKEWED_CACHE_BYTES).await?;
         let op = skewed(&mut served, prepared.shape, exponent, settings).await?;
         for run in measure_modes(&served, &op, None, settings).await? {
@@ -4255,7 +4269,7 @@ async fn skewed_hits(
                 }),
                 ..Measured::of(label, run)
             };
-            eprintln!("{}", row(&measured));
+            print_row(&measured);
             results.push(measured);
         }
     }
@@ -4624,7 +4638,7 @@ async fn two_tables(
         },
     ];
     for run in &rows {
-        eprintln!("{}", row(run));
+        print_row(run);
     }
     Ok(rows)
 }
@@ -4780,6 +4794,12 @@ impl ReadTrace {
         })
     }
 
+    /// What the sample scales a full-size budget by.
+    fn scale(&self) -> Scale {
+        let (part, whole) = self.sample.fraction();
+        Scale { part, whole }
+    }
+
     /// The trace as a workload on `shape`: its distinct kept keys scattered
     /// over the sample's share of the table's rows
     /// (`workload::scatter_share`), so they fill its pages as densely as
@@ -4799,10 +4819,7 @@ impl ReadTrace {
                 format!("r={} ", self.sample)
             },
             op: placed(shape, Arc::clone(&self.requests), ids),
-            scale: {
-                let (part, whole) = self.sample.fraction();
-                Scale { part, whole }
-            },
+            scale: self.scale(),
             ts: self.ts.clone(),
             fields: self.fields.clone(),
         })
@@ -4831,6 +4848,9 @@ async fn sweep(
     for &budget in budgets {
         let actual = workload.scale.of(budget.0);
         for &mode in &settings.modes {
+            if stopped() {
+                return Ok(results);
+            }
             let tasks = match mode {
                 Mode::Single => 1,
                 Mode::Multi => settings.tasks,
@@ -4839,6 +4859,15 @@ async fn sweep(
             served.filled = Filled::now();
             fill_from(&served, &workload.op, settings.tasks, fill).await?;
             served.filled = served.filled.ended();
+            let fill_of = format!(
+                "the fill of {} {}{budget} {}",
+                scenario.name(),
+                workload.name,
+                mode.name()
+            );
+            if stop_if_out_of_ram(&fill_of, served.filled.before, served.filled.after) {
+                return Ok(results);
+            }
             let reserve = (requests - fill) / tasks + 1;
             let window = measured_run(
                 &served,
@@ -4879,7 +4908,7 @@ async fn sweep(
                 window,
                 rounds: None,
             };
-            eprintln!("{}", row(&measured));
+            print_row(&measured);
             if ended {
                 eprintln!("  the window ended at the workload's last request");
             }
@@ -4900,6 +4929,9 @@ async fn replays(
 ) -> BenchResult<Vec<Measured>> {
     let mut measured = Vec::new();
     for table in replay_tables(tables) {
+        if stopped() {
+            break;
+        }
         let workload = trace.on(table.shape)?;
         for &tier in tiers {
             let scenario = (Scenario::Replay, &workload);
@@ -4983,6 +5015,67 @@ impl<'a> WorkloadPlan<'a> {
             Err(format!("nothing was measured: {}", problems.join("; ")).into())
         }
     }
+
+    /// What each of the plan's workloads scales a full-size budget by.
+    fn scales(&self) -> Vec<Scale> {
+        self.trace
+            .iter()
+            .map(ReadTrace::scale)
+            .chain(
+                self.fitted
+                    .iter()
+                    .map(|&(name, _, keys)| fitted_scale(name, keys)),
+            )
+            .collect()
+    }
+}
+
+/// The largest of `budgets` the plan's workloads serve, scaled
+/// (`Scale::of`), against the memory the machine has available
+/// (`headroom::needed_bytes`), checked before anything is measured: an
+/// error when it will not fit, and otherwise the check and the run's
+/// `headroom::OUT_OF_RAM_LIMIT_BYTES` as the report records them. A
+/// platform that does not say what memory is available is not checked.
+fn check_memory(budgets: &[Size], plan: &WorkloadPlan<'_>) -> BenchResult<Json> {
+    let largest = plan
+        .scales()
+        .into_iter()
+        .flat_map(|scale| {
+            budgets
+                .iter()
+                .map(move |&budget| (budget, scale.of(budget.0)))
+        })
+        .max_by_key(|&(_, scaled)| scaled);
+    let needed = largest.map(|(_, scaled)| headroom::needed_bytes(scaled));
+    let available = headroom::available_bytes();
+    match (largest, needed, available) {
+        (Some((budget, scaled)), Some(needed), Some(available)) if needed > available => {
+            return Err(format!(
+                "nothing was measured: --budget {budget}, {:.0} MiB as this run scales it, \
+                 needs about {:.0} MiB of memory available ({} percent of it and {:.0} MiB \
+                 beside), and the machine has {:.0} MiB: lower --budget or free memory",
+                mib(scaled),
+                mib(needed),
+                headroom::RESIDENT_PERCENT_OF_BUDGET,
+                mib(headroom::RESIDENT_BESIDE_BUDGET_BYTES),
+                mib(available)
+            )
+            .into());
+        }
+        (Some(_), _, None) => eprintln!(
+            "warning: this platform does not say what memory is available, so --budget is not \
+             checked against it"
+        ),
+        _ => {}
+    }
+    Ok(json!({
+        "largest_budget_bytes": largest.map(|(_, scaled)| scaled),
+        "needed_bytes": needed,
+        "available_bytes": available,
+        "resident_percent_of_budget": headroom::RESIDENT_PERCENT_OF_BUDGET,
+        "resident_beside_budget_bytes": headroom::RESIDENT_BESIDE_BUDGET_BYTES,
+        "out_of_ram_limit_bytes": headroom::OUT_OF_RAM_LIMIT_BYTES,
+    }))
 }
 
 /// The workload scenarios `plan` checked: `replay` on `tables` and
@@ -5056,13 +5149,19 @@ fn fitted_workload(
     Ok(Workload {
         name: label,
         op: placed(shape, Arc::new(requests), ids),
-        scale: Scale {
-            part: keys,
-            whole: fitted.hour_keys,
-        },
+        scale: fitted_scale(name, keys),
         ts: None,
         fields,
     })
+}
+
+/// What a fitted workload `name` drawn over `keys` keys scales a
+/// full-size budget by: its keys over the measured hour's distinct keys.
+fn fitted_scale(name: FittedName, keys: u64) -> Scale {
+    Scale {
+        part: keys,
+        whole: name.fitted().hour_keys,
+    }
 }
 
 /// The fitted scenario: each workload `plan` checked, the `zipf` workload
@@ -5083,6 +5182,9 @@ async fn fitteds(
             }
         };
         for exponent in exponents {
+            if stopped() {
+                break;
+            }
             let workload = fitted_workload(name, table.shape, keys, exponent)?;
             for &tier in tiers {
                 let scenario = (Scenario::Fitted, &workload);
@@ -5600,6 +5702,53 @@ fn window_header() -> String {
         "rss MiB",
         "alloc MiB"
     )
+}
+
+/// Why the program stopped measuring, once the kernel came to hold more of
+/// the process compressed or swapped out than
+/// `headroom::OUT_OF_RAM_LIMIT_BYTES` within one run
+/// (`stop_if_out_of_ram`). A cache the kernel has pushed out of RAM still
+/// answers, at the swap's latency, which its row would report as
+/// icetray's; so every run after it is skipped, and the program writes the
+/// rows it measured and exits with this as its error.
+static STOPPED: OnceLock<String> = OnceLock::new();
+
+/// Whether a run has stopped the program measuring (`STOPPED`).
+fn stopped() -> bool {
+    STOPPED.get().is_some()
+}
+
+/// Stops the program measuring (`STOPPED`) when the kernel held more of
+/// the process compressed or swapped out at `to` than at `from`, past
+/// `headroom::OUT_OF_RAM_LIMIT_BYTES`, `from` and `to` bounding `what`;
+/// whether the program has stopped, by this run or an earlier one.
+fn stop_if_out_of_ram(what: &str, from: Snapshot, to: Snapshot) -> bool {
+    if let Some(grown) = headroom::pushed_out(from.compressed_or_swapped, to.compressed_or_swapped)
+    {
+        let reason = STOPPED.get_or_init(|| {
+            format!(
+                "the kernel compressed or swapped out {:.0} MiB of the process during {what}",
+                mib(grown)
+            )
+        });
+        eprintln!("stopping: {reason}");
+    }
+    stopped()
+}
+
+/// Prints `run`'s row, and stops the program measuring when the kernel
+/// pushed the process out of RAM between the start of the row's fill and
+/// the end of its window (`stop_if_out_of_ram`).
+fn print_row(run: &Measured) {
+    eprintln!("{}", row(run));
+    let what = format!(
+        "the fill and window of {} {} {}",
+        run.label.scenario.name(),
+        run.case.as_ref().map_or("-", |case| case.label.as_str()),
+        run.label.mode.name()
+    );
+    let memory = run.window.memory;
+    stop_if_out_of_ram(&what, memory.filled.before, memory.end);
 }
 
 fn row(run: &Measured) -> String {
@@ -6802,6 +6951,45 @@ fn check_scenario_names() -> BenchResult<()> {
     Ok(())
 }
 
+/// The lookup, load, and refresh scenarios of `scenarios` on each of
+/// `tables` in each of `tiers`, until a run stops the program measuring
+/// (`STOPPED`).
+async fn table_runs(
+    cli: &Cli,
+    scenarios: &[Scenario],
+    (tables, tiers): (&[&Prepared], &[Tier]),
+    settings: &RunSettings,
+) -> BenchResult<(Vec<Measured>, Vec<Loaded>)> {
+    let lookup_scenarios: Vec<Scenario> = scenarios
+        .iter()
+        .copied()
+        .filter(|s| s.traits().runs == Runs::Lookup)
+        .collect();
+    let mut measured = Vec::new();
+    let mut loaded = Vec::new();
+    for table in tables {
+        let table_lookups = lookups_for(table.shape, &lookup_scenarios);
+        for &tier in tiers {
+            if stopped() {
+                break;
+            }
+            if !table_lookups.is_empty() {
+                measured.extend(lookups(table, None, tier, &table_lookups, settings).await?);
+            }
+            if scenarios.contains(&Scenario::Load) && !stopped() {
+                let serve_table =
+                    |reuse| serve(table, None, tier, WARM_CACHE_BYTES, pinned(table), reuse);
+                let subject = Subject::Bench(table.shape);
+                loaded.extend(loads(subject, tier, cli.load_rounds, serve_table).await?);
+            }
+            if scenarios.contains(&Scenario::Refresh) && !stopped() {
+                loaded.extend(refreshes(table, tier, cli.load_rounds).await?);
+            }
+        }
+    }
+    Ok((measured, loaded))
+}
+
 #[tokio::main]
 async fn main() -> BenchResult<()> {
     check_scenario_names()?;
@@ -6848,47 +7036,25 @@ async fn main() -> BenchResult<()> {
     }
     eprintln!("read {:.0} MiB to prime the OS page cache", mib(primed));
     let tasks = settings.tasks;
-    let lookup_scenarios: Vec<Scenario> = scenarios
-        .iter()
-        .copied()
-        .filter(|s| s.traits().runs == Runs::Lookup)
-        .collect();
     let tiers = or_all(&cli.tier, &Tier::ALL);
     let tables: Vec<&Prepared> = prepared
         .iter()
         .filter(|table| measured_shapes.contains(&table.shape))
         .collect();
     let plan = WorkloadPlan::checked(&cli, &scenarios, (&prepared, &tables))?;
+    let memory = check_memory(&cli.budget, &plan)?;
     let machine = machine(tasks, !cli.no_metrics);
     eprintln!("{machine}");
     eprintln!("{}", header());
-    let mut measured = Vec::new();
-    let mut loaded = Vec::new();
-    for table in &tables {
-        let table_lookups = lookups_for(table.shape, &lookup_scenarios);
-        for &tier in &tiers {
-            if !table_lookups.is_empty() {
-                measured.extend(lookups(table, None, tier, &table_lookups, &settings).await?);
-            }
-            if scenarios.contains(&Scenario::Load) {
-                let serve_table =
-                    |reuse| serve(table, None, tier, WARM_CACHE_BYTES, pinned(table), reuse);
-                let subject = Subject::Bench(table.shape);
-                loaded.extend(loads(subject, tier, cli.load_rounds, serve_table).await?);
-            }
-            if scenarios.contains(&Scenario::Refresh) {
-                loaded.extend(refreshes(table, tier, cli.load_rounds).await?);
-            }
-        }
-    }
+    let (mut measured, loaded) = table_runs(&cli, &scenarios, (&tables, &tiers), &settings).await?;
     let workloads = (&tables[..], &tiers[..]);
     measured.extend(workload_runs(&cli, &plan, workloads, &settings).await?);
-    if scenarios.contains(&Scenario::TwoTable) {
+    if scenarios.contains(&Scenario::TwoTable) && !stopped() {
         for &tier in &tiers {
             measured.extend(two_tables(&prepared, tier, &settings).await?);
         }
     }
-    if scenarios.contains(&Scenario::KvBesideOrdered) {
+    if scenarios.contains(&Scenario::KvBesideOrdered) && !stopped() {
         for &tier in &tiers {
             measured.extend(kv_beside_ordered(&prepared, tier, &settings).await?);
         }
@@ -6896,11 +7062,22 @@ async fn main() -> BenchResult<()> {
     print_results(&machine, &measured, &loaded);
     let report = json!({
         "machine": machine,
-        "settings": report_settings(&cli, &prepared, &compression),
+        "settings": merged(
+            report_settings(&cli, &prepared, &compression),
+            [json!({ "memory_headroom": memory })],
+        ),
+        "stopped": STOPPED.get(),
         "lookups": measured.iter().map(Measured::to_json).collect::<Vec<_>>(),
         "loads": loaded.iter().map(Loaded::to_json).collect::<Vec<_>>(),
     });
     let path = write_report(&cli.out_dir, &report)?;
     println!("results: {}", path.display());
-    Ok(())
+    match STOPPED.get() {
+        Some(reason) => Err(format!(
+            "stopped measuring: {reason}; the rows measured until then are in {}",
+            path.display()
+        )
+        .into()),
+        None => Ok(()),
+    }
 }

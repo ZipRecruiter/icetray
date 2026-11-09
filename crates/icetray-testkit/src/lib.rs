@@ -5,8 +5,8 @@
 //! transport, a store that counts GETs per object, one that counts the
 //! rounds a read's GETs take, and one that logs each GET's range and
 //! latency, shared assertions, the golden-table locator (RFD 014), the
-//! truth file a check replays against a running server, and the lookup
-//! workloads the benchmark replays.
+//! truth file a check replays against a running server, the lookup
+//! workloads the benchmark replays, and the memory headroom it checks.
 
 pub mod aws_catalog;
 pub mod counting;
@@ -15,6 +15,7 @@ pub mod error;
 pub mod fixture;
 pub mod get_log;
 pub mod golden;
+pub mod headroom;
 pub mod keys;
 pub mod latency;
 pub mod layout;
