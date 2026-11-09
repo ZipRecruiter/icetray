@@ -397,6 +397,50 @@ among a thousand cold ones. The median lookup is a row-cache hit, which
 finds no key and reads no page. A table's own gain depends on its skew, its
 row size, and its budget, and its hit rate is the one to watch.
 
+### Realistic workloads
+
+The `skewed-hit` scenario draws each key on its own, which reproduces a
+cache's mean hit rate about right and its per-request tail wrong: in the
+production workloads measured on 2026-10-28 a batch's keys are hot or
+cold together, the skew is flatter, with Zipf exponents of about 0.52 to
+0.57, and a third to three quarters of an hour's keys are read once. The
+benchmark program runs such workloads under a sweep of cache budgets, and
+reports for every row the budget's split, what each cache held and
+served, the process's resident set and jemalloc's allocated bytes, and
+the latency per request. Its `replay` scenario replays a trace of a
+service's requests, a Parquet file of one row per request with a list of
+key ids. With `--trace-sample` the program keeps a share of the trace's
+keys, with every lookup of each, places them on the same share of the
+table's rows, and scales the budgets by it, so a trace larger than a
+laptop's table keeps both caches' hit rates against memory. Its `fitted`
+scenario draws the same shapes without a trace: job embeddings read in
+batches by a ranking service, per-user profile embeddings read by one Get
+per request, and job display documents read in small batches, each key
+read exactly as often as the busiest hour's curve says. The embedding
+workloads run on the `scattered` table of 4 KiB values, which
+`--scattered-files` enlarges at its rows per file, and the documents on
+a `documents` table of 10,800-byte JSON documents. `--zipf-exponent`
+sweeps `skewed-hit`, and the `zipf` workload, which deals the embedding
+batches' sizes over pure Zipf, separates skew from correlation; at its
+default of 0.9 `skewed-hit` draws the same ranks as before.
+
+```sh
+cargo run --release -p icetray-testkit --example bench -- \
+  --scenario replay --trace requests.parquet --trace-sample 0.25 \
+  --table scattered --scattered-files 128 --tier full \
+  --budget 512MiB,2GiB,8GiB --row-cache on
+cargo run --release -p icetray-testkit --example bench -- \
+  --scenario fitted --workload embedding-batches,zipf --zipf-exponent 0.5,0.9 \
+  --scattered-files 128 --tier full --budget 512MiB,2GiB,8GiB --row-cache on
+```
+
+Run each both with `--row-cache on` and `off`. To check a fitted workload
+against its trace, give `--workload-keys` the distinct keys a replay kept,
+which its results record as `trace_distinct_keys`, and the same budgets.
+A fitted draw spreads each key's reads evenly through the run, so a trace
+that reads keys again within a fraction of a second hits its caches more
+often than its fitted workload does at small budgets.
+
 ## The page cache
 
 icetray caches value pages compressed, keyed by file and offset. Iceberg

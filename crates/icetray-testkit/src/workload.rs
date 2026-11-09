@@ -17,6 +17,9 @@
 //! share of a table's rows (`scatter_share`), the kept keys fill its pages
 //! as densely as the whole trace's keys fill the whole table's, so a page
 //! cache scaled by the rate holds the same share of the asked keys too.
+//!
+//! `fitted` draws synthetic workloads fitted to measured ones, for a run
+//! without a trace.
 
 use std::fmt;
 use std::fs::File;
@@ -32,6 +35,8 @@ use rand::seq::SliceRandom as _;
 use crate::error::Result;
 use crate::keys::splitmix64;
 use icetray_core::approx;
+
+pub mod fitted;
 
 /// The column of a trace holding each request's arrival time.
 pub const TS_COLUMN: &str = "ts";
@@ -63,7 +68,7 @@ impl fmt::Display for TraceColumn {
 }
 
 /// What makes a workload unreadable or unplaceable; closed.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum WorkloadFault {
     /// The trace has no `KEYS_COLUMN`.
     #[error("the trace has no {KEYS_COLUMN} column")]
@@ -106,6 +111,25 @@ pub enum WorkloadFault {
         keys: u64,
         /// The table's rows.
         rows: u64,
+    },
+    /// A synthetic workload over no keys, or over more than a `u32`
+    /// numbers.
+    #[error("a workload cannot be drawn over {keys} keys")]
+    WorkloadKeys {
+        /// The keys asked for.
+        keys: u64,
+    },
+    /// A Zipf exponent that is not a finite number at or above zero.
+    #[error("a Zipf exponent of {exponent} is not a finite number at or above zero")]
+    ZipfExponent {
+        /// The exponent asked for.
+        exponent: f64,
+    },
+    /// A copula correlation outside [0, 1].
+    #[error("a copula correlation of {rho} is not in [0, 1]")]
+    Rho {
+        /// The correlation asked for.
+        rho: f64,
     },
     /// More distinct keys than a `u32` place numbers.
     #[error("{keys} distinct keys are more than a u32 numbers")]
@@ -213,7 +237,7 @@ impl Requests<u64> {
 
 /// A share of a trace's keys, from above zero to one, held as the
 /// decimal it was written as, `parts` over a power of ten, so a sample and
-/// the budget scaled by it are exact integer arithmetic.
+/// a budget scaled by its fraction are exact integer arithmetic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SampleRate {
     parts: u64,
@@ -239,13 +263,6 @@ impl SampleRate {
     /// The rate as a fraction: its parts over its scale, a power of ten.
     pub fn fraction(self) -> (u64, u64) {
         (self.parts, self.scale)
-    }
-
-    /// `n` scaled by the rate, rounded down: a full-size cache budget as
-    /// the sampled run holds it.
-    pub fn of(self, n: u64) -> u64 {
-        let scaled = u128::from(n) * u128::from(self.parts) / u128::from(self.scale);
-        u64::try_from(scaled).expect("a rate of at most one scales n to at most n")
     }
 
     /// Whether `hash` falls under the rate's share of the `u64` hash space.
@@ -771,12 +788,12 @@ mod tests {
 
     #[test]
     fn test_sample_rate_from_str_reads_decimals_in_zero_to_one() {
-        assert_eq!(rate("1").of(1_000), 1_000);
-        assert_eq!(rate("0.25").of(1_000), 250);
-        assert_eq!(rate(".05").of(1_000), 50);
-        assert_eq!(rate("1.000").of(1_000), 1_000);
-        assert_eq!(rate("0.333").of(1_000), 333);
-        assert_eq!(rate("1.").of(7), 7);
+        assert_eq!(rate("1").fraction(), (1, 1));
+        assert_eq!(rate("0.25").fraction(), (25, 100));
+        assert_eq!(rate(".05").fraction(), (5, 100));
+        assert_eq!(rate("1.000").fraction(), (1_000, 1_000));
+        assert_eq!(rate("0.333").fraction(), (333, 1_000));
+        assert_eq!(rate("1.").fraction(), (1, 1));
         for text in [
             "0",
             "0.0",

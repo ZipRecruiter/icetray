@@ -82,6 +82,25 @@
 //! request, and the bench copies a request's keys before it times it,
 //! so its allocations per operation count one copy of each key.
 //!
+//! `fitted` draws each `--workload` instead, so anyone can run it without
+//! the traces (`workload::fitted`): `embedding-batches` and `per-user-get`
+//! on the scattered table, `document-batches` on the documents table, each
+//! of `--workload-keys` keys (the table's rows by default) read exactly
+//! the count the busiest hour's curve gives it, those reads dealt without
+//! replacement into requests whose sizes come from the measured histogram,
+//! a batch's keys made hot or cold together by a Gaussian copula fitted to
+//! the measured spread. The requests hold the measured hour's lookups per
+//! key, each budget is scaled by the keys drawn over the hour's distinct
+//! keys, and the run fills and measures as `replay` does. To compare a
+//! fitted workload with its trace, replay the trace under `--trace-sample`
+//! and draw the workload with `--workload-keys` at the replay's
+//! `trace_distinct_keys`, over the same `--budget`: both rows then stand
+//! for the same full-size budgets over caches of the same share of their
+//! keys, and their hit rates compare. `zipf` deals the embedding batches'
+//! sizes from pure Zipf counts of each `--zipf-exponent`, every key on its
+//! own, so against `embedding-batches` it separates skew from the batches'
+//! correlation; `skewed-hit` sweeps the same exponents, each a row.
+//!
 //! Reference mode. Under `--reference WAREHOUSE` the program writes and
 //! reads none of its own tables and serves the golden reference tables
 //! instead (`golden::GoldenTable::reference`, which `dev/golden-tables.py
@@ -152,6 +171,7 @@ use icetray_testkit::layout::{KEY_COLUMN, Layout as FileLayout, VALUE_COLUMN};
 use icetray_testkit::protobuf::{
     CHECKSUM_FIELD, FILLER_FIELD, FLAGS_FIELD, GROUP_FIELD, ID_FIELD, NAME_FIELD, SCORES_FIELD,
 };
+use icetray_testkit::workload::fitted::{self, Fitted, RankCdf, SizeDist};
 use icetray_testkit::workload::{self, KeySample, Requests, SampleRate, Trace};
 use icetray_testkit::{
     FixtureSpec, GetLog, KeyShape, LoggedGet, MINUTE_MICROS, MemoryCatalog, ORDER_COLUMN,
@@ -300,13 +320,13 @@ enum Scenario {
     WarmHit,
     /// A hit whose value neither cache holds.
     ColdHit,
-    /// A hit whose key is drawn from a Zipf distribution of exponent
-    /// `ZIPF_EXPONENT` over the table's keys, ranked in a seeded random
-    /// order so the hot keys lie scattered through the key order, through
-    /// the `SKEWED_CACHE_BYTES` budget, which holds a share of the table's
-    /// values, filled by a pass of the scenario's own keys before it is
-    /// measured; through the row cache or the page cache alone as
-    /// `--row-cache` says.
+    /// A hit whose key is drawn from a Zipf distribution of each
+    /// `--zipf-exponent` (`ZIPF_EXPONENT` by default) over the table's
+    /// keys, ranked in a seeded random order so the hot keys lie scattered
+    /// through the key order, through the `SKEWED_CACHE_BYTES` budget,
+    /// which holds a share of the table's values, filled by a pass of the
+    /// scenario's own keys before it is measured; through the row cache or
+    /// the page cache alone as `--row-cache` says. Each exponent is a row.
     SkewedHit,
     /// A key inside the table's range that no file holds.
     Miss,
@@ -424,6 +444,11 @@ enum Scenario {
     /// each key-value table `--table` names, under each `--budget`. Runs
     /// only when named.
     Replay,
+    /// Each `--workload` drawn from a curve and request sizes fitted to a
+    /// measured workload (`workload::fitted`), over `--workload-keys` keys
+    /// of its table, under each `--budget`, filled and measured as `replay`
+    /// is. Runs only when named.
+    Fitted,
 }
 
 impl Scenario {
@@ -475,6 +500,7 @@ impl Scenario {
                 Traits::cold("scan-bounded-string-cold").on(TableName::OrderedString)
             }
             Self::Replay => Traits::of("replay", Cache::Swept).named(),
+            Self::Fitted => Traits::of("fitted", Cache::Swept).named(),
         }
     }
 
@@ -540,7 +566,8 @@ enum Cache {
     /// table's values.
     Cold,
     /// The `SKEWED_CACHE_BYTES` budget, which holds a share of the table's
-    /// values, filled by the scenario's own skewed keys.
+    /// values, served for each `--zipf-exponent` alone and filled by the
+    /// scenario's own skewed keys.
     Skewed,
     /// None it depends on: a miss, served warm, reads no value page, and a
     /// load or a refresh reads none through it.
@@ -661,7 +688,7 @@ enum TableName {
     /// A table shaped like a serving table: random-looking string keys,
     /// 4 KiB random values in 64 KiB value pages, and about 37,500 rows per
     /// file, in `--scattered-files` files. Runs only when named, and only
-    /// its load, refresh, cold-hit, miss, skewed-hit, and replay
+    /// its load, refresh, cold-hit, miss, skewed-hit, replay, and fitted
     /// scenarios: its value pages outrun the warm cache.
     Scattered,
     /// A table of documents: the scattered table's keys and pages, and
@@ -802,6 +829,62 @@ impl RowCacheFlag {
     }
 }
 
+/// A synthetic workload `fitted` draws (`workload::fitted`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum FittedName {
+    /// Job embeddings read in batches by a ranking service, a batch's keys
+    /// hot or cold together, on the scattered table.
+    EmbeddingBatches,
+    /// Per-user profile embeddings, one Get per request, on the scattered
+    /// table.
+    PerUserGet,
+    /// Job display documents read in small batches, on the documents
+    /// table.
+    DocumentBatches,
+    /// The embedding batches' sizes over pure Zipf of each
+    /// `--zipf-exponent`, every key drawn on its own, on the scattered
+    /// table: against `embedding-batches`, what skew does apart from the
+    /// batches' correlation.
+    Zipf,
+}
+
+impl FittedName {
+    const ALL: [Self; 4] = [
+        Self::EmbeddingBatches,
+        Self::PerUserGet,
+        Self::DocumentBatches,
+        Self::Zipf,
+    ];
+
+    /// The name in the results, as the command line spells it.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EmbeddingBatches => "embedding-batches",
+            Self::PerUserGet => "per-user-get",
+            Self::DocumentBatches => "document-batches",
+            Self::Zipf => "zipf",
+        }
+    }
+
+    /// The measured workload it draws, or for `Zipf` the one whose sizes
+    /// and lookups per key it keeps.
+    fn fitted(self) -> Fitted {
+        match self {
+            Self::EmbeddingBatches | Self::Zipf => fitted::EMBEDDING_BATCHES,
+            Self::PerUserGet => fitted::PER_USER_GET,
+            Self::DocumentBatches => fitted::DOCUMENT_BATCHES,
+        }
+    }
+
+    /// The table it runs on.
+    fn table(self) -> TableName {
+        match self {
+            Self::EmbeddingBatches | Self::PerUserGet | Self::Zipf => TableName::Scattered,
+            Self::DocumentBatches => TableName::Documents,
+        }
+    }
+}
+
 /// A byte count on the command line: bytes, or a count of KiB, MiB, or
 /// GiB, such as `512MiB`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -845,6 +928,23 @@ impl std::fmt::Display for Size {
             None => write!(f, "{}", self.0),
         }
     }
+}
+
+/// A Zipf exponent that is not a finite number at or above zero.
+#[derive(Debug, thiserror::Error)]
+#[error("{text:?} is not a Zipf exponent: a finite number at or above zero")]
+struct NotAnExponent {
+    text: String,
+}
+
+/// `text` as a Zipf exponent, for `--zipf-exponent`.
+fn exponent(text: &str) -> Result<f64, NotAnExponent> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|exponent| exponent.is_finite() && *exponent >= 0.0)
+        .ok_or_else(|| NotAnExponent {
+            text: text.to_string(),
+        })
 }
 
 /// The cache budgets a workload sweeps when `--budget` is absent: 512 MiB,
@@ -961,9 +1061,34 @@ struct Cli {
     /// whole trace under each `--budget`.
     #[arg(long, value_name = "RATE", default_value_t = SampleRate::ALL)]
     trace_sample: SampleRate,
-    /// The cache budgets `replay` sweeps, each a row: bytes, or a count of
-    /// KiB, MiB, or GiB, such as `512MiB`. Under `--trace-sample` each is
-    /// the budget the sampled run stands for.
+    /// The synthetic workloads `fitted` draws.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    workload: Vec<FittedName>,
+    /// The keys a `fitted` workload reads, the most read first, placed on
+    /// as many of its table's rows; the table's rows when absent. Set to
+    /// the distinct keys a `replay` of the workload's trace kept
+    /// (`trace_distinct_keys`) to compare the two.
+    #[arg(
+        long,
+        value_name = "KEYS",
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    workload_keys: Option<u64>,
+    /// The Zipf exponents `skewed-hit` and the `zipf` workload sweep, each
+    /// a row: finite numbers at or above zero.
+    #[arg(
+        long,
+        value_name = "X",
+        value_delimiter = ',',
+        default_values_t = [ZIPF_EXPONENT],
+        value_parser = exponent,
+    )]
+    zipf_exponent: Vec<f64>,
+    /// The cache budgets `replay` and `fitted` sweep, each a row: bytes, or
+    /// a count of KiB, MiB, or GiB, such as `512MiB`. Each is the budget a
+    /// full-size run stands for, scaled by `--trace-sample` for a replay
+    /// and by the keys drawn over the measured hour's for a fitted
+    /// workload.
     #[arg(
         long,
         value_name = "SIZE",
@@ -2482,10 +2607,11 @@ fn hit_ids(shape: TableShape) -> Vec<u64> {
         .collect()
 }
 
-/// The exponent of the skewed scenario's Zipf distribution: the key of
-/// rank `r`, from one, is drawn in proportion to `1 / r^ZIPF_EXPONENT`.
-/// At 0.9 over a table of `ROWS` keys, the hottest one percent of keys
-/// take about half the lookups.
+/// The exponent of the skewed scenario's Zipf distribution when
+/// `--zipf-exponent` is absent: the key of rank `r`, from one, is drawn in
+/// proportion to `1 / r^ZIPF_EXPONENT`. At 0.9 over a table of `ROWS`
+/// keys, the hottest one percent of keys take about half the lookups, and
+/// the figures `docs/performance.md` publishes were measured at it.
 const ZIPF_EXPONENT: f64 = 0.9;
 
 /// The seed of the skewed pools' ranking and draws, fixed so every run
@@ -2504,18 +2630,18 @@ const SKEWED_POOL: usize = 4 * KEY_POOL;
 /// `SKEWED_POOL` keys it measures, independent draws of one distribution,
 /// so the measured keys reach a cache already holding what that
 /// distribution reads most and not the very keys it is about to ask. Each
-/// draw is a Zipf rank by inverse CDF over the precomputed cumulative
-/// weights, the rank the id it holds in a seeded shuffle of the first
-/// build's ids, so the hot keys lie scattered through the key order and
-/// so through the value pages.
-fn skewed_pools(shape: TableShape) -> (Arc<Vec<Key>>, Arc<Vec<Key>>) {
+/// draw is a rank of Zipf of `exponent` by inverse CDF over the
+/// precomputed cumulative weights, the rank the id it holds in a seeded
+/// shuffle of the first build's ids, so the hot keys lie scattered through
+/// the key order and so through the value pages.
+fn skewed_pools(shape: TableShape, exponent: f64) -> (Arc<Vec<Key>>, Arc<Vec<Key>>) {
     let mut rng = StdRng::seed_from_u64(SKEW_SEED);
     let mut by_rank: Vec<u64> = (0..shape.rows).collect();
     by_rank.shuffle(&mut rng);
     let mut total = 0.0;
     let cumulative: Vec<f64> = (1..=shape.rows)
         .map(|rank| {
-            total += approx::ratio(1, rank).powf(ZIPF_EXPONENT);
+            total += approx::ratio(1, rank).powf(exponent);
             total
         })
         .collect();
@@ -2558,12 +2684,17 @@ async fn fill_from(served: &Served, op: &Op, tasks: usize, ops: usize) -> BenchR
     Ok(())
 }
 
-/// The skewed scenario's op over `shape`, its measured pool
+/// The skewed scenario's op over `shape` at `exponent`, its measured pool
 /// (`skewed_pools`), once `served` is filled by a pass of its fill pool
 /// with `settings.tasks` tasks (`fill_from`), its resident set read around
 /// the pass.
-async fn skewed(served: &mut Served, shape: TableShape, settings: &RunSettings) -> BenchResult<Op> {
-    let (fill, measured) = skewed_pools(shape);
+async fn skewed(
+    served: &mut Served,
+    shape: TableShape,
+    exponent: f64,
+    settings: &RunSettings,
+) -> BenchResult<Op> {
+    let (fill, measured) = skewed_pools(shape, exponent);
     served.filled = Filled::now();
     fill_from(
         served,
@@ -3933,6 +4064,8 @@ struct RunSettings {
     /// `duration` over `warmup`, rounded up: how many warm-ups long the
     /// measured window is, which sizes its sample reservation.
     windows: u64,
+    /// The exponents the skewed scenario and the Zipf workload sweep.
+    zipf_exponents: Vec<f64>,
 }
 
 impl RunSettings {
@@ -3952,9 +4085,6 @@ struct Budgets {
     warm: Option<Served>,
     /// Under `COLD_CACHE_BYTES`, for the cold scenarios.
     cold: Option<Served>,
-    /// Under `SKEWED_CACHE_BYTES`, unfilled: the skewed scenario fills it
-    /// with its own keys.
-    skewed: Option<Served>,
 }
 
 impl Budgets {
@@ -3980,36 +4110,27 @@ impl Budgets {
         let cold = serve_if(uses(Cache::Cold), COLD_CACHE_BYTES)
             .await
             .transpose()?;
-        let skewed = serve_if(uses(Cache::Skewed), SKEWED_CACHE_BYTES)
-            .await
-            .transpose()?;
-        Ok(Self { warm, cold, skewed })
+        Ok(Self { warm, cold })
     }
 
-    /// The table served under `cache`, which a selected scenario measures.
+    /// The table served under `cache`, which a selected scenario measures;
+    /// the skewed and swept budgets are served per run instead.
     fn of(&self, cache: Cache) -> &Served {
         match cache {
             Cache::Warm | Cache::Unread => &self.warm,
             Cache::Cold => &self.cold,
-            Cache::Skewed => &self.skewed,
-            Cache::Swept => &None,
+            Cache::Skewed | Cache::Swept => &None,
         }
         .as_ref()
         .expect("a table is served for every selected scenario")
-    }
-
-    /// The table served under the skewed budget, for its fill.
-    fn skewed_mut(&mut self) -> &mut Served {
-        self.skewed
-            .as_mut()
-            .expect("a table is served for every selected scenario")
     }
 }
 
 /// Every selected lookup scenario of one table in one tier, each in every
 /// selected mode, over a warm table, for the cold scenarios a cold one,
-/// and for the skewed scenario one filled by a pass of its own keys
-/// (`fill_from`); each served beside `beside` when given (`serve`). A
+/// and for the skewed scenario one per exponent, each filled by a pass of
+/// its own keys (`skewed_hits`); each served beside `beside` when given
+/// (`serve`). A
 /// Scan scenario is checked against the model whole (`verify_scans`)
 /// before it is measured.
 async fn lookups(
@@ -4021,7 +4142,7 @@ async fn lookups(
 ) -> BenchResult<Vec<Measured>> {
     let shape = prepared.shape;
     let (hits, misses) = key_pools(shape);
-    let mut budgets = Budgets::serve(prepared, beside, tier, scenarios).await?;
+    let budgets = Budgets::serve(prepared, beside, tier, scenarios).await?;
     let whole = scenarios
         .iter()
         .any(|s| s.traits().projects)
@@ -4042,9 +4163,21 @@ async fn lookups(
     };
     let mut results = Vec::new();
     for &scenario in scenarios {
+        let label = RunLabel {
+            scenario,
+            table: shape,
+            tier,
+            mode: Mode::Single,
+            tasks: 1,
+            batch_fan_out: serving().batch_fan_out,
+            beside: beside.map(|other| other.shape),
+        };
         let op = match scenario {
             Scenario::WarmHit | Scenario::ColdHit => get(&hits, true, WHOLE_VALUE),
-            Scenario::SkewedHit => skewed(budgets.skewed_mut(), shape, settings).await?,
+            Scenario::SkewedHit => {
+                results.extend(skewed_hits(prepared, beside, label, settings).await?);
+                continue;
+            }
             Scenario::Miss => get(&misses, false, WHOLE_VALUE),
             Scenario::MultiGet100 | Scenario::MultiGet100Cold => {
                 multi(&hits, SMALL_BATCH_KEYS, WHOLE_VALUE)
@@ -4082,24 +4215,46 @@ async fn lookups(
             | Scenario::Refresh
             | Scenario::TwoTable
             | Scenario::KvBesideOrdered
-            | Scenario::Replay => {
+            | Scenario::Replay
+            | Scenario::Fitted => {
                 continue;
             }
         };
         let served = budgets.of(scenario.traits().cache);
         verify_scans(&op, &served.table, shape).await?;
         let rounds = count_rounds(served, &op).await?;
-        let label = RunLabel {
-            scenario,
-            table: shape,
-            tier,
-            mode: Mode::Single,
-            tasks: 1,
-            batch_fan_out: serving().batch_fan_out,
-            beside: beside.map(|other| other.shape),
-        };
         for run in measure_modes(served, &op, rounds, settings).await? {
             let measured = Measured::of(label, run);
+            eprintln!("{}", row(&measured));
+            results.push(measured);
+        }
+    }
+    Ok(results)
+}
+
+/// The skewed scenario of `label` on `prepared` beside `beside`, at each
+/// of the run's `--zipf-exponent`s in every selected mode, each exponent
+/// over a table and caches served for it alone under `SKEWED_CACHE_BYTES`
+/// and filled by a pass of its own keys (`skewed`); each row labeled with
+/// its exponent.
+async fn skewed_hits(
+    prepared: &Prepared,
+    beside: Option<&Prepared>,
+    label: RunLabel,
+    settings: &RunSettings,
+) -> BenchResult<Vec<Measured>> {
+    let mut results = Vec::new();
+    for &exponent in &settings.zipf_exponents {
+        let mut served = serve_loaded(prepared, beside, label.tier, SKEWED_CACHE_BYTES).await?;
+        let op = skewed(&mut served, prepared.shape, exponent, settings).await?;
+        for run in measure_modes(&served, &op, None, settings).await? {
+            let measured = Measured {
+                case: Some(Case {
+                    label: format!("s={exponent}"),
+                    fields: json!({ "zipf_exponent": exponent }),
+                }),
+                ..Measured::of(label, run)
+            };
             eprintln!("{}", row(&measured));
             results.push(measured);
         }
@@ -4490,16 +4645,38 @@ const PLACE_SEED: u64 = 0x1ce7_4a7b_e4c4_0005;
 const FILL_DIVISOR: usize = 3;
 
 /// A workload as the bench runs it on one table: its requests as an op
-/// over the table's keys by place, the share of the full workload they
-/// stand for, which scales each budget, each request's arrival time when
-/// known, and what every row of it reports of it.
+/// over the table's keys by place, what they are of the full-size workload
+/// they stand for, which scales each budget, each request's arrival time
+/// when known, and what every row of it reports of it.
 struct Workload {
     /// What the printed table's case starts with, before the budget.
     name: String,
     op: Op,
-    sample: SampleRate,
+    scale: Scale,
     ts: Option<Arc<Vec<i64>>>,
     fields: Json,
+}
+
+/// What a workload's keys are of the full-size workload's, `part` over
+/// `whole`: a trace's sample rate, or a fitted workload's keys over its
+/// measured hour's. A run's cache budget is the full-size one scaled by
+/// it, so each holds the same share of the keys.
+#[derive(Clone, Copy, Debug)]
+struct Scale {
+    part: u64,
+    whole: u64,
+}
+
+impl Scale {
+    /// `budget` scaled, rounded down.
+    fn of(self, budget: u64) -> u64 {
+        let scaled = u128::from(budget) * u128::from(self.part) / u128::from(self.whole);
+        u64::try_from(scaled).unwrap_or(u64::MAX)
+    }
+
+    fn as_f64(self) -> f64 {
+        approx::ratio(self.part, self.whole)
+    }
 }
 
 impl Workload {
@@ -4622,7 +4799,10 @@ impl ReadTrace {
                 format!("r={} ", self.sample)
             },
             op: placed(shape, Arc::clone(&self.requests), ids),
-            sample: self.sample,
+            scale: {
+                let (part, whole) = self.sample.fraction();
+                Scale { part, whole }
+            },
             ts: self.ts.clone(),
             fields: self.fields.clone(),
         })
@@ -4631,7 +4811,7 @@ impl ReadTrace {
 
 /// `workload` on `prepared` in `tier` as `scenario`, under each of
 /// `budgets` in each selected mode: each budget the full-size one, scaled
-/// by the workload's sample for the run (`SampleRate::of`), and each mode
+/// for the run (`Scale`), and each mode
 /// over a table and caches served for it alone and loaded, filled by the
 /// workload's first third of requests with `settings.tasks` tasks,
 /// unmeasured, and then measured over the requests after them, from the
@@ -4649,7 +4829,7 @@ async fn sweep(
     let fill = requests / FILL_DIVISOR;
     let mut results = Vec::new();
     for &budget in budgets {
-        let actual = workload.sample.of(budget.0);
+        let actual = workload.scale.of(budget.0);
         for &mode in &settings.modes {
             let tasks = match mode {
                 Mode::Single => 1,
@@ -4675,6 +4855,7 @@ async fn sweep(
                     json!({
                         "budget_nominal_bytes": budget.0,
                         "budget_bytes": actual,
+                        "budget_scale": workload.scale.as_f64(),
                         "fill_requests": fill,
                         "window_first_request": fill,
                         "window_requests": window.ops,
@@ -4737,17 +4918,25 @@ fn replay_tables<'a>(tables: &'a [&'a Prepared]) -> impl Iterator<Item = &'a Pre
 }
 
 /// The workload scenarios a run makes, checked before anything is
-/// measured: the trace `replay` replays, read once under `--trace-sample`.
-struct WorkloadPlan {
+/// measured: the trace `replay` replays, read once under `--trace-sample`,
+/// and each workload `fitted` draws, with its table and its keys.
+struct WorkloadPlan<'a> {
     trace: Option<ReadTrace>,
+    fitted: Vec<(FittedName, &'a Prepared, u64)>,
 }
 
-impl WorkloadPlan {
+impl<'a> WorkloadPlan<'a> {
     /// The plan of the workload scenarios `scenarios` selects, `replay` on
-    /// `tables`, or every problem that would stop one of them partway:
-    /// a replay without `--trace`, and a trace that does not fit a table it
-    /// replays on (`ReadTrace::problem_on`).
-    fn checked(cli: &Cli, scenarios: &[Scenario], tables: &[&Prepared]) -> BenchResult<Self> {
+    /// `tables` and `fitted` on its workloads' tables among `prepared`, or
+    /// every problem that would stop one of them partway: a replay without
+    /// `--trace`, a trace that does not fit a table it replays on
+    /// (`ReadTrace::problem_on`), and `--workload-keys` above a fitted
+    /// workload's table's rows.
+    fn checked(
+        cli: &Cli,
+        scenarios: &[Scenario],
+        (prepared, tables): (&'a [Prepared], &[&Prepared]),
+    ) -> BenchResult<Self> {
         let mut problems = Vec::new();
         let mut trace = None;
         if scenarios.contains(&Scenario::Replay) {
@@ -4762,12 +4951,146 @@ impl WorkloadPlan {
                 None => problems.push("the replay scenario needs --trace FILE".to_string()),
             }
         }
+        let mut fitted = Vec::new();
+        if scenarios.contains(&Scenario::Fitted) {
+            for name in or_all(&cli.workload, &FittedName::ALL) {
+                let Some(table) = prepared
+                    .iter()
+                    .find(|table| table.shape.name == name.table())
+                else {
+                    problems.push(format!(
+                        "no {} table for {}",
+                        name.table().as_str(),
+                        name.as_str()
+                    ));
+                    continue;
+                };
+                let rows = table.shape.rows;
+                let keys = cli.workload_keys.unwrap_or(rows);
+                if keys > rows {
+                    problems.push(format!(
+                        "fitted {}: --workload-keys {keys} is more than the {rows} rows of {}",
+                        name.as_str(),
+                        table.shape.table_name()
+                    ));
+                }
+                fitted.push((name, table, keys));
+            }
+        }
         if problems.is_empty() {
-            Ok(Self { trace })
+            Ok(Self { trace, fitted })
         } else {
             Err(format!("nothing was measured: {}", problems.join("; ")).into())
         }
     }
+}
+
+/// The workload scenarios `plan` checked: `replay` on `tables` and
+/// `fitted` on its workloads' tables, each in `tiers`.
+async fn workload_runs(
+    cli: &Cli,
+    plan: &WorkloadPlan<'_>,
+    (tables, tiers): (&[&Prepared], &[Tier]),
+    settings: &RunSettings,
+) -> BenchResult<Vec<Measured>> {
+    let mut measured = Vec::new();
+    if let Some(trace) = &plan.trace {
+        measured.extend(replays(cli, trace, tables, tiers, settings).await?);
+    }
+    if !plan.fitted.is_empty() {
+        measured.extend(fitteds(cli, plan, tiers, settings).await?);
+    }
+    Ok(measured)
+}
+
+/// The seed of a fitted workload's draws, fixed so every run of one
+/// workload over one key count asks the same requests.
+const WORKLOAD_SEED: u64 = 0x1ce7_4a7b_e4c4_0006;
+
+/// `name` drawn over `keys` keys of `shape`, at `exponent` for `Zipf`:
+/// the measured hour's lookups per key over `keys` (`Fitted::lookups_over`)
+/// dealt into requests (`fitted::draw_requests`), each budget scaled by
+/// `keys` over the hour's distinct keys, so the run's cache holds the
+/// share of its keys a full-size cache holds of the hour's. The keys are
+/// scattered over the same share of the table's rows, as a sampled
+/// replay's are (`ReadTrace::on`), or over as many rows as there are keys
+/// when that share holds fewer, as it does at the default of every row.
+fn fitted_workload(
+    name: FittedName,
+    shape: TableShape,
+    keys: u64,
+    exponent: Option<f64>,
+) -> BenchResult<Workload> {
+    let started = Instant::now();
+    let fitted = name.fitted();
+    let (cdf, rho) = match exponent {
+        Some(exponent) => (RankCdf::zipf(exponent, keys)?, 0.0),
+        None => (RankCdf::from_curve(fitted.curve, keys)?, fitted.rho),
+    };
+    let sizes = fitted.sizes.map(SizeDist::new);
+    let lookups = fitted.lookups_over(keys);
+    let requests = fitted::draw_requests(&cdf, sizes.as_ref(), rho, lookups, WORKLOAD_SEED)?;
+    let label = match exponent {
+        Some(exponent) => format!("{} s={exponent} ", name.as_str()),
+        None => format!("{} ", name.as_str()),
+    };
+    eprintln!(
+        "drew {}over {keys} keys: {} requests, {} lookups ({:.1?})",
+        label,
+        requests.len(),
+        requests.lookups(),
+        started.elapsed()
+    );
+    let fields = json!({
+        "workload": name.as_str(),
+        "workload_keys": keys,
+        "workload_rho": rho,
+        "zipf_exponent": exponent,
+        "workload_requests": requests.len(),
+        "workload_lookups": requests.lookups(),
+        "workload_mean_keys": sizes.as_ref().map_or(1.0, SizeDist::mean),
+        "workload_seed": WORKLOAD_SEED,
+    });
+    let ids_held = workload::share_of_rows(shape.rows, (keys, fitted.hour_keys)).max(keys);
+    let ids = workload::scatter(approx::length(keys), ids_held, PLACE_SEED)?;
+    Ok(Workload {
+        name: label,
+        op: placed(shape, Arc::new(requests), ids),
+        scale: Scale {
+            part: keys,
+            whole: fitted.hour_keys,
+        },
+        ts: None,
+        fields,
+    })
+}
+
+/// The fitted scenario: each workload `plan` checked, the `zipf` workload
+/// at each `--zipf-exponent`, swept over `--budget` (`sweep`) in each of
+/// `tiers`.
+async fn fitteds(
+    cli: &Cli,
+    plan: &WorkloadPlan<'_>,
+    tiers: &[Tier],
+    settings: &RunSettings,
+) -> BenchResult<Vec<Measured>> {
+    let mut measured = Vec::new();
+    for &(name, table, keys) in &plan.fitted {
+        let exponents: Vec<Option<f64>> = match name {
+            FittedName::Zipf => settings.zipf_exponents.iter().copied().map(Some).collect(),
+            FittedName::EmbeddingBatches | FittedName::PerUserGet | FittedName::DocumentBatches => {
+                vec![None]
+            }
+        };
+        for exponent in exponents {
+            let workload = fitted_workload(name, table.shape, keys, exponent)?;
+            for &tier in tiers {
+                let scenario = (Scenario::Fitted, &workload);
+                measured.extend(sweep(table, tier, scenario, &cli.budget, settings).await?);
+            }
+        }
+    }
+    Ok(measured)
 }
 
 // ---------------------------------------------------------------------------
@@ -6264,8 +6587,9 @@ fn print_prepared(prepared: &[Prepared]) {
 
 /// The tables the command line measures, and beside them every table to
 /// prepare: those, under the two-table scenario the long and string tables
-/// of random values it serves, and under `kv-beside-ordered` the long table
-/// of random values and the ordered table.
+/// of random values it serves, under `kv-beside-ordered` the long table of
+/// random values and the ordered table, and under `fitted` each
+/// workload's table.
 fn select_shapes(cli: &Cli, scenarios: &[Scenario]) -> (Vec<TableShape>, Vec<TableShape>) {
     let values = or_all(&cli.values, &Values::ALL);
     let measured: Vec<TableShape> = shapes()
@@ -6274,6 +6598,14 @@ fn select_shapes(cli: &Cli, scenarios: &[Scenario]) -> (Vec<TableShape>, Vec<Tab
         .collect();
     let two_table = scenarios.contains(&Scenario::TwoTable) && !cli.prepare;
     let beside_ordered = scenarios.contains(&Scenario::KvBesideOrdered) && !cli.prepare;
+    let workload_tables: Vec<TableName> = if scenarios.contains(&Scenario::Fitted) {
+        or_all(&cli.workload, &FittedName::ALL)
+            .into_iter()
+            .map(FittedName::table)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let needed = shapes()
         .into_iter()
         .filter(|shape| {
@@ -6285,6 +6617,7 @@ fn select_shapes(cli: &Cli, scenarios: &[Scenario]) -> (Vec<TableShape>, Vec<Tab
                 || (beside_ordered
                     && random
                     && matches!(shape.name, TableName::Long | TableName::Ordered))
+                || workload_tables.contains(&shape.name)
         })
         .collect();
     (measured, needed)
@@ -6385,6 +6718,12 @@ fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Js
         "trace_sample_seed": TRACE_SAMPLE_SEED,
         "place_seed": PLACE_SEED,
         "fill_divisor": FILL_DIVISOR,
+        "workloads": or_all(&cli.workload, &FittedName::ALL)
+            .into_iter()
+            .map(FittedName::as_str)
+            .collect::<Vec<_>>(),
+        "workload_keys": cli.workload_keys,
+        "workload_seed": WORKLOAD_SEED,
         "scattered_files": cli.scattered_files,
     });
     let settings = json!({
@@ -6395,7 +6734,7 @@ fn report_settings(cli: &Cli, prepared: &[Prepared], compression: &[Json]) -> Js
         "project_most_fields": PROJECT_MOST,
         "cold_cache_bytes": COLD_CACHE_BYTES,
         "skewed_cache_bytes": SKEWED_CACHE_BYTES,
-        "zipf_exponent": ZIPF_EXPONENT,
+        "zipf_exponents": cli.zipf_exponent,
         "skew_seed": SKEW_SEED,
         "row_cache": cli.row_cache.is_on(),
         "warmup_seconds": cli.warmup,
@@ -6438,6 +6777,7 @@ fn run_settings(cli: &Cli) -> RunSettings {
         warmup: Duration::from_secs(cli.warmup),
         duration: Duration::from_secs(cli.duration),
         windows: cli.duration.div_ceil(cli.warmup),
+        zipf_exponents: cli.zipf_exponent.clone(),
     }
 }
 
@@ -6518,7 +6858,7 @@ async fn main() -> BenchResult<()> {
         .iter()
         .filter(|table| measured_shapes.contains(&table.shape))
         .collect();
-    let plan = WorkloadPlan::checked(&cli, &scenarios, &tables)?;
+    let plan = WorkloadPlan::checked(&cli, &scenarios, (&prepared, &tables))?;
     let machine = machine(tasks, !cli.no_metrics);
     eprintln!("{machine}");
     eprintln!("{}", header());
@@ -6541,9 +6881,8 @@ async fn main() -> BenchResult<()> {
             }
         }
     }
-    if let Some(trace) = &plan.trace {
-        measured.extend(replays(&cli, trace, &tables, &tiers, &settings).await?);
-    }
+    let workloads = (&tables[..], &tiers[..]);
+    measured.extend(workload_runs(&cli, &plan, workloads, &settings).await?);
     if scenarios.contains(&Scenario::TwoTable) {
         for &tier in &tiers {
             measured.extend(two_tables(&prepared, tier, &settings).await?);
