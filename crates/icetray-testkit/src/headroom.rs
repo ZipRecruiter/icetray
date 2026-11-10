@@ -1,14 +1,13 @@
 //! What a benchmark run asks of the machine's memory: how much a cache
 //! budget needs available before the run starts, and how much of the
-//! process's own memory the kernel may compress or swap out before the run
-//! no longer measures caches held in RAM.
+//! process's own memory the kernel may push out of RAM, and read back,
+//! before the run no longer measures caches held in RAM.
 //!
 //! A cache the kernel has compressed or swapped out still answers, slowly,
 //! so a run under memory pressure reports the swap's latency as icetray's.
 //! The benchmark refuses a budget that `needed_bytes` says will not fit in
-//! `available_bytes`, and stops measuring once
-//! `compressed_or_swapped_bytes` grows past `OUT_OF_RAM_LIMIT_BYTES` within
-//! a run (`pushed_out`).
+//! `available_bytes`, and stops measuring once a run has waited on memory
+//! out of RAM (`breach`).
 
 /// The resident memory a cache budget grows the benchmark process by, in
 /// percent of the budget. jemalloc rounds each cached page up to its size
@@ -30,12 +29,20 @@ const PERCENT: u64 = 100;
 /// for a fitted workload's draw.
 pub const RESIDENT_BESIDE_BUDGET_BYTES: u64 = 1 << 30;
 
+/// The most bytes of the process's memory the kernel may read back into
+/// RAM during one run, for faults that waited on a decompression or a swap
+/// read, before the benchmark stops: 1,024 pages of 16 KiB. The kernel
+/// compresses idle memory, such as a workload's drawn requests and what
+/// jemalloc keeps of freed memory, whenever its free pages run low, even
+/// with file cache it could drop; only a read of it delays a lookup.
+pub const READ_BACK_LIMIT_BYTES: u64 = 16 << 20;
+
 /// The most bytes of the process's memory the kernel may come to hold
 /// compressed or swapped out during one run, beyond what it held when the
-/// run's fill began, before the benchmark stops: under 1 percent of the
-/// budgets a sweep measures, so a cache whose pages it reaches have
-/// stayed in RAM.
-pub const OUT_OF_RAM_LIMIT_BYTES: u64 = 64 << 20;
+/// run's fill began, before the benchmark stops, on a platform that does
+/// not count what it reads back (`OutOfRam::read_back`): under 1 percent
+/// of the budgets a sweep measures.
+pub const PUSHED_OUT_LIMIT_BYTES: u64 = 64 << 20;
 
 /// Bytes in the kibibyte Linux's `/proc` files count in.
 #[cfg(any(target_os = "linux", test))]
@@ -51,13 +58,45 @@ pub fn needed_bytes(budget: u64) -> u64 {
         .saturating_add(RESIDENT_BESIDE_BUDGET_BYTES)
 }
 
-/// How far `compressed_or_swapped_bytes` grew from `before` to `after`,
-/// when it grew past `OUT_OF_RAM_LIMIT_BYTES`; `None` when it did not, or
-/// either reading is unknown.
+/// What the kernel had done with this process's memory at one moment
+/// (`out_of_ram`), each `None` where the platform does not say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutOfRam {
+    /// The bytes the kernel holds compressed or swapped out now. On macOS,
+    /// `task_vm_info`'s `compressed`, which counts compressed pages whether
+    /// their segment is in RAM or in swap. On Linux, `/proc/self/status`'s
+    /// `VmSwap`.
+    pub held: Option<u64>,
+    /// The bytes the kernel has read back into RAM since the process
+    /// started, for the process's faults on memory it had pushed out. On
+    /// macOS, `task_vm_info`'s `decompressions` in pages of its
+    /// `page_size`; swap there holds only compressed memory, so every read
+    /// of it is a decompression. Linux does not count it per process.
+    pub read_back: Option<u64>,
+}
+
+/// How a run waited on memory out of RAM (`breach`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Breach {
+    /// The kernel read this many bytes back, past `READ_BACK_LIMIT_BYTES`.
+    ReadBack(u64),
+    /// The kernel came to hold this many bytes more out of RAM, past
+    /// `PUSHED_OUT_LIMIT_BYTES`, on a platform that does not count what it
+    /// reads back.
+    PushedOut(u64),
+}
+
+/// How the process waited on memory out of RAM between `before` and
+/// `after`, `None` when it did not or neither reading says. A platform
+/// that counts what it reads back is judged on that alone.
 #[must_use]
-pub fn pushed_out(before: Option<u64>, after: Option<u64>) -> Option<u64> {
-    let grown = after?.saturating_sub(before?);
-    (grown > OUT_OF_RAM_LIMIT_BYTES).then_some(grown)
+pub fn breach(before: OutOfRam, after: OutOfRam) -> Option<Breach> {
+    if let (Some(from), Some(to)) = (before.read_back, after.read_back) {
+        let grown = to.saturating_sub(from);
+        return (grown > READ_BACK_LIMIT_BYTES).then_some(Breach::ReadBack(grown));
+    }
+    let grown = after.held?.saturating_sub(before.held?);
+    (grown > PUSHED_OUT_LIMIT_BYTES).then_some(Breach::PushedOut(grown))
 }
 
 /// The memory the kernel can hand a process now without compressing or
@@ -70,14 +109,10 @@ pub fn available_bytes() -> Option<u64> {
     platform::available_bytes()
 }
 
-/// The bytes of this process's memory the kernel holds compressed or
-/// swapped out now, or `None` where the platform does not say. On macOS,
-/// `task_vm_info`'s `compressed`, which counts compressed pages whether
-/// their segment is in RAM or in swap. On Linux, `/proc/self/status`'s
-/// `VmSwap`.
+/// What the kernel has done with this process's memory now.
 #[must_use]
-pub fn compressed_or_swapped_bytes() -> Option<u64> {
-    platform::compressed_or_swapped_bytes()
+pub fn out_of_ram() -> OutOfRam {
+    platform::out_of_ram()
 }
 
 /// The bytes of `field` in a Linux `/proc` file of `Name:   N kB` lines,
@@ -108,8 +143,13 @@ mod platform {
         kib_field(&std::fs::read_to_string(MEMINFO).ok()?, "MemAvailable")
     }
 
-    pub(super) fn compressed_or_swapped_bytes() -> Option<u64> {
-        kib_field(&std::fs::read_to_string(STATUS).ok()?, "VmSwap")
+    pub(super) fn out_of_ram() -> super::OutOfRam {
+        super::OutOfRam {
+            held: std::fs::read_to_string(STATUS)
+                .ok()
+                .and_then(|status| kib_field(&status, "VmSwap")),
+            read_back: None,
+        }
     }
 }
 
@@ -127,13 +167,25 @@ mod platform {
     /// `task_info`'s flavor for `task_vm_info`, from `<mach/task_info.h>`.
     const TASK_VM_INFO: libc::task_flavor_t = 22;
 
-    /// The 64-bit words of `task_vm_info` through `compressed_lifetime`,
-    /// its first revision (`TASK_VM_INFO_REV0_COUNT`): `virtual_size`,
-    /// `region_count` and `page_size` sharing a word, then fifteen sizes.
-    const TASK_VM_INFO_REV0_WORDS: usize = 18;
+    /// The naturals of `task_vm_info` through `decompressions`
+    /// (`TASK_VM_INFO_REV5_COUNT`), which `<mach/task_info.h>` packs to 4
+    /// bytes.
+    const TASK_VM_INFO_REV5_COUNT: usize = 87;
 
-    /// The word of `task_vm_info` holding `compressed`.
-    const COMPRESSED_WORD: usize = 15;
+    /// The naturals of `task_vm_info` through `compressed_lifetime`
+    /// (`TASK_VM_INFO_REV0_COUNT`), which a kernel too old to count
+    /// decompressions still writes.
+    const TASK_VM_INFO_REV0_COUNT: usize = 36;
+
+    /// The natural of `task_vm_info` holding `page_size`.
+    const PAGE_SIZE_NATURAL: usize = 3;
+
+    /// The first of the two naturals of `task_vm_info` holding
+    /// `compressed`.
+    const COMPRESSED_NATURAL: usize = 30;
+
+    /// The natural of `task_vm_info` holding `decompressions`.
+    const DECOMPRESSIONS_NATURAL: usize = 86;
 
     /// The page counts `available_bytes` sums: free, file-backed,
     /// purgeable, and reusable.
@@ -155,12 +207,34 @@ mod platform {
         pages.checked_mul(sysctl_count(PAGE_SIZE)?)
     }
 
-    pub(super) fn compressed_or_swapped_bytes() -> Option<u64> {
-        let mut info = [0_u64; TASK_VM_INFO_REV0_WORDS];
-        let mut count = libc::mach_msg_type_number_t::try_from(
-            size_of_val(&info) / size_of::<libc::natural_t>(),
-        )
-        .ok()?;
+    pub(super) fn out_of_ram() -> super::OutOfRam {
+        let info = task_vm_info().unwrap_or_default();
+        let natural = |at: usize| info.get(at).copied();
+        let held = natural(COMPRESSED_NATURAL)
+            .zip(natural(COMPRESSED_NATURAL + 1))
+            .map(|(first, second)| wide(first, second));
+        let read_back = natural(DECOMPRESSIONS_NATURAL)
+            .zip(natural(PAGE_SIZE_NATURAL))
+            .and_then(|(pages, size)| u64::from(pages).checked_mul(u64::from(size)));
+        super::OutOfRam { held, read_back }
+    }
+
+    /// The 64-bit field `task_vm_info` holds in the naturals `first` and
+    /// `second`, in memory order.
+    fn wide(first: libc::natural_t, second: libc::natural_t) -> u64 {
+        let (low, high) = if cfg!(target_endian = "little") {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        (u64::from(high) << libc::natural_t::BITS) | u64::from(low)
+    }
+
+    /// The naturals of this task's `task_vm_info` the kernel wrote, through
+    /// `decompressions` at most.
+    fn task_vm_info() -> Option<Vec<libc::natural_t>> {
+        let mut info: [libc::natural_t; TASK_VM_INFO_REV5_COUNT] = [0; TASK_VM_INFO_REV5_COUNT];
+        let mut count = libc::mach_msg_type_number_t::try_from(info.len()).ok()?;
         // SAFETY: `mach_task_self_` is a port the runtime sets before
         // `main` and never changes; `task_info` writes at most `count`
         // naturals into `info`, which holds exactly that many, and the
@@ -173,7 +247,10 @@ mod platform {
                 &raw mut count,
             )
         };
-        (status == libc::KERN_SUCCESS).then_some(info[COMPRESSED_WORD])
+        let written = usize::try_from(count).ok()?;
+        (status == libc::KERN_SUCCESS && written >= TASK_VM_INFO_REV0_COUNT)
+            .then(|| info.get(..written).map(<[_]>::to_vec))
+            .flatten()
     }
 
     /// The unsigned integer the sysctl `name` holds, 32 or 64 bits wide.
@@ -204,6 +281,21 @@ mod platform {
             _ => None,
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::wide;
+
+        #[test]
+        fn test_wide_joins_two_naturals_in_memory_order() {
+            let field: u64 = 0x0123_4567_89ab_cdef;
+            let bytes = field.to_ne_bytes();
+            let (first, second) = bytes.split_at(size_of::<libc::natural_t>());
+            let natural =
+                |half: &[u8]| libc::natural_t::from_ne_bytes(half.try_into().expect("four bytes"));
+            assert_eq!(wide(natural(first), natural(second)), field);
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -212,8 +304,8 @@ mod platform {
         None
     }
 
-    pub(super) fn compressed_or_swapped_bytes() -> Option<u64> {
-        None
+    pub(super) fn out_of_ram() -> super::OutOfRam {
+        super::OutOfRam::default()
     }
 }
 
@@ -231,16 +323,45 @@ mod tests {
         assert_eq!(needed_bytes(u64::MAX), u64::MAX);
     }
 
+    fn reading(held: Option<u64>, read_back: Option<u64>) -> OutOfRam {
+        OutOfRam { held, read_back }
+    }
+
     #[test]
-    fn test_pushed_out_only_past_the_limit() {
-        let before = Some(1 << 20);
-        let at_limit = Some((1 << 20) + OUT_OF_RAM_LIMIT_BYTES);
-        let past = Some((1 << 20) + OUT_OF_RAM_LIMIT_BYTES + 1);
-        assert_eq!(pushed_out(before, at_limit), None);
-        assert_eq!(pushed_out(before, past), Some(OUT_OF_RAM_LIMIT_BYTES + 1));
-        assert_eq!(pushed_out(past, before), None);
-        assert_eq!(pushed_out(None, past), None);
-        assert_eq!(pushed_out(before, None), None);
+    fn test_breach_judges_reads_back_where_the_platform_counts_them() {
+        let start = 1 << 20;
+        let before = reading(Some(0), Some(start));
+        let held_lots = Some(PUSHED_OUT_LIMIT_BYTES * 4);
+        assert_eq!(
+            breach(
+                before,
+                reading(held_lots, Some(start + READ_BACK_LIMIT_BYTES))
+            ),
+            None
+        );
+        assert_eq!(
+            breach(
+                before,
+                reading(Some(0), Some(start + READ_BACK_LIMIT_BYTES + 1))
+            ),
+            Some(Breach::ReadBack(READ_BACK_LIMIT_BYTES + 1))
+        );
+        assert_eq!(breach(before, reading(Some(0), Some(0))), None);
+    }
+
+    #[test]
+    fn test_breach_judges_growth_held_out_elsewhere() {
+        let before = reading(Some(1 << 20), None);
+        let at_limit = reading(Some((1 << 20) + PUSHED_OUT_LIMIT_BYTES), None);
+        let past = reading(Some((1 << 20) + PUSHED_OUT_LIMIT_BYTES + 1), None);
+        assert_eq!(breach(before, at_limit), None);
+        assert_eq!(
+            breach(before, past),
+            Some(Breach::PushedOut(PUSHED_OUT_LIMIT_BYTES + 1))
+        );
+        assert_eq!(breach(past, before), None);
+        assert_eq!(breach(reading(None, None), past), None);
+        assert_eq!(breach(before, reading(None, Some(1 << 40))), None);
     }
 
     #[test]
@@ -261,9 +382,15 @@ mod tests {
     fn test_platform_reads_this_machine() {
         let available = available_bytes().expect("the platform says what memory is available");
         assert!(available > 0, "no memory available reads as {available}");
+        let now = out_of_ram();
         assert!(
-            compressed_or_swapped_bytes().is_some(),
+            now.held.is_some(),
             "the platform says what of this process is out of RAM"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            now.read_back.is_some(),
+            "macOS says what of this process it read back"
         );
     }
 }

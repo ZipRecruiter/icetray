@@ -448,10 +448,15 @@ the machine's available memory cannot hold: the process grows by up to
 1.6 times its scaled budget, since jemalloc rounds each cached page up to
 a size class and holds memory freed by evictions for a while, and by
 about 1 GiB beside it. Each row records how much of the process the
-kernel held compressed or swapped out before its fill, after it, and at
-the window's end. Once that grows by more than 64 MiB within a run, the
-program stops measuring, writes the rows it has with the reason under
-`stopped`, and exits with an error.
+kernel held compressed or swapped out, and how much it had read back into
+RAM, before its fill, after it, and at the window's end. macOS compresses
+idle memory whenever its free pages run low, even while it holds file
+cache it could drop, and memory no lookup reads costs a row nothing; so on
+macOS, which counts the faults that waited on a decompression, the
+program stops once a run has read more than 16 MiB back. On Linux, which
+does not count those per process, it stops once the swapped-out amount
+grows by more than 64 MiB within a run. Either way it writes the rows it
+has with the reason under `stopped` and exits with an error.
 
 ## The page cache
 

@@ -2324,16 +2324,15 @@ const BUDGET_SHARDS: usize = 1;
 /// What the process held at one moment: its resident set, as
 /// `resident_bytes` reads it, the bytes jemalloc has allocated to the
 /// program and holds resident, read after advancing its epoch so they are
-/// current, and the bytes of it the kernel holds compressed or swapped out
-/// (`headroom::compressed_or_swapped_bytes`), `None` where the platform
-/// does not say. jemalloc's allocated bytes leave out what it keeps of
-/// memory freed earlier, which the resident set counts.
+/// current, and what the kernel had pushed out of RAM and read back
+/// (`headroom::out_of_ram`). jemalloc's allocated bytes leave out what it
+/// keeps of memory freed earlier, which the resident set counts.
 #[derive(Clone, Copy, Debug, Default)]
 struct Snapshot {
     rss: u64,
     allocated: u64,
     resident: u64,
-    compressed_or_swapped: Option<u64>,
+    out_of_ram: headroom::OutOfRam,
 }
 
 impl Snapshot {
@@ -2348,7 +2347,7 @@ impl Snapshot {
             rss: resident_bytes(),
             allocated: stat(tikv_jemalloc_ctl::stats::allocated::read),
             resident: stat(tikv_jemalloc_ctl::stats::resident::read),
-            compressed_or_swapped: headroom::compressed_or_swapped_bytes(),
+            out_of_ram: headroom::out_of_ram(),
         }
     }
 }
@@ -3667,9 +3666,12 @@ impl Memory {
             "jemalloc_resident_before_fill_bytes": self.filled.before.resident,
             "jemalloc_resident_after_fill_bytes": self.filled.after.resident,
             "jemalloc_resident_window_end_bytes": self.end.resident,
-            "compressed_or_swapped_before_fill_bytes": self.filled.before.compressed_or_swapped,
-            "compressed_or_swapped_after_fill_bytes": self.filled.after.compressed_or_swapped,
-            "compressed_or_swapped_window_end_bytes": self.end.compressed_or_swapped,
+            "compressed_or_swapped_before_fill_bytes": self.filled.before.out_of_ram.held,
+            "compressed_or_swapped_after_fill_bytes": self.filled.after.out_of_ram.held,
+            "compressed_or_swapped_window_end_bytes": self.end.out_of_ram.held,
+            "read_back_before_fill_bytes": self.filled.before.out_of_ram.read_back,
+            "read_back_after_fill_bytes": self.filled.after.out_of_ram.read_back,
+            "read_back_window_end_bytes": self.end.out_of_ram.read_back,
         })
     }
 }
@@ -5033,8 +5035,8 @@ impl<'a> WorkloadPlan<'a> {
 /// The largest of `budgets` the plan's workloads serve, scaled
 /// (`Scale::of`), against the memory the machine has available
 /// (`headroom::needed_bytes`), checked before anything is measured: an
-/// error when it will not fit, and otherwise the check and the run's
-/// `headroom::OUT_OF_RAM_LIMIT_BYTES` as the report records them. A
+/// error when it will not fit, and otherwise the check and the limits a run
+/// stops at (`headroom::breach`) as the report records them. A
 /// platform that does not say what memory is available is not checked.
 fn check_memory(budgets: &[Size], plan: &WorkloadPlan<'_>) -> BenchResult<Json> {
     let largest = plan
@@ -5074,7 +5076,8 @@ fn check_memory(budgets: &[Size], plan: &WorkloadPlan<'_>) -> BenchResult<Json> 
         "available_bytes": available,
         "resident_percent_of_budget": headroom::RESIDENT_PERCENT_OF_BUDGET,
         "resident_beside_budget_bytes": headroom::RESIDENT_BESIDE_BUDGET_BYTES,
-        "out_of_ram_limit_bytes": headroom::OUT_OF_RAM_LIMIT_BYTES,
+        "read_back_limit_bytes": headroom::READ_BACK_LIMIT_BYTES,
+        "pushed_out_limit_bytes": headroom::PUSHED_OUT_LIMIT_BYTES,
     }))
 }
 
@@ -5704,9 +5707,8 @@ fn window_header() -> String {
     )
 }
 
-/// Why the program stopped measuring, once the kernel came to hold more of
-/// the process compressed or swapped out than
-/// `headroom::OUT_OF_RAM_LIMIT_BYTES` within one run
+/// Why the program stopped measuring, once a run waited on the process's
+/// memory out of RAM past what `headroom::breach` allows
 /// (`stop_if_out_of_ram`). A cache the kernel has pushed out of RAM still
 /// answers, at the swap's latency, which its row would report as
 /// icetray's; so every run after it is skipped, and the program writes the
@@ -5718,18 +5720,21 @@ fn stopped() -> bool {
     STOPPED.get().is_some()
 }
 
-/// Stops the program measuring (`STOPPED`) when the kernel held more of
-/// the process compressed or swapped out at `to` than at `from`, past
-/// `headroom::OUT_OF_RAM_LIMIT_BYTES`, `from` and `to` bounding `what`;
-/// whether the program has stopped, by this run or an earlier one.
+/// Stops the program measuring (`STOPPED`) when the process waited on its
+/// memory out of RAM between `from` and `to`, which bound `what`, past
+/// what `headroom::breach` allows; whether the program has stopped, by
+/// this run or an earlier one.
 fn stop_if_out_of_ram(what: &str, from: Snapshot, to: Snapshot) -> bool {
-    if let Some(grown) = headroom::pushed_out(from.compressed_or_swapped, to.compressed_or_swapped)
-    {
-        let reason = STOPPED.get_or_init(|| {
-            format!(
+    if let Some(breach) = headroom::breach(from.out_of_ram, to.out_of_ram) {
+        let reason = STOPPED.get_or_init(|| match breach {
+            headroom::Breach::ReadBack(bytes) => format!(
+                "the kernel read {:.0} MiB of the process back into RAM during {what}",
+                mib(bytes)
+            ),
+            headroom::Breach::PushedOut(bytes) => format!(
                 "the kernel compressed or swapped out {:.0} MiB of the process during {what}",
-                mib(grown)
-            )
+                mib(bytes)
+            ),
         });
         eprintln!("stopping: {reason}");
     }
