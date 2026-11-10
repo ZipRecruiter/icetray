@@ -1000,6 +1000,16 @@ struct Cli {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
     )]
     row_group_rows: Option<usize>,
+    /// Rows per data page of the tables written, the layout's when absent:
+    /// a bound on every column's pages, which a value page bounded by bytes
+    /// meets first when its rows are few, so on the scattered and documents
+    /// tables it sizes the key pages alone. The manifest records it, as it
+    /// records `--row-group-rows`.
+    #[arg(
+        long,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+    )]
+    page_rows: Option<usize>,
     /// Files of the scattered table, each of about 37,500 rows, so its
     /// per-file work stays in proportion: 32 holds 1.2 million rows, 128
     /// holds 4.8 million, enough for the embedding workload's hour
@@ -1112,6 +1122,7 @@ struct Cli {
             "prepare",
             "rewrite",
             "row_group_rows",
+            "page_rows",
             "row_cache",
         ],
     )]
@@ -1213,6 +1224,14 @@ static ROW_GROUP_ROWS: OnceLock<Option<usize>> = OnceLock::new();
 /// `ROW_GROUP_ROWS`, or the writer's default before `main` sets it.
 fn row_group_rows() -> Option<usize> {
     ROW_GROUP_ROWS.get().copied().flatten()
+}
+
+/// The run's `--page-rows`.
+static PAGE_ROWS: OnceLock<Option<usize>> = OnceLock::new();
+
+/// `PAGE_ROWS`, or the layout's own before `main` sets it.
+fn page_rows() -> Option<usize> {
+    PAGE_ROWS.get().copied().flatten()
 }
 
 /// The run's `--scattered-files`.
@@ -1796,15 +1815,18 @@ impl TableShape {
     /// files rolled at `SCATTERED_FILE_BYTES`; for the string-ordered table the column
     /// index cut to `ORDER_INDEX_TRUNCATE_BYTES`, and for the rolled table
     /// files rolled at `ROLLED_FILE_BYTES`; every table's row groups of the
-    /// run's `--row-group-rows` when it sets them.
+    /// run's `--row-group-rows` and its pages of `--page-rows` when it sets
+    /// them.
     fn layout(self) -> FileLayout {
+        let layout = self.table_layout();
         FileLayout {
             row_group_rows: row_group_rows(),
-            ..self.table_layout()
+            page_rows: page_rows().unwrap_or(layout.page_rows),
+            ..layout
         }
     }
 
-    /// `layout` before the run's `--row-group-rows`.
+    /// `layout` before the run's `--row-group-rows` and `--page-rows`.
     fn table_layout(self) -> FileLayout {
         let byte_pages = FileLayout {
             page_bytes: Some(approx::length(VALUE_PAGE_BYTES)),
@@ -1907,7 +1929,7 @@ impl Prepared {
     /// the appended table its `overlapping_appends`, the scattered table
     /// its `scattered_files`, a table of scattered keys the
     /// `SCATTERED_ID_SPACE` that spelled them, and a run that sets
-    /// `--row-group-rows` that count.
+    /// `--row-group-rows` or `--page-rows` that count.
     fn to_json(&self) -> Json {
         let mut table = json!({
             "name": self.shape.table_name(),
@@ -1934,6 +1956,9 @@ impl Prepared {
         }
         if let Some(rows) = row_group_rows() {
             table["row_group_rows"] = json!(rows);
+        }
+        if let Some(rows) = page_rows() {
+            table["page_rows"] = json!(rows);
         }
         table
     }
@@ -2114,7 +2139,8 @@ fn read_manifest(dir: &Path) -> BenchResult<Vec<Prepared>> {
                 == Some(shape.overlapping_appends()).filter(|&appends| appends > 0)
             && table["scattered_files"].as_u64() == shape.scattered_files()
             && table["scattered_id_space"].as_u64() == shape.scattered_id_space()
-            && table["row_group_rows"].as_u64() == row_group_rows().map(approx::count);
+            && table["row_group_rows"].as_u64() == row_group_rows().map(approx::count)
+            && table["page_rows"].as_u64() == page_rows().map(approx::count);
         if current && local_path(&first)?.exists() && local_path(&second)?.exists() {
             recorded.push(Prepared {
                 shape,
@@ -2323,14 +2349,17 @@ const BUDGET_SHARDS: usize = 1;
 
 /// What the process held at one moment: its resident set, as
 /// `resident_bytes` reads it, the bytes jemalloc has allocated to the
-/// program and holds resident, read after advancing its epoch so they are
-/// current, and what the kernel had pushed out of RAM and read back
-/// (`headroom::out_of_ram`). jemalloc's allocated bytes leave out what it
-/// keeps of memory freed earlier, which the resident set counts.
+/// program, in the pages of its live allocations, and holds resident,
+/// read after advancing its epoch so they are current, and what the kernel
+/// had pushed out of RAM and read back (`headroom::out_of_ram`). jemalloc's
+/// allocated bytes leave out what it keeps of memory freed earlier, which
+/// the resident set counts; its active bytes less its allocated ones are
+/// the pages a live allocation spans past its size.
 #[derive(Clone, Copy, Debug, Default)]
 struct Snapshot {
     rss: u64,
     allocated: u64,
+    active: u64,
     resident: u64,
     out_of_ram: headroom::OutOfRam,
 }
@@ -2346,6 +2375,7 @@ impl Snapshot {
         Self {
             rss: resident_bytes(),
             allocated: stat(tikv_jemalloc_ctl::stats::allocated::read),
+            active: stat(tikv_jemalloc_ctl::stats::active::read),
             resident: stat(tikv_jemalloc_ctl::stats::resident::read),
             out_of_ram: headroom::out_of_ram(),
         }
@@ -3663,6 +3693,9 @@ impl Memory {
             "jemalloc_allocated_before_fill_bytes": self.filled.before.allocated,
             "jemalloc_allocated_after_fill_bytes": self.filled.after.allocated,
             "jemalloc_allocated_window_end_bytes": self.end.allocated,
+            "jemalloc_active_before_fill_bytes": self.filled.before.active,
+            "jemalloc_active_after_fill_bytes": self.filled.after.active,
+            "jemalloc_active_window_end_bytes": self.end.active,
             "jemalloc_resident_before_fill_bytes": self.filled.before.resident,
             "jemalloc_resident_after_fill_bytes": self.filled.after.resident,
             "jemalloc_resident_window_end_bytes": self.end.resident,
@@ -7003,6 +7036,9 @@ async fn main() -> BenchResult<()> {
     ROW_GROUP_ROWS
         .set(cli.row_group_rows)
         .expect("main sets the row groups once");
+    PAGE_ROWS
+        .set(cli.page_rows)
+        .expect("main sets the page rows once");
     SCATTERED_FILES
         .set(cli.scattered_files)
         .expect("main sets the scattered files once");
