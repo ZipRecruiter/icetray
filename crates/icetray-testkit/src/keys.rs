@@ -400,6 +400,10 @@ pub enum ValueKind {
     /// prose, whose words are common ones or made of random syllables, so
     /// a page of them compresses about as far as documents of listings do.
     Json,
+    /// `embedding_value_for_len`: bytes of `EMBEDDING_SYMBOLS` symbols,
+    /// which zstd shrinks about as far as a measured column of embeddings,
+    /// in a page and value by value alike.
+    Embedding,
 }
 
 /// The `len`-byte value of `kind` stored for `key`.
@@ -409,6 +413,7 @@ pub fn value_of_kind(key: &Key, len: usize, kind: ValueKind) -> Vec<u8> {
         ValueKind::Text => text_value_for_len(key, len),
         ValueKind::Protobuf => protobuf::value(key, len, FIRST_VERSION),
         ValueKind::Json => json_value_for_len(key, len),
+        ValueKind::Embedding => embedding_value_for_len(key, len),
     }
 }
 
@@ -503,6 +508,22 @@ pub fn text_value_for_len(key: &Key, len: usize) -> Vec<u8> {
         bytes.push(b'}');
     }
     bytes
+}
+
+/// The symbols an embedding value's bytes are drawn from: 30, a little
+/// under five bits a byte, so zstd shrinks a page of the values about
+/// 1.62x, as far as it shrank the pages of a production embedding column
+/// measured on 2026-11-08, and a value alone about 1.6x.
+const EMBEDDING_SYMBOLS: u64 = 30;
+
+/// The `len`-byte embedding value stored for `key`: bytes drawn uniformly
+/// from `EMBEDDING_SYMBOLS` symbols by the key's xorshift stream, so it is
+/// deterministic and distinct for neighboring keys.
+pub fn embedding_value_for_len(key: &Key, len: usize) -> Vec<u8> {
+    let mut stream = Stream::from_key(key);
+    (0..len)
+        .map(|_| u8::try_from(stream.next() % EMBEDDING_SYMBOLS).expect("a symbol fits in a byte"))
+        .collect()
 }
 
 /// The fields of a JSON document that hold a few words each, written in
@@ -1025,6 +1046,34 @@ mod tests {
             json_value_for_len(&key, len)
         );
         assert!(json_value_for_len(&key, 0).is_empty());
+    }
+
+    #[test]
+    fn test_embedding_value_for_len_draws_its_bytes_from_the_symbols() {
+        let len = 4_242;
+        for id in SAMPLE_IDS {
+            let key = scattered_key_at(id, 0);
+            let value = embedding_value_for_len(&key, len);
+            assert_eq!(value.len(), len);
+            assert_eq!(value, embedding_value_for_len(&key, len));
+            assert_ne!(
+                value,
+                embedding_value_for_len(&scattered_key_at(id + 1, 0), len)
+            );
+            assert!(
+                value
+                    .iter()
+                    .all(|&byte| u64::from(byte) < EMBEDDING_SYMBOLS)
+            );
+            let drawn: std::collections::HashSet<u8> = value.iter().copied().collect();
+            assert_eq!(drawn.len(), usize::try_from(EMBEDDING_SYMBOLS).unwrap());
+        }
+        let key = scattered_key_at(SAMPLE_IDS[5], 0);
+        assert_eq!(
+            value_of_kind(&key, len, ValueKind::Embedding),
+            embedding_value_for_len(&key, len)
+        );
+        assert!(embedding_value_for_len(&key, 0).is_empty());
     }
 
     #[test]

@@ -20,7 +20,9 @@
 //! values in byte-bounded pages per file, in `--scattered-files` files);
 //! and when `--table documents` names it, a table of documents beside it
 //! (`DOCUMENT_ROWS` rows of the same keys and pages and 10,800-byte JSON
-//! documents), through the fixture writer (once, then reused from
+//! documents), and when `--table embeddings` names it, one of embeddings
+//! (`EMBEDDING_ROWS` rows of the same keys and pages and 4,242-byte values
+//! that compress as embeddings do), through the fixture writer (once, then reused from
 //! `--data-dir`), reports how
 //! far zstd compressed each table's key and value columns, serves them
 //! through `Table` over `Storage`'s `file://` store in every residency
@@ -51,7 +53,8 @@
 //!
 //! Workloads. `replay` replays a trace of a service's lookups, which runs
 //! only when named, on each key-value table `--table` names: the scattered
-//! table for traces of 4 KiB values, the documents table for documents. A
+//! table for traces of 4 KiB values, the documents table for documents,
+//! the embeddings table for embeddings. A
 //! trace file is Parquet, one row per request in the order the requests
 //! arrived: `ts`, an int64 of microseconds, optional and read only to
 //! report the span a window replayed, and `keys`, a list of int64, the
@@ -697,6 +700,12 @@ enum TableName {
     /// about 20,700 rows per file. Runs only when named, and only the
     /// scenarios the scattered table runs.
     Documents,
+    /// A table of embeddings: the scattered table's keys, pages, and rows
+    /// per file, `EMBEDDING_FILES` files of them, and values of
+    /// `EMBEDDING_VALUE_BYTES` bytes that compress about as far as
+    /// measured embeddings do (`Values::Embedding`). Runs only when named,
+    /// and only the scenarios the scattered table runs.
+    Embeddings,
     /// Long keys of `ORDERED_ROWS_PER_KEY` rows each by a timestamp order
     /// column, contract layout: the table the first Scan and `MultiScan`
     /// scenarios read, and the only one they read.
@@ -748,15 +757,20 @@ enum Values {
     /// (`json_value_for_len`), which zstd compresses about as far as
     /// measured documents compress; the documents table's alone.
     Json,
+    /// Bytes of a few symbols (`embedding_value_for_len`), which zstd
+    /// compresses about as far as measured embeddings compress; the
+    /// embeddings table's alone.
+    Embedding,
 }
 
 impl Values {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Random,
         Self::Text,
         Self::Protobuf,
         Self::ProtobufLarge,
         Self::Json,
+        Self::Embedding,
     ];
 
     /// The values' name in the results and, after the key column's, in a
@@ -768,6 +782,7 @@ impl Values {
             Self::Protobuf => "protobuf",
             Self::ProtobufLarge => "protobuf_large",
             Self::Json => "json",
+            Self::Embedding => "embedding",
         }
     }
 
@@ -777,6 +792,7 @@ impl Values {
             Self::Text => ValueKind::Text,
             Self::Protobuf | Self::ProtobufLarge => ValueKind::Protobuf,
             Self::Json => ValueKind::Json,
+            Self::Embedding => ValueKind::Embedding,
         }
     }
 
@@ -785,7 +801,7 @@ impl Values {
     fn is_protobuf(self) -> bool {
         match self {
             Self::Protobuf | Self::ProtobufLarge => true,
-            Self::Random | Self::Text | Self::Json => false,
+            Self::Random | Self::Text | Self::Json | Self::Embedding => false,
         }
     }
 }
@@ -967,8 +983,8 @@ struct Cli {
     /// Residency tiers to run them in.
     #[arg(long, value_enum, value_delimiter = ',')]
     tier: Vec<Tier>,
-    /// Tables to run them over, by keys; `scattered` and `documents` run
-    /// only when named.
+    /// Tables to run them over, by keys; `scattered`, `documents`, and
+    /// `embeddings` run only when named.
     #[arg(long, value_enum, value_delimiter = ',')]
     table: Vec<TableName>,
     /// Tables to run them over, by values; the protobuf values are on long
@@ -1002,8 +1018,8 @@ struct Cli {
     row_group_rows: Option<usize>,
     /// Rows per data page of the tables written, the layout's when absent:
     /// a bound on every column's pages, which a value page bounded by bytes
-    /// meets first when its rows are few, so on the scattered and documents
-    /// tables it sizes the key pages alone. The manifest records it, as it
+    /// meets first when its rows are few, so on the scattered, documents,
+    /// and embeddings tables it sizes the key pages alone. The manifest records it, as it
     /// records `--row-group-rows`.
     #[arg(
         long,
@@ -1300,6 +1316,21 @@ const DOCUMENT_VALUE_BYTES: usize = 10_800;
 // Both builds' ids have scattered keys.
 const _: () = assert!(DOCUMENT_ROWS + DOCUMENT_ROWS / APPEND_DIVISOR <= SCATTERED_ID_SPACE);
 
+/// Files of the embeddings table, one per bucket, of
+/// `SCATTERED_ROWS_PER_FILE` rows each: enough rows that the embedding
+/// workload's 4.77 million distinct keys of one hour fit unsampled.
+const EMBEDDING_FILES: u64 = 128;
+
+/// Rows of the embeddings table's first build: 4,800,000.
+const EMBEDDING_ROWS: u64 = EMBEDDING_FILES * SCATTERED_ROWS_PER_FILE;
+
+/// Bytes per value of the embeddings table: 4,242, the mean of a
+/// production column of embeddings measured on 2026-11-08.
+const EMBEDDING_VALUE_BYTES: usize = 4_242;
+
+// Both builds' ids have scattered keys.
+const _: () = assert!(EMBEDDING_ROWS + EMBEDDING_ROWS / APPEND_DIVISOR <= SCATTERED_ID_SPACE);
+
 /// Bytes per value of the scattered table and of the large protobuf
 /// table: 4 KiB, a serving table's value, so a 64 KiB value page holds
 /// about sixteen.
@@ -1413,10 +1444,11 @@ const SHORT_RUN: Ordered = Ordered {
 /// followed by the append's number.
 const APPEND_PREFIX: &str = "append";
 
-/// The file size target of the scattered and documents tables: 256 MiB,
-/// above the ~155 MB a scattered bucket's incompressible rows take and the
-/// ~224 MB a documents bucket's rows take before compression, so the
-/// rolling writer keeps each bucket in one file.
+/// The file size target of the scattered, documents, and embeddings
+/// tables: 256 MiB, above the ~155 MB a scattered bucket's incompressible
+/// rows take and the ~224 MB a documents bucket's and ~160 MB an
+/// embeddings bucket's rows take before compression, so the rolling writer
+/// keeps each bucket in one file.
 const SCATTERED_FILE_BYTES: usize = 256 * 1024 * 1024;
 
 /// The column-index truncation of the scattered table: 256 bytes, what the
@@ -1454,7 +1486,7 @@ struct TableShape {
 /// Every table the program writes, the scattered one at
 /// `SCATTERED_BUCKETS` files; `shapes` gives them at the run's
 /// `--scattered-files`.
-const SHAPES: [TableShape; 13] = [
+const SHAPES: [TableShape; 14] = [
     TableShape {
         name: TableName::Long,
         key_type: KeyType::Long,
@@ -1544,6 +1576,17 @@ const SHAPES: [TableShape; 13] = [
         ordered: None,
     },
     TableShape {
+        name: TableName::Embeddings,
+        key_type: KeyType::String,
+        key_shape: KeyShape::Scattered,
+        key_bytes: SCATTERED_KEY_FIXED_BYTES,
+        value_bytes: EMBEDDING_VALUE_BYTES,
+        values: Values::Embedding,
+        rows: EMBEDDING_ROWS,
+        appended_rows: EMBEDDING_ROWS / APPEND_DIVISOR,
+        ordered: None,
+    },
+    TableShape {
         name: TableName::Ordered,
         key_type: KeyType::Long,
         key_shape: KeyShape::Sequential,
@@ -1610,7 +1653,7 @@ const VALUES_SEPARATOR: &str = "_";
 const FILES_SUFFIX: &str = "_files";
 
 /// Every table the program writes as the run writes it (`TableShape::at_run`).
-fn shapes() -> [TableShape; 13] {
+fn shapes() -> [TableShape; 14] {
     SHAPES.map(TableShape::at_run)
 }
 
@@ -1621,6 +1664,7 @@ impl TableName {
             Self::String => "string",
             Self::Scattered => "scattered",
             Self::Documents => "documents",
+            Self::Embeddings => "embeddings",
             Self::Ordered => "ordered",
             Self::OrderedLong => "ordered_long",
             Self::OrderedString => "ordered_string",
@@ -1644,7 +1688,11 @@ impl TableShape {
         };
         match self.values {
             Values::Random => keys,
-            Values::Text | Values::Protobuf | Values::ProtobufLarge | Values::Json => {
+            Values::Text
+            | Values::Protobuf
+            | Values::ProtobufLarge
+            | Values::Json
+            | Values::Embedding => {
                 format!("{keys}{VALUES_SEPARATOR}{}", self.values.as_str())
             }
         }
@@ -1737,6 +1785,7 @@ impl TableShape {
             | TableName::String
             | TableName::Scattered
             | TableName::Documents
+            | TableName::Embeddings
             | TableName::Ordered
             | TableName::OrderedLong
             | TableName::OrderedString
@@ -1762,6 +1811,7 @@ impl TableShape {
             | TableName::String
             | TableName::Scattered
             | TableName::Documents
+            | TableName::Embeddings
             | TableName::Ordered
             | TableName::OrderedLong
             | TableName::OrderedString => None,
@@ -1784,10 +1834,10 @@ impl TableShape {
     /// close to the raw size, inside the contract's 32 to 64 MiB. A text
     /// table keeps the bucket count of the random table with its key
     /// column, so the two differ in their values alone; its files come out
-    /// smaller by the values' compression. The scattered table has one
-    /// file of `SCATTERED_ROWS_PER_FILE` rows per bucket, and the documents
-    /// table one of `DOCUMENT_ROWS_PER_FILE`. The rolled and
-    /// appended tables take the buckets a contract table of their first
+    /// smaller by the values' compression. The scattered and embeddings
+    /// tables have one file of `SCATTERED_ROWS_PER_FILE` rows per bucket,
+    /// and the documents table one of `DOCUMENT_ROWS_PER_FILE`. The rolled
+    /// and appended tables take the buckets a contract table of their first
     /// build's rows has, which a compaction of them would write.
     fn buckets(self) -> u32 {
         let buckets = match self.name {
@@ -1801,22 +1851,24 @@ impl TableShape {
                 let row_bytes = approx::count(self.row_bytes());
                 (self.first_build_rows() * row_bytes).div_ceil(TARGET_FILE_BYTES_MAX)
             }
-            TableName::Scattered => self.rows.div_ceil(SCATTERED_ROWS_PER_FILE),
+            TableName::Scattered | TableName::Embeddings => {
+                self.rows.div_ceil(SCATTERED_ROWS_PER_FILE)
+            }
             TableName::Documents => self.rows.div_ceil(DOCUMENT_ROWS_PER_FILE),
         };
         u32::try_from(buckets).expect("a benchmark table has a few dozen buckets at most")
     }
 
-    /// The Parquet layout: the contract's, or for the scattered and
-    /// documents tables and the large protobuf table value pages bounded at
-    /// the contract's `VALUE_PAGE_BYTES` (the byte bound shortens the
-    /// writer's page-size check to every two rows, so a page overshoots it
-    /// by one value at most), and for the scattered and documents tables
-    /// files rolled at `SCATTERED_FILE_BYTES`; for the string-ordered table the column
-    /// index cut to `ORDER_INDEX_TRUNCATE_BYTES`, and for the rolled table
-    /// files rolled at `ROLLED_FILE_BYTES`; every table's row groups of the
-    /// run's `--row-group-rows` and its pages of `--page-rows` when it sets
-    /// them.
+    /// The Parquet layout: the contract's, or for the scattered, documents,
+    /// and embeddings tables and the large protobuf table value pages
+    /// bounded at the contract's `VALUE_PAGE_BYTES` (the byte bound shortens
+    /// the writer's page-size check to every two rows, so a page overshoots
+    /// it by one value at most), and for the scattered, documents, and
+    /// embeddings tables files rolled at `SCATTERED_FILE_BYTES`; for the
+    /// string-ordered table the column index cut to
+    /// `ORDER_INDEX_TRUNCATE_BYTES`, and for the rolled table files rolled
+    /// at `ROLLED_FILE_BYTES`; every table's row groups of the run's
+    /// `--row-group-rows` and its pages of `--page-rows` when it sets them.
     fn layout(self) -> FileLayout {
         let layout = self.table_layout();
         FileLayout {
@@ -1845,12 +1897,14 @@ impl TableShape {
                 ..FileLayout::contract()
             },
             TableName::Long | TableName::String => match self.values {
-                Values::Random | Values::Text | Values::Protobuf | Values::Json => {
-                    FileLayout::contract()
-                }
+                Values::Random
+                | Values::Text
+                | Values::Protobuf
+                | Values::Json
+                | Values::Embedding => FileLayout::contract(),
                 Values::ProtobufLarge => byte_pages,
             },
-            TableName::Scattered | TableName::Documents => FileLayout {
+            TableName::Scattered | TableName::Documents | TableName::Embeddings => FileLayout {
                 target_file_bytes: SCATTERED_FILE_BYTES,
                 column_index_truncate: Some(SCATTERED_COLUMN_INDEX_TRUNCATE),
                 ..byte_pages
@@ -1882,11 +1936,14 @@ impl TableShape {
     }
 
     /// Whether the command line selects the table: named by `--table`, or
-    /// `--table` absent and the table neither the scattered nor the
-    /// documents one, and its values among `values`.
+    /// `--table` absent and the table none of the scattered, documents, and
+    /// embeddings ones, and its values among `values`.
     fn selected(self, tables: &[TableName], values: &[Values]) -> bool {
         let named = if tables.is_empty() {
-            !matches!(self.name, TableName::Scattered | TableName::Documents)
+            !matches!(
+                self.name,
+                TableName::Scattered | TableName::Documents | TableName::Embeddings
+            )
         } else {
             tables.contains(&self.name)
         };
