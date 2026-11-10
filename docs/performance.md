@@ -332,11 +332,12 @@ The same memory holds many more hot rows than pages: a value page holds a
 hot row beside every row stored next to it, so where hot keys are
 scattered through the key order, as hashed or arbitrarily assigned keys
 are, most of a cached page is rows no caller requested. icetray charges
-each entry its key and value, held in one allocation, at the
-allocation's size, plus 160 bytes of overhead, so rows of a few hundred
-bytes or more spend most of the budget on values. icetray does not cache
-a value larger than one 64 KiB value page, and evicts a row read once
-before rows that keep being read.
+each entry its key and its value, each in an allocation of its own, at the
+allocations' sizes, plus 168 bytes of overhead, so rows of a few hundred
+bytes or more spend most of the budget on values, and a value whose length
+is an allocator size class, as 4 KiB is, takes no more. icetray does not
+cache a value larger than one 64 KiB value page, and evicts a row read
+once before rows that keep being read.
 
 icetray serves an entry only while the lookup's generation holds the
 entry's file and has not deleted its row, so a deleted or rewritten row

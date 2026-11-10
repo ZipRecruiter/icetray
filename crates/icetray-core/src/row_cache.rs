@@ -32,26 +32,27 @@ use crate::shard::Tally;
 /// displace thousands of narrow ones.
 pub(crate) const ROW_CACHE_MAX_VALUE_BYTES: u64 = VALUE_PAGE_BYTES;
 
-/// Bytes of a `quick_cache` slot: its hash, links, and the `Bytes`
-/// handles of its key and value, measured at about 120 bytes for rows of
-/// 100 bytes, with a key and a value of the same 32 bytes each, once the
-/// allocator's rounding of the value is taken out. A ghost keeps its slot
-/// and no entry, so it is charged this much.
-const ROW_SLOT_BYTES: u64 = 128;
+/// Bytes of a `quick_cache` slot beside the entry's key and value: its
+/// hash and links. A slot holding two 32-byte handles measured about 120
+/// bytes for rows of 100 bytes once the allocator's rounding of the value
+/// was taken out, so about 56, rounded up.
+const QUICK_CACHE_SLOT_BYTES: usize = 64;
 
-/// Bytes of the shared header the first clone of a cached `Bytes`
-/// allocates, which every entry that is read pays: `bytes`' `Shared`, a
-/// buffer pointer, its capacity, and a reference count.
+/// Bytes of a slot: `quick_cache`'s own (`QUICK_CACHE_SLOT_BYTES`), the
+/// entry's key handle, and its value, which holds where the value was read
+/// and a handle on the value's bytes. A ghost keeps its slot and no entry,
+/// so it is charged this much.
+const ROW_SLOT_BYTES: u64 =
+    approx::count(QUICK_CACHE_SLOT_BYTES + size_of::<EntryKey>() + size_of::<EntryValue>());
+
+/// Bytes of the shared header the first clone of a cached value's `Bytes`
+/// allocates, which every value entry that is read pays: `bytes`' `Shared`,
+/// a buffer pointer, its capacity, and a reference count.
 const SHARED_HEADER_LEN: usize = 24;
 
 /// What the shared header takes in jemalloc's size class
 /// (`SHARED_HEADER_LEN`).
 const SHARED_HEADER_BYTES: u64 = approx::count(size_class(SHARED_HEADER_LEN));
-
-/// Bytes charged per entry on top of the value's allocation: its slot
-/// (`ROW_SLOT_BYTES`) and the shared header a read allocates
-/// (`SHARED_HEADER_BYTES`).
-pub(crate) const ROW_ENTRY_OVERHEAD_BYTES: u64 = ROW_SLOT_BYTES + SHARED_HEADER_BYTES;
 
 /// The weight of an average entry, which `quick_cache` divides the budget by
 /// to choose how many shards to split into: what a value of about a
@@ -155,41 +156,31 @@ const fn size_class(len: usize) -> usize {
     len.next_multiple_of(spacing)
 }
 
-/// What an entry whose one allocation is `entry_len` bytes is charged
-/// against the budget: the allocation in jemalloc's size class, plus
-/// `ROW_ENTRY_OVERHEAD_BYTES`.
-fn charged(entry_len: usize) -> u64 {
-    approx::count(size_class(entry_len)) + ROW_ENTRY_OVERHEAD_BYTES
+/// What an entry is charged against the budget: its key's allocation of
+/// `key_len` bytes and its value's of `value_len` bytes (`None` for a
+/// cached null or a presence entry, which allocates no value), each in
+/// jemalloc's size class, its slot (`ROW_SLOT_BYTES`), and, for a value,
+/// the shared header a read allocates (`SHARED_HEADER_BYTES`).
+fn charged(key_len: usize, value_len: Option<usize>) -> u64 {
+    let value = value_len.map_or(0, |len| {
+        approx::count(size_class(len)) + SHARED_HEADER_BYTES
+    });
+    approx::count(size_class(key_len)) + value + ROW_SLOT_BYTES
 }
 
 /// What an entry for a table key of `key_len` bytes and a value of
 /// `value_len` bytes (`None` for a cached null or a presence entry) is
-/// charged (`charged`): its allocation holds the key, where it was read,
-/// and the value, `ENTRY_HEAD_BYTES` beside the two.
+/// charged (`charged`): its key's allocation holds `KEY_HEAD_BYTES` before
+/// the table key.
 #[cfg(test)]
 pub(crate) fn weigh(key_len: usize, value_len: Option<usize>) -> u64 {
-    charged(ENTRY_HEAD_BYTES + key_len + value_len.unwrap_or(0))
+    charged(KEY_HEAD_BYTES + key_len, value_len)
 }
 
-/// Bytes of an entry's allocation before its table key: the table's
+/// Bytes of an entry key's allocation before its table key: the table's
 /// number and the part of the row the entry is for (`Part::code`), four
 /// bytes each.
 const KEY_HEAD_BYTES: usize = 8;
-
-/// Bytes of an entry's allocation between its table key and its value:
-/// where the value was read (`Source`), the file's number and the row's
-/// position, eight bytes each, and what the entry holds (`HELD_*`), one.
-const SOURCE_BYTES: usize = 17;
-
-/// Bytes of an entry's allocation beside its table key and its value.
-const ENTRY_HEAD_BYTES: usize = KEY_HEAD_BYTES + SOURCE_BYTES;
-
-/// The held byte of an entry for a column whose value is null.
-const HELD_NULL: u8 = 0;
-/// The held byte of an entry for a column's value.
-const HELD_VALUE: u8 = 1;
-/// The held byte of a presence entry.
-const HELD_PRESENT: u8 = 2;
 
 /// What of a table key's row an entry is for: one of the table's value
 /// columns, by its place in the table's layout, or, for a presence-only
@@ -268,10 +259,10 @@ fn hash_address<H: Hasher>(table: u32, part: u32, key: &[u8], hasher: &mut H) {
 }
 
 /// A stored entry's key: its table's number, its part's code, and the
-/// table key's bytes (`Key::as_bytes`), the head of the entry's one
-/// allocation, which `EntryValue` shares.
+/// table key's bytes (`Key::as_bytes`), in an allocation apart from the
+/// value's.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct EntryKey(Bytes);
+struct EntryKey(Box<[u8]>);
 
 impl EntryKey {
     /// The four bytes at `at` as a number.
@@ -322,45 +313,15 @@ impl Equivalent<EntryKey> for Address<'_> {
     }
 }
 
-/// A stored entry's value: where it was read and what it holds
-/// (`SOURCE_BYTES`), then the value's bytes, the tail of the allocation
-/// `EntryKey` heads.
+/// A stored entry's value: where it was read and what it holds, its value's
+/// bytes in an allocation of their own, so a value whose length is a size
+/// class, as a 4 KiB value's is, takes that class and no more.
 #[derive(Clone, Debug)]
-struct EntryValue(Bytes);
-
-impl EntryValue {
-    /// Where the entry was read.
-    fn source(&self) -> Source {
-        let word = |at: usize| -> [u8; 8] {
-            self.0[at..at + 8]
-                .try_into()
-                .expect("an entry value holds its source")
-        };
-        Source {
-            file: FileNumber::from_le_bytes(word(0)),
-            position: RowPosition(u64::from_le_bytes(word(8))),
-        }
-    }
-
-    /// The entry as a lookup reads it, its value a handle on the entry's
-    /// allocation.
-    fn entry(&self) -> Entry {
-        let held = match self.0[SOURCE_BYTES - 1] {
-            HELD_NULL => Held::Null,
-            HELD_PRESENT => Held::Present,
-            HELD_VALUE => Held::Value(self.0.slice(SOURCE_BYTES..)),
-            other => unreachable!("an entry's held byte is a HELD_ constant, not {other}"),
-        };
-        Entry {
-            source: self.source(),
-            held,
-        }
-    }
-}
+struct EntryValue(Entry);
 
 /// An entry of `table`'s `part` at `key`, read at `source`, holding
-/// `held`, as one allocation its key and value share, so the entry keeps
-/// nothing of the page its value was read from.
+/// `held`, its value copied, so the entry keeps nothing of the page its
+/// value was read from.
 fn entry(
     table: u32,
     part: Part,
@@ -368,24 +329,18 @@ fn entry(
     source: Source,
     held: Caching<'_>,
 ) -> (EntryKey, EntryValue) {
-    let (held_byte, value) = match held {
-        Caching::Presence => (HELD_PRESENT, &[][..]),
-        Caching::Column(None) => (HELD_NULL, &[][..]),
-        Caching::Column(Some(value)) => (HELD_VALUE, value),
+    let mut address = Vec::with_capacity(KEY_HEAD_BYTES + key.len());
+    address.extend_from_slice(&table.to_le_bytes());
+    address.extend_from_slice(&part.code().to_le_bytes());
+    address.extend_from_slice(key);
+    let held = match held {
+        Caching::Presence => Held::Present,
+        Caching::Column(None) => Held::Null,
+        Caching::Column(Some(value)) => Held::Value(Bytes::copy_from_slice(value)),
     };
-    let key_len = KEY_HEAD_BYTES + key.len();
-    let mut bytes = Vec::with_capacity(ENTRY_HEAD_BYTES + key.len() + value.len());
-    bytes.extend_from_slice(&table.to_le_bytes());
-    bytes.extend_from_slice(&part.code().to_le_bytes());
-    bytes.extend_from_slice(key);
-    bytes.extend_from_slice(&source.file.to_le_bytes());
-    bytes.extend_from_slice(&source.position.0.to_le_bytes());
-    bytes.push(held_byte);
-    bytes.extend_from_slice(value);
-    let bytes = Bytes::from(bytes);
     (
-        EntryKey(bytes.slice(..key_len)),
-        EntryValue(bytes.slice(key_len..)),
+        EntryKey(address.into_boxed_slice()),
+        EntryValue(Entry { source, held }),
     )
 }
 
@@ -395,7 +350,11 @@ struct RowWeighter;
 
 impl Weighter<EntryKey, EntryValue> for RowWeighter {
     fn weight(&self, key: &EntryKey, value: &EntryValue) -> u64 {
-        charged(key.0.len() + value.0.len())
+        let value_len = match &value.0.held {
+            Held::Value(bytes) => Some(bytes.len()),
+            Held::Null | Held::Present => None,
+        };
+        charged(key.0.len(), value_len)
     }
 }
 
@@ -635,7 +594,7 @@ impl TableRows {
             .load()
             .cache
             .get(&address)
-            .map(|value| value.entry())
+            .map(|value| value.0)
     }
 
     /// Caches `part` of `key`'s row as read at `source`, holding `held`,
@@ -665,7 +624,7 @@ impl TableRows {
             .built
             .load()
             .cache
-            .remove_if(&address, |value| value.source() == source);
+            .remove_if(&address, |value| value.0.source == source);
     }
 
     /// Counts what one lookup did with the cache, on the calling thread's
@@ -996,21 +955,21 @@ mod tests {
         );
     }
 
-    /// An entry is charged its allocation in jemalloc's size class, its
-    /// head and key beside its value.
+    /// An entry is charged its key's and its value's allocations, each in
+    /// jemalloc's size class, so a 4 KiB value takes its class and no more,
+    /// plus its slot, and a value the shared header a read allocates.
     #[test]
     fn test_charged_rounds_to_jemalloc_size_classes() {
-        assert_eq!(charged(100), 112 + ROW_ENTRY_OVERHEAD_BYTES);
-        assert_eq!(charged(1029), 1280 + ROW_ENTRY_OVERHEAD_BYTES);
+        let overhead = ROW_SLOT_BYTES + SHARED_HEADER_BYTES;
+        assert_eq!(charged(16, Some(100)), 16 + 112 + overhead);
+        assert_eq!(charged(16, Some(1029)), 16 + 1280 + overhead);
+        assert_eq!(charged(16, Some(4096)), 16 + 4096 + overhead);
+        assert_eq!(charged(17, Some(4097)), 32 + 5120 + overhead);
         assert_eq!(
-            weigh(LONG_KEY_BYTES, Some(100)),
-            charged(ENTRY_HEAD_BYTES + LONG_KEY_BYTES + 100)
+            weigh(LONG_KEY_BYTES, Some(4096)),
+            charged(KEY_HEAD_BYTES + LONG_KEY_BYTES, Some(4096))
         );
-        assert_eq!(
-            weigh(LONG_KEY_BYTES, Some(100)),
-            160 + ROW_ENTRY_OVERHEAD_BYTES
-        );
-        assert_eq!(weigh(LONG_KEY_BYTES, None), 48 + ROW_ENTRY_OVERHEAD_BYTES);
+        assert_eq!(weigh(LONG_KEY_BYTES, None), 16 + ROW_SLOT_BYTES);
     }
 
     /// A row hit again after it was cached outlives any number of rows read
@@ -1145,9 +1104,11 @@ mod tests {
             let entries = cache.shape().entries_capacity;
             let held = entries + cache.0.built.load().ghosts.beside(entries);
             assert!(held <= budget, "{held} over {budget}");
+            let ghosts = cache.0.built.load().ghosts;
             assert!(
-                budget - held <= shards,
-                "the entries hold the rest, down to a multiple of the shards"
+                budget - held <= shards + ghosts.beside(shards) + 1,
+                "the entries hold the rest, down to a multiple of the shards \
+                 and the reserve beside them"
             );
         }
     }

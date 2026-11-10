@@ -130,12 +130,8 @@ impl FileNumber {
         Self(NEXT.fetch_add(1, AtomicOrdering::Relaxed))
     }
 
-    /// The number as eight bytes, as the row cache stores it.
-    pub(crate) fn to_le_bytes(self) -> [u8; 8] {
-        self.0.to_le_bytes()
-    }
-
-    /// The number `to_le_bytes` gave `bytes`.
+    /// The number whose eight bytes are `bytes`, for a test's entry.
+    #[cfg(test)]
     pub(crate) fn from_le_bytes(bytes: [u8; 8]) -> Self {
         Self(u64::from_le_bytes(bytes))
     }
