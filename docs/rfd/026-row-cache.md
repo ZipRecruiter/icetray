@@ -4,6 +4,10 @@
 > checks each hit against the generation, so it reads no key page for a
 > hit, and it caches presence-only lookups too.
 
+> Updated 2026-11-11: values of 1 KiB or more will live in slabs of
+> icetray's own size classes, and a hit will hand out a reference to the
+> value's slot. See RFD 030 (Cache slabs).
+
 ## Problem
 
 A lookup is for one row, but icetray reads a whole key page to find the
@@ -48,9 +52,11 @@ and will check each hit against the generation's files and deletes.
   pages alone. icetray always reads pages for an ordered table, since
   only the index and the pages show that a Scan's range is complete.
 - **What an entry weighs.** icetray charges an entry its key's and
-  value's bytes at the allocator's size, plus its overhead, so the
-  budget bounds the cache's memory (RFD 028 (Cache budget)). icetray
-  does not cache a value above a bound.
+  value's bytes at what their allocations cost, plus its overhead, so
+  the budget bounds the cache's memory (RFD 028 (Cache budget)). Until
+  the slabs of RFD 030 (Cache slabs) land, that is jemalloc's size
+  class; once they do, a value of 1 KiB or more is charged its slab's
+  size class. icetray does not cache a value above a bound.
 - **The library.** quick_cache, the fastest in a bake-off against foyer
   and segcache over rows of 100 bytes to 8 KiB, and the only one whose
   throughput grew under hot keys.

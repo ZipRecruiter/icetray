@@ -1,5 +1,8 @@
 # One page cache
 
+> Updated 2026-11-11: the memory level will hold pages in slabs and
+> charge each page what it costs. See RFD 030 (Cache slabs).
+
 ## Problem
 
 A process keeps two page caches. Key-value tables read value pages,
@@ -45,6 +48,12 @@ only the runs of pages neither holds.
   lives in the memory level alone, as a key-value table's do today.
 - **Counted.** The page cache's series lose their `cache` label, one page
   cache remaining.
+- **Memory.** The memory level will hold pages in the slabs of RFD 030
+  (Cache slabs) and charge each page what it costs, its slot or, outside
+  the slab classes, jemalloc's size class, so its part of the budget
+  bounds what it holds. Until the slabs land, it charges a page its
+  length and an overhead, less than jemalloc's size class for a page
+  just over a power of two.
 
 ## Alternatives Considered
 
