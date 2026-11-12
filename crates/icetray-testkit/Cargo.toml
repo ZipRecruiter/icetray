@@ -28,6 +28,7 @@ parquet = { workspace = true }
 pin-project-lite = { workspace = true }
 rand.workspace = true
 roaring = { workspace = true }
+rustix = { version = "1.1.6", features = ["fs", "param", "time"] }
 s3s = { workspace = true }
 s3s-fs = { workspace = true }
 serde.workspace = true

@@ -9,6 +9,8 @@
 
 use std::io;
 
+use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
 use crate::approx;
 use crate::config::Config;
 use crate::contract::PAGE_CACHE_DISK_BLOCK_BYTES;
@@ -53,7 +55,7 @@ pub fn needed_by(config: &Config) -> u64 {
 /// limit as unlimited and caps every process at `kern.maxfilesperproc`,
 /// which `getdtablesize` returns.
 pub fn limit() -> u64 {
-    let soft = current().rlim_cur;
+    let soft = bound(current().current);
     // SAFETY: `getdtablesize` takes no argument and reads the calling
     // process's own descriptor table size.
     let table = unsafe { libc::getdtablesize() };
@@ -66,45 +68,36 @@ pub fn limit() -> u64 {
 /// it was and is the error.
 pub fn raise() -> io::Result<u64> {
     let before = current();
-    if before.rlim_cur < before.rlim_max {
-        set(before.rlim_max, before.rlim_max)?;
+    if bound(before.current) < bound(before.maximum) {
+        set(Rlimit {
+            current: before.maximum,
+            maximum: before.maximum,
+        })?;
     }
     let granted = limit();
-    if current().rlim_cur > granted {
-        set(granted, before.rlim_max)?;
+    if bound(current().current) > granted {
+        set(Rlimit {
+            current: Some(granted),
+            maximum: before.maximum,
+        })?;
     }
     Ok(granted)
 }
 
-/// The process's `RLIMIT_NOFILE`.
-pub(crate) fn current() -> libc::rlimit {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a live, writable `rlimit` that nothing else borrows
-    // until the call returns, and the call writes only that struct.
-    let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
-    assert_eq!(
-        status, 0,
-        "getrlimit fails only for a bad pointer or resource, and both are fixed here"
-    );
-    limit
+/// A limit as a count, an unlimited one, which rustix states as `None`,
+/// as the largest.
+fn bound(limit: Option<u64>) -> u64 {
+    limit.unwrap_or(u64::MAX)
 }
 
-/// Sets the process's `RLIMIT_NOFILE` to `soft` under `hard`.
-pub(crate) fn set(soft: u64, hard: u64) -> io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: soft,
-        rlim_max: hard,
-    };
-    // SAFETY: `limit` is a live `rlimit` the call only reads.
-    let status = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+/// The process's `RLIMIT_NOFILE`.
+pub(crate) fn current() -> Rlimit {
+    getrlimit(Resource::Nofile)
+}
+
+/// Sets the process's `RLIMIT_NOFILE` to `limit`.
+pub(crate) fn set(limit: Rlimit) -> io::Result<()> {
+    setrlimit(Resource::Nofile, limit).map_err(io::Error::from)
 }
 
 /// Running a test body in a child process, for a test that changes the
@@ -227,14 +220,18 @@ mod tests {
         testing::in_child(
             "descriptors::tests::test_raise_lifts_the_soft_limit_to_what_the_kernel_grants",
             || {
-                let hard = current().rlim_max;
-                set(LOWERED, hard).unwrap();
+                let hard = current().maximum;
+                set(Rlimit {
+                    current: Some(LOWERED),
+                    maximum: hard,
+                })
+                .unwrap();
                 assert_eq!(limit(), LOWERED);
                 let raised = raise().unwrap();
                 assert!(raised > LOWERED, "{raised}");
                 assert_eq!(raised, limit());
-                assert_eq!(current().rlim_cur, raised);
-                assert_eq!(current().rlim_max, hard);
+                assert_eq!(current().current, Some(raised));
+                assert_eq!(current().maximum, hard);
             },
         );
     }
@@ -243,6 +240,6 @@ mod tests {
     fn test_limit_is_within_the_soft_limit() {
         let limit = limit();
         assert!(limit > 0);
-        assert!(limit <= current().rlim_cur);
+        assert!(limit <= bound(current().current));
     }
 }

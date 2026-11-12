@@ -150,17 +150,19 @@ impl Service<Uri> for TurmoilConnect {
                 .ok_or_else(|| std::io::Error::other("uri has no authority"))?
                 .as_str()
                 .to_string();
-            let io = TcpStream::connect(authority).await?;
+            let io = TokioIo::new(TcpStream::connect(authority).await?);
             Ok(TurmoilConnection { io })
         })
     }
 }
 
 pin_project! {
-    /// `turmoil::net::TcpStream` behind hyper's own I/O traits.
+    /// `turmoil::net::TcpStream` behind hyper's own I/O traits, through
+    /// hyper-util's `TokioIo`; a type of this crate's own, so it can
+    /// implement hyper-util's `Connection`.
     struct TurmoilConnection {
         #[pin]
-        io: TcpStream,
+        io: TokioIo<TcpStream>,
     }
 }
 
@@ -168,21 +170,9 @@ impl hyper::rt::Read for TurmoilConnection {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
-        // SAFETY: the cursor hands out uninitialized memory. tokio's `ReadBuf`
-        // tracks how many of those bytes the read initialized and filled, and
-        // only that many are advanced below, so no uninitialized byte is ever
-        // exposed as read data.
-        let mut read_buf = tokio::io::ReadBuf::uninit(unsafe { buf.as_mut() });
-        let filled = match tokio::io::AsyncRead::poll_read(self.project().io, cx, &mut read_buf) {
-            Poll::Ready(Ok(())) => read_buf.filled().len(),
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Pending => return Poll::Pending,
-        };
-        // SAFETY: `filled` counts bytes the read above initialized.
-        unsafe { buf.advance(filled) };
-        Poll::Ready(Ok(()))
+        hyper::rt::Read::poll_read(self.project().io, cx, buf)
     }
 }
 
@@ -192,15 +182,15 @@ impl hyper::rt::Write for TurmoilConnection {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        tokio::io::AsyncWrite::poll_write(self.project().io, cx, buf)
+        hyper::rt::Write::poll_write(self.project().io, cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        tokio::io::AsyncWrite::poll_flush(self.project().io, cx)
+        hyper::rt::Write::poll_flush(self.project().io, cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        tokio::io::AsyncWrite::poll_shutdown(self.project().io, cx)
+        hyper::rt::Write::poll_shutdown(self.project().io, cx)
     }
 }
 

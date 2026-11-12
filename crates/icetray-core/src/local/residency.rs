@@ -57,8 +57,8 @@ pub enum Unobservable {
         /// The process's effective user.
         euid: u32,
     },
-    /// Checking the file's owner or permissions, reading the page size,
-    /// mapping the file, or the `mincore` call failed.
+    /// Checking the file's owner or permissions, mapping the file, or the
+    /// `mincore` call failed.
     #[error("{0}")]
     Io(Arc<io::Error>),
 }
@@ -93,15 +93,12 @@ pub(crate) fn resident(
 ) -> Result<ResidentPages, Unobservable> {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: `geteuid` takes no argument, cannot fail, and reads only
-        // the calling process's credentials.
-        let euid = unsafe { libc::geteuid() };
-        observable_as(file, path, euid)?;
+        observable_as(file, path, rustix::process::geteuid().as_raw())?;
     }
     // macOS's `mincore` answers for any mapping, so only Linux checks.
     #[cfg(not(target_os = "linux"))]
     let _ = path;
-    let page = page_bytes()?;
+    let page = page_bytes();
     match Span::covering(range, page) {
         Some(span) => sample(file, &span, page),
         None => Ok(ResidentPages::default()),
@@ -123,42 +120,25 @@ fn observable_as(file: &File, path: &Path, euid: u32) -> Result<(), Unobservable
 }
 
 /// Whether this process's effective user may write the file at `path`.
-/// By path, since asking of a descriptor needs `AT_EMPTY_PATH`, which
-/// `faccessat2` (Linux 5.8) alone takes.
+/// By path, since asking of a descriptor needs `AT_EMPTY_PATH`. rustix
+/// asks `faccessat2` (Linux 5.8) for `AT_EACCESS`, and before 5.8 falls
+/// back to `faccessat` only for a process whose real and effective ids
+/// agree; a seccomp profile that refuses `faccessat2` with `EPERM` makes
+/// every such file report as not writable.
 #[cfg(target_os = "linux")]
 fn writable(path: &Path) -> io::Result<bool> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: `path` is a NUL-terminated string that outlives the call,
-    // which only reads it.
-    let status =
-        unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::W_OK, libc::AT_EACCESS) };
-    if status == 0 {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::EACCES | libc::EPERM | libc::EROFS) => Ok(false),
-        Some(_) | None => Err(error),
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
+    use rustix::io::Errno;
+    match accessat(CWD, path, Access::WRITE_OK, AtFlags::EACCESS) {
+        Ok(()) => Ok(true),
+        Err(Errno::ACCESS | Errno::PERM | Errno::ROFS) => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
 /// The platform's page size in bytes.
-pub(crate) fn page_bytes() -> io::Result<u64> {
-    sysconf_count(libc::_SC_PAGESIZE)
-}
-
-/// `sysconf(name)` for a count that is always stated and above zero, as
-/// the page size and the physical page count are: -1 is a failure errno
-/// names, and zero, which states nothing usable, is invalid data.
-pub(crate) fn sysconf_count(name: libc::c_int) -> io::Result<u64> {
-    // SAFETY: `sysconf` takes a constant name and reads no memory of ours.
-    let value = unsafe { libc::sysconf(name) };
-    match u64::try_from(value) {
-        Ok(0) => Err(io::Error::from(io::ErrorKind::InvalidData)),
-        Ok(count) => Ok(count),
-        Err(_) => Err(io::Error::last_os_error()),
-    }
+pub(crate) fn page_bytes() -> u64 {
+    approx::count(rustix::param::page_size())
 }
 
 /// The stretch of a file a mapping covers to sample a byte range: from the
@@ -266,7 +246,7 @@ mod tests {
     /// A file of `FILE_PAGES` pages just written under `dir`, open, its
     /// path, and its length.
     fn written(dir: &Path) -> (File, PathBuf, u64) {
-        let page = page_bytes().unwrap();
+        let page = page_bytes();
         let len = FILE_PAGES * page;
         let path = dir.join("pages");
         let mut file = File::create(&path).unwrap();
@@ -299,7 +279,7 @@ mod tests {
     fn test_resident_counts_the_pages_a_range_touches() {
         let dir = tempfile::tempdir().unwrap();
         let (file, path, len) = written(dir.path());
-        let page = page_bytes().unwrap();
+        let page = page_bytes();
         let inside_the_second_page = page + 1;
         let residency = resident(&file, &path, inside_the_second_page..len).unwrap();
         assert_eq!(residency.pages, FILE_PAGES - 1);
@@ -333,8 +313,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(read_only)).unwrap();
         let owner = file.metadata().unwrap().uid();
         let someone_else = owner.wrapping_add(1);
-        // SAFETY: `geteuid` takes no argument and cannot fail.
-        let root = unsafe { libc::geteuid() } == 0;
+        let root = rustix::process::geteuid().is_root();
         match observable_as(&file, &path, someone_else) {
             Ok(()) => assert!(root, "only root may write a read-only file"),
             Err(Unobservable::Foreign { owner: found, euid }) => {
@@ -369,13 +348,6 @@ mod tests {
         );
         assert_eq!(Span::covering(5..5, PAGE), None);
         assert_eq!(Span::covering(Range { start: 9, end: 5 }, PAGE), None);
-    }
-
-    #[test]
-    fn test_sysconf_count_reads_the_page_size_above_zero() {
-        let page = sysconf_count(libc::_SC_PAGESIZE).unwrap();
-        assert!(page.is_power_of_two(), "{page}");
-        assert_eq!(page_bytes().unwrap(), page);
     }
 
     #[test]
@@ -418,16 +390,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_resident_after_reading_half_back_counts_that_half() {
-        use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::FileExt as _;
         let dir = tempfile::tempdir().unwrap();
         let (file, path, len) = written(dir.path());
         crate::local::testing::evict(&path);
-        // SAFETY: `posix_fadvise` takes no pointer; the descriptor is
-        // `file`'s, open for the call. Offset 0 and length 0 cover the file.
-        let advised =
-            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
-        assert_eq!(advised, 0, "posix_fadvise failed");
+        // Offset 0 and no length cover the whole file.
+        rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::Random).unwrap();
         let half = len / 2;
         file.read_exact_at(&mut vec![0u8; approx::length(half)], 0)
             .unwrap();

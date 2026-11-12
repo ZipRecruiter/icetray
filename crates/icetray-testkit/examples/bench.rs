@@ -5415,27 +5415,16 @@ fn resident_pages(statm: &[u8]) -> u64 {
         .unwrap_or(0)
 }
 
-/// The kernel's page size, which `STATM` counts in, or zero when the
-/// system does not say.
+/// The kernel's page size, which `STATM` counts in.
 fn page_bytes() -> u64 {
-    // SAFETY: `sysconf` reads a system constant and touches no memory of
-    // the caller's.
-    u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(0)
+    icetray_core::approx::count(rustix::param::page_size())
 }
 
-/// The calling thread's user and system CPU time so far, or zero when the
-/// clock cannot be read.
+/// The calling thread's user and system CPU time so far.
 fn thread_cpu() -> Duration {
-    // SAFETY: `clock_gettime` writes one `timespec` into the zeroed struct
-    // it is handed and reads nothing else.
-    let now = unsafe {
-        let mut now: libc::timespec = std::mem::zeroed();
-        if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut now) != 0 {
-            return Duration::ZERO;
-        }
-        now
-    };
-    clock_time(now)
+    clock_time(rustix::time::clock_gettime(
+        rustix::time::ClockId::ThreadCPUTime,
+    ))
 }
 
 /// The process's user and system CPU time so far, and its peak resident
@@ -5476,7 +5465,7 @@ fn cpu_time(value: libc::timeval) -> Duration {
 
 /// A `timespec` from `clock_gettime` as a `Duration`, at the kernel's
 /// boundary, where the time arrives as bare seconds and nanoseconds.
-fn clock_time(value: libc::timespec) -> Duration {
+fn clock_time(value: rustix::time::Timespec) -> Duration {
     Duration::from_secs(u64::try_from(value.tv_sec).unwrap_or(0))
         + Duration::from_nanos(u64::try_from(value.tv_nsec).unwrap_or(0))
 }

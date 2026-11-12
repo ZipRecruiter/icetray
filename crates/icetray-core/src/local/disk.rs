@@ -265,32 +265,16 @@ impl ChunkFile {
     /// `noatime` not at all.
     #[cfg(target_os = "linux")]
     fn read_cached(&self, offset: u64, len: u64) -> Option<Bytes> {
-        use std::os::fd::AsRawFd as _;
-        /// One buffer takes the whole range.
-        const BUFFERS: libc::c_int = 1;
-        let offset = libc::off_t::try_from(offset).ok()?;
+        use rustix::io::{ReadWriteFlags, preadv2};
         let mut buf = vec![0u8; approx::length(len)];
-        let target = libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: buf.len(),
-        };
-        // SAFETY: `target` describes `buf`: a live allocation of
-        // `iov_len` initialized bytes, which nothing else borrows or moves
-        // until the call returns, and `preadv2` writes at most `iov_len`
-        // bytes into it. `BUFFERS` counts the one `iovec` passed. The
-        // descriptor is `self.file`'s, which the `&self` borrow keeps open
-        // for the call. An unsupported flag is `EOPNOTSUPP`, not undefined
-        // behavior.
-        let read = unsafe {
-            libc::preadv2(
-                self.file.as_raw_fd(),
-                &raw const target,
-                BUFFERS,
-                offset,
-                libc::RWF_NOWAIT,
-            )
-        };
-        (usize::try_from(read).ok()? == buf.len()).then(|| Bytes::from(buf))
+        let read = preadv2(
+            &self.file,
+            &mut [std::io::IoSliceMut::new(&mut buf)],
+            offset,
+            ReadWriteFlags::NOWAIT,
+        )
+        .ok()?;
+        (read == buf.len()).then(|| Bytes::from(buf))
     }
 
     /// `fault` at this chunk file's path.
@@ -590,7 +574,7 @@ mod tests {
         let end = std::fs::metadata(&path).unwrap().len();
         assert_eq!(disk.chunks(), start..end);
         assert_eq!(disk.path(), path);
-        let page = super::residency::page_bytes().unwrap();
+        let page = super::residency::page_bytes();
         let pages = end.div_ceil(page) - start / page;
         assert_eq!(
             disk.resident().unwrap(),

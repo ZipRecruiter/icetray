@@ -185,14 +185,8 @@ fn blocks(chosen: &[u64], page: u64) -> SweepResult<Vec<u64>> {
 }
 
 /// The platform's page size in bytes.
-fn page_bytes() -> io::Result<u64> {
-    // SAFETY: `sysconf` takes a constant name and reads no memory of ours.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    match u64::try_from(page) {
-        Ok(0) => Err(io::Error::from(io::ErrorKind::InvalidData)),
-        Ok(page) => Ok(page),
-        Err(_) => Err(io::Error::last_os_error()),
-    }
+fn page_bytes() -> u64 {
+    approx::count(rustix::param::page_size())
 }
 
 /// One chunk file's key chunks, open for eviction and warming.
@@ -322,7 +316,7 @@ async fn main() -> SweepResult<()> {
     } else {
         cli.resident_per_mille.clone()
     };
-    for block in blocks(&cli.evict_block, page_bytes()?)? {
+    for block in blocks(&cli.evict_block, page_bytes())? {
         for &target in &points {
             let eviction = choose(&regions, block, target, &mut rng);
             for (kind, keys) in [(Kind::Hit, &hits), (Kind::Miss, &misses)] {
@@ -463,18 +457,13 @@ fn evict(regions: &[Region], eviction: &Eviction) -> io::Result<()> {
 /// Drops the pages wholly inside `range` of `file` from the page cache.
 #[cfg(target_os = "linux")]
 fn drop_pages(file: &File, range: &Range<u64>) -> io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    let offset = libc::off_t::try_from(range.start).map_err(io::Error::other)?;
-    let len = libc::off_t::try_from(range.end - range.start).map_err(io::Error::other)?;
-    // SAFETY: `posix_fadvise` takes no pointer; the descriptor is `file`'s,
-    // open for the call.
-    let advised =
-        unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_DONTNEED) };
-    if advised == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(advised))
-    }
+    // An empty range is no length, which `fadvise` takes as the rest of
+    // the file.
+    let Some(len) = std::num::NonZeroU64::new(range.end - range.start) else {
+        return Ok(());
+    };
+    rustix::fs::fadvise(file, range.start, Some(len), rustix::fs::Advice::DontNeed)
+        .map_err(io::Error::from)
 }
 
 /// No platform but Linux drops a file's pages on request.

@@ -8,10 +8,11 @@
 
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Component, Path};
 
 use crate::index::saturating_sum;
-use crate::local::{page_bytes, sysconf_count};
+use crate::local::page_bytes;
 
 /// Where the cgroup filesystem is mounted, under the root.
 const CGROUP_MOUNT: &str = "sys/fs/cgroup";
@@ -98,8 +99,21 @@ fn host_bytes() -> Option<u64> {
     // intentional: a host whose memory cannot be read leaves the cgroup's
     // limit, or none, which the caller logs.
     let pages = sysconf_count(libc::_SC_PHYS_PAGES).ok()?;
-    let page = page_bytes().ok()?;
-    pages.checked_mul(page)
+    pages.checked_mul(page_bytes())
+}
+
+/// `sysconf(name)` for a count that is always stated and above zero, as
+/// the physical page count is: -1 is a failure errno
+/// names, and zero, which states nothing usable, is invalid data. rustix
+/// has no `sysconf`.
+fn sysconf_count(name: libc::c_int) -> io::Result<u64> {
+    // SAFETY: `sysconf` takes a constant name and reads no memory of ours.
+    let value = unsafe { libc::sysconf(name) };
+    match u64::try_from(value) {
+        Ok(0) => Err(io::Error::from(io::ErrorKind::InvalidData)),
+        Ok(count) => Ok(count),
+        Err(_) => Err(io::Error::last_os_error()),
+    }
 }
 
 /// The memory limit the process's cgroup sets under `root`: the cgroup v2
@@ -219,6 +233,13 @@ mod tests {
     /// What cgroup v1 holds for a group with no limit: `i64::MAX` rounded
     /// down to a 4 KiB page.
     const V1_UNLIMITED: u64 = 0x7FFF_FFFF_FFFF_F000;
+
+    #[test]
+    fn test_sysconf_count_reads_the_page_size_rustix_reads() {
+        let page = sysconf_count(libc::_SC_PAGESIZE).unwrap();
+        assert!(page.is_power_of_two(), "{page}");
+        assert_eq!(page_bytes(), page);
+    }
 
     /// A root under `dir` whose `/proc/self/cgroup` holds `membership`.
     fn root_with(dir: &Path, membership: &str) -> std::path::PathBuf {

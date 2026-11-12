@@ -3,10 +3,10 @@
 ## Problem
 
 icetray has `unsafe` blocks in `icetray-core` and the testkit and no rule
-for when one is acceptable. Most call the operating system: file
-descriptor limits, `preadv2`, `posix_fadvise`, `mincore` over a mapping.
-Others wrap the allocator to count allocations in tests and benchmarks,
-or hand a reader uninitialized memory. A mistake in a system call often
+for when one is acceptable. Most call the operating system: the size of
+the descriptor table, the physical page count, `mincore` over a mapping,
+macOS's memory queries. Others wrap the allocator to count allocations
+in tests and benchmarks. A mistake in a system call often
 fails loudly, with an error code or a crash, though a wrong length passed
 to one can corrupt memory as silently as any other mistake. A mistake in
 code that manages memory can corrupt a value another lookup returns and
@@ -75,22 +75,19 @@ alone.
 
 ## Consequences
 
-The `unsafe` already in icetray predates this decision and has not been
-assessed against it: the system calls in `local/residency`,
-`local/disk`, `local/testing`, and `descriptors`; the counting allocator
-in `deletes/bound`'s tests; and in the testkit, the benchmark's counting
-allocator and system calls, the residency example's system calls,
-`headroom`'s memory queries, and `sim`'s reads into uninitialized
-buffers. A maintainer assesses each module and then names it in an RFD,
-rewrites it without `unsafe`, or records it here as exempt. rustix has
-safe forms of most of those system calls; the residency mapping's
-`mmap` and `mincore`, `getdtablesize`, the physical page count's
-`sysconf`, `getrusage`, and the macOS memory queries have none there,
-and the counting allocators implement a trait that is itself `unsafe`.
-Every block
-among them already carries a `SAFETY` comment. `local/residency`'s
-mapping is memory a system call manages, which Miri may not be able to
-run, so its assessment says what checks it instead.
+The `unsafe` already in icetray predates this decision. Where rustix
+has a safe form of a system call, icetray calls that instead. What
+remains has not been assessed against this decision: `local/residency`'s
+mapping, whose `mmap`, `mincore`, and `munmap` rustix has no safe form
+of; `getdtablesize` in `descriptors` and the physical page count's
+`sysconf` in `memory`, which rustix lacks; the counting allocators in
+`deletes/bound`'s tests and the benchmark, which implement a trait that
+is itself `unsafe`; and in the testkit, the benchmark's `getrusage` and
+`headroom`'s macOS memory queries. A maintainer assesses each module and
+then names it in an RFD, rewrites it without `unsafe`, or records it
+here as exempt. Every block among them carries a `SAFETY` comment.
+`local/residency`'s mapping is memory a system call manages, which Miri
+may not be able to run, so its assessment says what checks it instead.
 
 Nothing mechanical stops `unsafe` from appearing in a module no RFD
 names; review does. A feature that needs `unsafe` needs an RFD first,

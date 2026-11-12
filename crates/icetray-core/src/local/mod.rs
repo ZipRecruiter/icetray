@@ -39,7 +39,7 @@ use format::{
 };
 pub(crate) use format::{Rejection, chunk_file_bytes};
 use prost::Message as _;
-pub(crate) use residency::{ResidentPages, Unobserved, page_bytes, sysconf_count};
+pub(crate) use residency::{ResidentPages, Unobserved, page_bytes};
 use sha2::{Digest as _, Sha256};
 
 use crate::approx;

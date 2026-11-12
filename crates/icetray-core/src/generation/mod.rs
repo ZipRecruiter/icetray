@@ -6386,7 +6386,7 @@ mod tests {
             .load(&table.config(Residency::Disk, None), Some(&local), None)
             .await
             .unwrap();
-        let page = crate::local::page_bytes().unwrap();
+        let page = crate::local::page_bytes();
         let pages: u64 = disk
             .identities()
             .iter()

@@ -3238,7 +3238,11 @@ mod tests {
                     .enable_all()
                     .build()
                     .unwrap();
-                descriptors::set(LOWERED_LIMIT, descriptors::current().rlim_max).unwrap();
+                descriptors::set(rustix::process::Rlimit {
+                    current: Some(LOWERED_LIMIT),
+                    maximum: descriptors::current().maximum,
+                })
+                .unwrap();
                 let opened = runtime.block_on(PageCache::new(ROOMY_BYTES, Some(level)));
                 let Err(Error::Cache(CacheError::DescriptorLimit {
                     limit,
