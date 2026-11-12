@@ -39,9 +39,9 @@ pub const READ_BACK_LIMIT_BYTES: u64 = 16 << 20;
 
 /// The most bytes of the process's memory the kernel may come to hold
 /// compressed or swapped out during one run, beyond what it held when the
-/// run's fill began, before the benchmark stops, on a platform that does
-/// not count what it reads back (`OutOfRam::read_back`): under 1 percent
-/// of the budgets a sweep measures.
+/// run began, before the benchmark stops, on a platform that does not
+/// count what it reads back (`OutOfRam::read_back`): 3 percent of a 2 GiB
+/// budget, and under 1 percent from 8 GiB.
 pub const PUSHED_OUT_LIMIT_BYTES: u64 = 64 << 20;
 
 /// Bytes in the kibibyte Linux's `/proc` files count in.

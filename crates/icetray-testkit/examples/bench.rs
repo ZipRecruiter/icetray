@@ -141,7 +141,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -1912,15 +1912,21 @@ impl TableShape {
         }
     }
 
-    /// Ids between two keys of the pass that fills the warm cache: every
-    /// id when value pages are bounded by bytes, since such a page holds a
-    /// few rows of its bucket, which a stride would step over, and every id
-    /// of the ordered table, whose page holds the runs of a few keys of its
-    /// bucket; `PRIME_STRIDE` under the contract's pages otherwise.
+    /// Ids between two keys of the pass that fills the warm cache:
+    /// `PRIME_STRIDE` for a key-value table whose value pages hold at least
+    /// the contract's rows, and every id otherwise, since a page bounded by
+    /// bytes, or by `--page-rows` below the contract's, holds a few rows of
+    /// its bucket, which a stride would step over, as the ordered table's
+    /// page holds the runs of a few keys of its bucket.
     fn prime_stride(self) -> u64 {
-        match (self.ordered, self.layout().page_bytes) {
-            (Some(_), _) | (None, Some(_)) => EVERY_ID_STRIDE,
-            (None, None) => PRIME_STRIDE,
+        let layout = self.layout();
+        let contract_pages = self.ordered.is_none()
+            && layout.page_bytes.is_none()
+            && layout.page_rows >= FileLayout::contract().page_rows;
+        if contract_pages {
+            PRIME_STRIDE
+        } else {
+            EVERY_ID_STRIDE
         }
     }
 
@@ -2384,6 +2390,10 @@ struct Served {
     /// The process's resident set around the pass that filled or primed
     /// the caches before a run measured them (`Filled`).
     filled: Filled,
+    /// What the process held when the last window measured on this table
+    /// ended, where the next row's out-of-RAM check starts (`Memory::of`);
+    /// `None` before any window, when the check starts at `filled`.
+    checked: Mutex<Option<Snapshot>>,
     /// The local directory under the Disk tier, whose chunk files the
     /// sizing reports.
     local: Option<Arc<LocalDir>>,
@@ -2579,6 +2589,7 @@ async fn serve(
         row_cache,
         budget,
         filled: Filled::unfilled(),
+        checked: Mutex::new(None),
         local,
         rounds,
         gets: None,
@@ -3695,6 +3706,10 @@ struct Memory {
     page_usage: u64,
     pages: u64,
     filled: Filled,
+    /// Where the row's out-of-RAM check starts: the end of the window
+    /// measured before it on the same table, or the start of the table's
+    /// fill for its first.
+    from: Snapshot,
     end: Snapshot,
     rss_peak: u64,
     /// Whether the run's key-value tables read through the row cache, the
@@ -3706,6 +3721,13 @@ impl Memory {
     /// `served`'s caches as they are now, after a window whose resident
     /// set peaked at `rss_peak`.
     fn of(served: &Served, rss_peak: u64) -> Self {
+        let end = Snapshot::now();
+        let from = served
+            .checked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(end)
+            .unwrap_or(served.filled.before);
         Self {
             row_budget: served.budget.row_bytes,
             page_budget: served.budget.page_bytes,
@@ -3714,7 +3736,8 @@ impl Memory {
             page_usage: served.cache.usage(),
             pages: served.cache.pages(),
             filled: served.filled,
-            end: Snapshot::now(),
+            from,
+            end,
             rss_peak,
             rows_read: served.budget.row_bytes > 0,
         }
@@ -3722,14 +3745,16 @@ impl Memory {
 
     /// The bytes the fill made jemalloc allocate, over the row entries
     /// held at the window's end: an entry's whole cost, its share of the
-    /// page cache's growth beside it included; `None` without row entries.
+    /// page cache's growth beside it included; `None` without row entries,
+    /// or without a fill that allocated, as a cold scenario's.
     fn allocated_per_row_entry(self) -> Option<f64> {
         let grown = self
             .filled
             .after
             .allocated
             .saturating_sub(self.filled.before.allocated);
-        (self.rows_read && self.row_entries > 0).then(|| approx::ratio(grown, self.row_entries))
+        (self.rows_read && self.row_entries > 0 && grown > 0)
+            .then(|| approx::ratio(grown, self.row_entries))
     }
 
     fn to_json(self) -> Json {
@@ -5821,18 +5846,19 @@ fn stop_if_out_of_ram(what: &str, from: Snapshot, to: Snapshot) -> bool {
 }
 
 /// Prints `run`'s row, and stops the program measuring when the kernel
-/// pushed the process out of RAM between the start of the row's fill and
+/// pushed the process out of RAM between the end of the row before it on
+/// the same table, or the start of the table's fill for its first row, and
 /// the end of its window (`stop_if_out_of_ram`).
 fn print_row(run: &Measured) {
     eprintln!("{}", row(run));
     let what = format!(
-        "the fill and window of {} {} {}",
+        "the window of {} {} {} and what ran since the row before it or the fill",
         run.label.scenario.name(),
         run.case.as_ref().map_or("-", |case| case.label.as_str()),
         run.label.mode.name()
     );
     let memory = run.window.memory;
-    stop_if_out_of_ram(&what, memory.filled.before, memory.end);
+    stop_if_out_of_ram(&what, memory.from, memory.end);
 }
 
 fn row(run: &Measured) -> String {
@@ -6282,6 +6308,7 @@ async fn serve_reference(
         row_cache,
         budget,
         filled: Filled::unfilled(),
+        checked: Mutex::new(None),
         local,
         rounds: counted,
         gets: logged,
