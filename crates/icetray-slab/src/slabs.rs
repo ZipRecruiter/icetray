@@ -4,7 +4,8 @@
 use std::collections::BTreeSet;
 use std::iter;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::time::Instant;
 
 use bytes::Bytes;
 
@@ -24,6 +25,41 @@ impl<R> Clone for Slabs<R> {
             pool: Arc::clone(&self.pool),
         }
     }
+}
+
+/// A slab class, by its index among its slabs' classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassId(u16);
+
+impl ClassId {
+    /// The class at `index` among its slabs' classes.
+    fn new(index: usize) -> ClassId {
+        ClassId(u16::try_from(index).expect("slabs hold fewer than 2^16 classes"))
+    }
+
+    /// The class's index among its slabs' classes.
+    fn index(self) -> usize {
+        usize::from(self.0)
+    }
+}
+
+/// A held slot of a chunk that `Slabs::empty_sparsest` marked as being
+/// emptied.
+#[derive(Debug)]
+pub struct Emptied<R> {
+    /// The record the slot was stored with.
+    pub record: R,
+    /// The slot's address, which `is_slot` compares with a `Bytes`'.
+    pub at: usize,
+}
+
+/// Whether `bytes` start at `at`, the address of a slot in an `Emptied`:
+/// whether they are that slot's bytes, so a cache removes an entry only
+/// while it still holds the slot. Once the slot's chunk is freed, other
+/// memory may take its address, so a match can name another value; the
+/// cost of that is one entry evicted.
+pub fn is_slot(bytes: &[u8], at: usize) -> bool {
+    bytes.as_ptr().addr() == at
 }
 
 impl<R: Clone + Send + Sync + 'static> Slabs<R> {
@@ -46,6 +82,9 @@ impl<R: Clone + Send + Sync + 'static> Slabs<R> {
                 classes,
                 chunk_bytes: AtomicU64::new(0),
                 held_slots: AtomicU64::new(0),
+                uncharged_bytes: AtomicU64::new(0),
+                waiting_bytes: AtomicU64::new(0),
+                lock_wait_nanos: AtomicU64::new(0),
             }),
         }
     }
@@ -73,6 +112,52 @@ impl<R: Clone + Send + Sync + 'static> Slabs<R> {
     pub fn held_slots(&self) -> u64 {
         self.pool.held_slots.load(Ordering::Relaxed)
     }
+
+    /// Bytes the slabs hold that no value is charged for: the free slots
+    /// of chunks not being emptied, and the whole of every chunk being
+    /// emptied. A cache's capacity for its entries is its budget less this.
+    pub fn uncharged_bytes(&self) -> u64 {
+        self.pool.uncharged_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the chunks being emptied, which wait for their last held
+    /// slot to drop.
+    pub fn waiting_bytes(&self) -> u64 {
+        self.pool.waiting_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Of the classes whose free slots in chunks not being emptied hold
+    /// more than `free_bytes`, the one whose free slots hold the most.
+    /// `None` when no class's do.
+    pub fn class_over(&self, free_bytes: u64) -> Option<ClassId> {
+        self.pool
+            .classes
+            .iter()
+            .map(|class| class.free_bytes.load(Ordering::Relaxed))
+            .enumerate()
+            .filter(|&(_, free)| free > free_bytes)
+            .max_by_key(|&(_, free)| free)
+            .map(|(index, _)| ClassId::new(index))
+    }
+
+    /// Marks the chunk of `class` with the fewest held slots, among those
+    /// with a free slot and not being emptied, as being emptied, and
+    /// returns each of its held slots' records and addresses. No store
+    /// lands in it again, and the slabs free it when its last held slot
+    /// drops, which the caller hastens by dropping the entries that hold
+    /// the slots. A chunk with no free slot strands no memory, so when
+    /// every chunk of the class is full, or it has none, nothing is
+    /// emptied and the result is empty. `class` is one of these slabs',
+    /// from `class_over`.
+    pub fn empty_sparsest(&self, class: ClassId) -> Vec<Emptied<R>> {
+        self.pool.empty_sparsest(class.index())
+    }
+
+    /// Nanoseconds that stores, frees, and emptying spent waiting for a
+    /// class's lock, counted only from a `try_lock` that found it held.
+    pub fn lock_wait_nanos(&self) -> u64 {
+        self.pool.lock_wait_nanos.load(Ordering::Relaxed)
+    }
 }
 
 /// The slabs and their totals. The totals change under a class's lock and
@@ -85,25 +170,53 @@ struct Pool<R> {
     chunk_bytes: AtomicU64,
     /// Slots held, in every chunk.
     held_slots: AtomicU64,
+    /// Bytes of free slots in chunks not being emptied, and of every chunk
+    /// being emptied.
+    uncharged_bytes: AtomicU64,
+    /// Bytes of every chunk being emptied.
+    waiting_bytes: AtomicU64,
+    /// Nanoseconds spent waiting for a class's lock that `try_lock` found
+    /// held.
+    lock_wait_nanos: AtomicU64,
 }
 
 impl<R: Send + 'static> Pool<R> {
+    /// The lock of class `class`, timing the wait when another thread
+    /// holds it.
+    fn lock(&self, class: usize) -> MutexGuard<'_, ClassState<R>> {
+        let state = &self.classes[class].state;
+        match state.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                let waiting = Instant::now();
+                let guard = state.lock().unwrap_or_else(PoisonError::into_inner);
+                let waited = u64::try_from(waiting.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.lock_wait_nanos.fetch_add(waited, Ordering::Relaxed);
+                guard
+            }
+        }
+    }
+
     /// A free slot of class `class`, now held with `record`, and its chunk:
     /// the fullest chunk with room, or a new chunk when none has room. The
     /// caller fills the slot after the class's lock is released, since
-    /// nothing refers to it until its store returns. Any record the slot
-    /// still had drops after the lock is released.
+    /// nothing refers to it until its store returns. Between reserving the
+    /// slot and releasing the lock nothing can panic, since a panic there
+    /// would strand the slot. Any record the slot still had drops after the
+    /// lock is released.
     fn reserve(&self, class: usize, record: R) -> (Reserved, ChunkId) {
         let slab = &self.classes[class];
         let (reserved, id, _replaced) = {
-            let mut guard = slab.lock();
+            let mut guard = self.lock(class);
             let state = &mut *guard;
             let id = if let Some(&(_, id)) = state.room.last() {
                 id
             } else {
                 let chunk = ChunkState::new(Chunk::new(slab.slot_bytes, slab.slots), slab.slots);
                 self.chunk_bytes
-                    .fetch_add(count(chunk.chunk.bytes()), Ordering::Relaxed);
+                    .fetch_add(slab.chunk_charge, Ordering::Relaxed);
+                self.add_free(slab, slab.chunk_charge);
                 state.add(chunk)
             };
             let chunk = state.chunks[id.index()]
@@ -120,9 +233,57 @@ impl<R: Send + 'static> Pool<R> {
                 state.room.insert((chunk.chunk.held(), id));
             }
             self.held_slots.fetch_add(1, Ordering::Relaxed);
+            self.sub_free(slab, slab.slot_charge);
             (reserved, id, replaced)
         };
         (reserved, id)
+    }
+
+    /// `Slabs::empty_sparsest` for class `class`. The records leave in the
+    /// result, so none drops under the lock.
+    fn empty_sparsest(&self, class: usize) -> Vec<Emptied<R>> {
+        let slab = &self.classes[class];
+        let mut guard = self.lock(class);
+        let state = &mut *guard;
+        let Some(sparsest) = state.room.pop_first() else {
+            return Vec::new();
+        };
+        let (held, id) = sparsest;
+        let chunk = state.chunks[id.index()]
+            .as_mut()
+            .expect("a chunk in the set of chunks with room is in its class");
+        chunk.emptying = true;
+        let free = slab.chunk_charge - u64::from(held) * slab.slot_charge;
+        slab.free_bytes.fetch_sub(free, Ordering::Relaxed);
+        self.uncharged_bytes
+            .fetch_add(slab.chunk_charge - free, Ordering::Relaxed);
+        self.waiting_bytes
+            .fetch_add(slab.chunk_charge, Ordering::Relaxed);
+        let ChunkState { chunk, records, .. } = chunk;
+        records
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                record.take().map(|record| Emptied {
+                    record,
+                    at: chunk.slot_addr(index),
+                })
+            })
+            .collect()
+    }
+
+    /// Counts `bytes` more of class `slab`'s free slots in chunks not being
+    /// emptied.
+    fn add_free(&self, slab: &Class<R>, bytes: u64) {
+        slab.free_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.uncharged_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Counts `bytes` fewer of class `slab`'s free slots in chunks not
+    /// being emptied.
+    fn sub_free(&self, slab: &Class<R>, bytes: u64) {
+        slab.free_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.uncharged_bytes.fetch_sub(bytes, Ordering::Relaxed);
     }
 }
 
@@ -131,8 +292,10 @@ impl<R: Send + 'static> Release for Pool<R> {
     /// chunk when no slot in it is held. The record and the chunk drop
     /// after the class's lock is released.
     fn release(&self, returning: Returning<'_, Self>) {
+        let class = returning.class();
+        let slab = &self.classes[class];
         let (_record, _freed) = {
-            let mut guard = self.classes[returning.class()].lock();
+            let mut guard = self.lock(class);
             let state = &mut *guard;
             let id = returning.chunk();
             let entry = &mut state.chunks[id.index()];
@@ -144,13 +307,25 @@ impl<R: Send + 'static> Release for Pool<R> {
             let record = chunk.records[index].take();
             state.room.remove(&(held, id));
             self.held_slots.fetch_sub(1, Ordering::Relaxed);
+            let emptying = chunk.emptying;
+            if !emptying {
+                self.add_free(slab, slab.slot_charge);
+            }
             let freed = if chunk.chunk.held() == 0 {
                 self.chunk_bytes
-                    .fetch_sub(count(chunk.chunk.bytes()), Ordering::Relaxed);
+                    .fetch_sub(slab.chunk_charge, Ordering::Relaxed);
+                if emptying {
+                    self.waiting_bytes
+                        .fetch_sub(slab.chunk_charge, Ordering::Relaxed);
+                    self.uncharged_bytes
+                        .fetch_sub(slab.chunk_charge, Ordering::Relaxed);
+                } else {
+                    self.sub_free(slab, slab.chunk_charge);
+                }
                 state.free_ids.push(id);
                 entry.take()
             } else {
-                if !chunk.emptying {
+                if !emptying {
                     state.room.insert((chunk.chunk.held(), id));
                 }
                 None
@@ -160,31 +335,38 @@ impl<R: Send + 'static> Release for Pool<R> {
     }
 }
 
-/// One slab class's chunks, under one lock.
+/// One slab class's chunks, under one lock, and its free slots' total.
 struct Class<R> {
     /// The bytes of each slot.
     slot_bytes: usize,
     /// The slots in each chunk.
     slots: usize,
+    /// `slot_bytes` as the totals count it.
+    slot_charge: u64,
+    /// The bytes of each chunk as the totals count them.
+    chunk_charge: u64,
+    /// Bytes of free slots in the class's chunks not being emptied. Changes
+    /// under `state`'s lock, read without it.
+    free_bytes: AtomicU64,
     state: Mutex<ClassState<R>>,
 }
 
 impl<R> Class<R> {
     /// The class of `slot_bytes`-byte slots, holding no chunks.
     fn new(slot_bytes: usize) -> Class<R> {
+        let slots = slots_per_chunk(slot_bytes);
         Class {
             slot_bytes,
-            slots: slots_per_chunk(slot_bytes),
+            slots,
+            slot_charge: count(slot_bytes),
+            chunk_charge: count(slot_bytes * slots),
+            free_bytes: AtomicU64::new(0),
             state: Mutex::new(ClassState {
                 chunks: Vec::new(),
                 free_ids: Vec::new(),
                 room: BTreeSet::new(),
             }),
         }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, ClassState<R>> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -196,7 +378,7 @@ struct ClassState<R> {
     /// `chunks`.
     free_ids: Vec<ChunkId>,
     /// (held slots, id) of every chunk with a free slot that is not being
-    /// emptied, so the last is the fullest chunk with room.
+    /// emptied, so the first is the sparsest and the last the fullest.
     room: BTreeSet<(u32, ChunkId)>,
 }
 
@@ -219,7 +401,8 @@ struct ChunkState<R> {
     /// Whether the chunk is being emptied: it takes no new store, and is
     /// freed when its last held slot drops.
     emptying: bool,
-    /// Each slot's record, `None` while the slot is free.
+    /// Each slot's record, `None` while the slot is free and once its
+    /// chunk is being emptied, which hands the records out.
     records: Vec<Option<R>>,
 }
 
@@ -241,6 +424,9 @@ fn count(n: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::thread;
+
     use super::*;
     use crate::{MIN_SLAB_BYTES, slab_class, slots_per_chunk};
 
@@ -260,6 +446,23 @@ mod tests {
     fn chunk_of(len: usize) -> u64 {
         let class = slab_class(len);
         u64::try_from(class * slots_per_chunk(class)).unwrap()
+    }
+
+    /// The class a value of `len` bytes takes.
+    fn class_of(len: usize) -> ClassId {
+        ClassId::new(class_index(slab_class(len)))
+    }
+
+    /// The bytes of one slot of the class a value of `len` bytes takes.
+    fn slot_of(len: usize) -> u64 {
+        u64::try_from(slab_class(len)).unwrap()
+    }
+
+    /// The records `emptied` names, in order.
+    fn records<R: Ord>(emptied: Vec<Emptied<R>>) -> Vec<R> {
+        let mut records: Vec<R> = emptied.into_iter().map(|e| e.record).collect();
+        records.sort();
+        records
     }
 
     #[test]
@@ -367,5 +570,240 @@ mod tests {
         assert_eq!(slabs.chunk_bytes(), chunk_of(MIN_SLAB_BYTES));
         assert_eq!(slabs.held_slots(), count(first.len() + 1));
         assert_eq!(one_more[..], input[..]);
+    }
+
+    #[test]
+    fn test_uncharged_counts_free_slots_and_waiting_chunks() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let input = pattern(MIN_SLAB_BYTES, 7);
+        let held: Vec<Bytes> = (0..3)
+            .map(|record| slabs.store(&input, record).unwrap())
+            .collect();
+        assert_eq!(slabs.chunk_bytes(), 32 * 1024);
+        assert_eq!(slabs.uncharged_bytes(), 29 * 1024);
+        assert_eq!(slabs.waiting_bytes(), 0);
+
+        let emptied = slabs.empty_sparsest(class_of(MIN_SLAB_BYTES));
+
+        assert_eq!(emptied.len(), 3);
+        assert_eq!(slabs.uncharged_bytes(), 32 * 1024);
+        assert_eq!(slabs.waiting_bytes(), 32 * 1024);
+        drop(held);
+        assert_eq!(slabs.uncharged_bytes(), 0);
+        assert_eq!(slabs.waiting_bytes(), 0);
+    }
+
+    #[test]
+    fn test_empty_sparsest_names_the_held_slots_and_takes_no_new_store() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let input = pattern(MIN_SLAB_BYTES, 8);
+        let held: Vec<Bytes> = (0..3)
+            .map(|record| slabs.store(&input, record).unwrap())
+            .collect();
+
+        let emptied = slabs.empty_sparsest(class_of(MIN_SLAB_BYTES));
+        let after = slabs.store(&input, 3).unwrap();
+
+        assert_eq!(records(emptied), [0, 1, 2]);
+        assert_eq!(slabs.chunk_bytes(), 2 * chunk_of(MIN_SLAB_BYTES));
+        assert_eq!(slabs.held_slots(), 4);
+        assert_eq!(
+            slabs.uncharged_bytes(),
+            chunk_of(MIN_SLAB_BYTES) + chunk_of(MIN_SLAB_BYTES) - slot_of(MIN_SLAB_BYTES)
+        );
+        drop(held);
+        assert_eq!(slabs.chunk_bytes(), chunk_of(MIN_SLAB_BYTES));
+        assert_eq!(after[..], input[..]);
+    }
+
+    #[test]
+    fn test_an_emptied_chunk_is_freed_when_its_last_reader_drops() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let mut held: Vec<Bytes> = (0..3)
+            .map(|seed| slabs.store(&pattern(MIN_SLAB_BYTES, seed), seed).unwrap())
+            .collect();
+        let kept = held.pop().unwrap();
+
+        let emptied = slabs.empty_sparsest(class_of(MIN_SLAB_BYTES));
+        drop(emptied);
+        drop(held);
+
+        assert_eq!(kept[..], pattern(MIN_SLAB_BYTES, 2)[..]);
+        assert_eq!(slabs.waiting_bytes(), chunk_of(MIN_SLAB_BYTES));
+        assert_eq!(slabs.chunk_bytes(), chunk_of(MIN_SLAB_BYTES));
+        assert_eq!(slabs.held_slots(), 1);
+
+        drop(kept);
+
+        assert_eq!(slabs.chunk_bytes(), 0);
+        assert_eq!(slabs.waiting_bytes(), 0);
+        assert_eq!(slabs.uncharged_bytes(), 0);
+        assert_eq!(slabs.held_slots(), 0);
+    }
+
+    #[test]
+    fn test_class_over_ignores_chunks_being_emptied() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let small: Vec<Bytes> = (0..3)
+            .map(|record| slabs.store(&pattern(MIN_SLAB_BYTES, 1), record).unwrap())
+            .collect();
+        let large = slabs.store(&pattern(LEN_4352_CLASS, 2), 3).unwrap();
+        let small_free = 29 * slot_of(MIN_SLAB_BYTES);
+        let large_free = 14 * slot_of(LEN_4352_CLASS);
+        assert!(small_free < large_free);
+        assert_eq!(slabs.class_over(0), Some(class_of(LEN_4352_CLASS)));
+        assert_eq!(slabs.class_over(small_free), Some(class_of(LEN_4352_CLASS)));
+        assert_eq!(slabs.class_over(large_free), None);
+
+        let emptied = slabs.empty_sparsest(class_of(LEN_4352_CLASS));
+
+        assert_eq!(records(emptied), [3]);
+        assert_eq!(slabs.class_over(0), Some(class_of(MIN_SLAB_BYTES)));
+        assert_eq!(
+            slabs.class_over(small_free - 1),
+            Some(class_of(MIN_SLAB_BYTES))
+        );
+        assert_eq!(slabs.class_over(small_free), None);
+        drop((small, large));
+        assert_eq!(slabs.class_over(0), None);
+    }
+
+    #[test]
+    fn test_is_slot_matches_only_its_own_slot() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let input = pattern(MIN_SLAB_BYTES, 9);
+        let held: Vec<Bytes> = (0..3)
+            .map(|record| slabs.store(&input, record).unwrap())
+            .collect();
+
+        let emptied = slabs.empty_sparsest(class_of(MIN_SLAB_BYTES));
+
+        assert_eq!(emptied.len(), held.len());
+        for Emptied { record, at } in &emptied {
+            for (index, bytes) in held.iter().enumerate() {
+                assert_eq!(is_slot(bytes, *at), index == *record, "{index} {record}");
+            }
+            let own = &held[*record];
+            assert!(!is_slot(&Bytes::copy_from_slice(own), *at));
+            assert!(!is_slot(&own.slice(1..), *at));
+            assert!(is_slot(&own.clone(), *at));
+        }
+    }
+
+    #[test]
+    fn test_empty_sparsest_takes_the_chunk_with_the_fewest_held_slots() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let slots = slots_per_chunk(slab_class(MIN_SLAB_BYTES));
+        let input = pattern(MIN_SLAB_BYTES, 10);
+        let mut first: Vec<Bytes> = (0..slots)
+            .map(|record| slabs.store(&input, record).unwrap())
+            .collect();
+        let mut second: Vec<Bytes> = (slots..2 * slots)
+            .map(|record| slabs.store(&input, record).unwrap())
+            .collect();
+        first.truncate(slots - 4);
+        second.truncate(slots - 20);
+
+        let emptied = slabs.empty_sparsest(class_of(MIN_SLAB_BYTES));
+
+        assert_eq!(records(emptied), (slots..slots + 12).collect::<Vec<_>>());
+        let refill: Vec<Bytes> = (0..4)
+            .map(|record| slabs.store(&input, record).unwrap())
+            .collect();
+        assert_eq!(slabs.chunk_bytes(), 2 * chunk_of(MIN_SLAB_BYTES));
+        assert_eq!(slabs.uncharged_bytes(), chunk_of(MIN_SLAB_BYTES));
+        drop(second);
+        assert_eq!(slabs.chunk_bytes(), chunk_of(MIN_SLAB_BYTES));
+        assert_eq!(slabs.uncharged_bytes(), 0);
+        drop((first, refill));
+        assert_eq!(slabs.chunk_bytes(), 0);
+    }
+
+    #[test]
+    fn test_empty_sparsest_of_a_class_without_room_empties_nothing() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let class = class_of(MIN_SLAB_BYTES);
+        assert!(slabs.empty_sparsest(class).is_empty());
+
+        let slots = slots_per_chunk(slab_class(MIN_SLAB_BYTES));
+        let input = pattern(MIN_SLAB_BYTES, 11);
+        let mut full: Vec<Bytes> = (0..slots)
+            .map(|record| slabs.store(&input, record).unwrap())
+            .collect();
+
+        assert!(slabs.empty_sparsest(class).is_empty());
+
+        assert_eq!(slabs.waiting_bytes(), 0);
+        assert_eq!(slabs.uncharged_bytes(), 0);
+        full.pop();
+        full.push(slabs.store(&input, slots).unwrap());
+        assert_eq!(slabs.chunk_bytes(), chunk_of(MIN_SLAB_BYTES));
+        drop(full);
+        assert_eq!(slabs.chunk_bytes(), 0);
+    }
+
+    #[test]
+    fn test_a_record_holding_a_slot_of_its_class_drops_outside_the_lock() {
+        let slabs: Slabs<Option<Bytes>> = Slabs::new(MAX_BYTES);
+        let input = pattern(MIN_SLAB_BYTES, 12);
+        let inner = slabs.store(&input, None).unwrap();
+        let outer = slabs.store(&input, Some(inner)).unwrap();
+        drop(outer);
+        assert_eq!(slabs.held_slots(), 0);
+
+        let inner = slabs.store(&input, None).unwrap();
+        let outer = slabs.store(&input, Some(inner)).unwrap();
+        let emptied = slabs.empty_sparsest(class_of(MIN_SLAB_BYTES));
+        assert_eq!(emptied.len(), 2);
+        drop(emptied);
+        assert_eq!(slabs.held_slots(), 1);
+        drop(outer);
+
+        assert_eq!(slabs.held_slots(), 0);
+        assert_eq!(slabs.chunk_bytes(), 0);
+    }
+
+    #[test]
+    fn test_an_uncontended_lock_adds_no_wait() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let input = pattern(MIN_SLAB_BYTES, 13);
+        let held: Vec<Bytes> = (0..3)
+            .map(|record| slabs.store(&input, record).unwrap())
+            .collect();
+        drop(slabs.empty_sparsest(class_of(MIN_SLAB_BYTES)));
+        drop(held);
+        assert_eq!(slabs.lock_wait_nanos(), 0);
+    }
+
+    #[test]
+    fn test_a_store_that_waits_on_its_class_lock_adds_its_wait() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let input = pattern(MIN_SLAB_BYTES, 14);
+        let class = class_index(slab_class(MIN_SLAB_BYTES));
+        // A round's store waits only if it reaches the lock before the
+        // test thread releases it, which nothing orders; the rounds make a
+        // store that never waits vanishingly unlikely.
+        let rounds = if cfg!(miri) { 20 } else { 1000 };
+        for _ in 0..rounds {
+            let barrier = Arc::new(Barrier::new(2));
+            let guard = slabs.pool.classes[class].state.lock().unwrap();
+            let storer = thread::spawn({
+                let (slabs, barrier, input) = (slabs.clone(), Arc::clone(&barrier), input.clone());
+                move || {
+                    barrier.wait();
+                    drop(slabs.store(&input, 0));
+                }
+            });
+            barrier.wait();
+            for _ in 0..100 {
+                thread::yield_now();
+            }
+            drop(guard);
+            storer.join().unwrap();
+            if slabs.lock_wait_nanos() > 0 {
+                return;
+            }
+        }
+        panic!("no store waited on its held class lock in {rounds} rounds");
     }
 }

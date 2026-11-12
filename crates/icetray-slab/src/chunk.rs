@@ -22,7 +22,8 @@
 //!    `slot_bytes`.
 //!
 //! The rest of the crate reaches a slot only through this module's API,
-//! which admits storing bytes and dropping the `Bytes` that reads them. A
+//! which admits storing bytes and dropping the `Bytes` that reads them, and
+//! learning a slot's address as a number, which reaches nothing. A
 //! `Reserved` slot has one use, `fill`, which returns the `Bytes`; the
 //! owner that reads the slot is private here and exists only filled. A slot
 //! is marked free only through `Chunk::release`, whose `Returning` only an
@@ -108,11 +109,6 @@ impl Chunk {
         }
     }
 
-    /// The bytes the chunk allocated.
-    pub(crate) fn bytes(&self) -> usize {
-        self.units * UNIT_BYTES
-    }
-
     /// The slots held.
     pub(crate) fn held(&self) -> u32 {
         self.slots - self.free.count_ones()
@@ -150,6 +146,13 @@ impl Chunk {
         assert!(self.free & bit == 0, "a slot is released once");
         self.free |= bit;
         slot_index(slot.index)
+    }
+
+    /// The address of slot `index`'s first byte, as a number: it names the
+    /// slot without a way to read, write, or release it.
+    pub(crate) fn slot_addr(&self, index: usize) -> usize {
+        let index = u32::try_from(index).expect("a slot index fits a u32");
+        self.slot_ptr(index).addr()
     }
 
     /// The first byte of slot `index`, which is below the chunk's slot
