@@ -31,9 +31,9 @@ pub const fn jemalloc_class(len: usize) -> usize {
     len.next_multiple_of(spacing)
 }
 
-/// The shortest value a slab holds. Below it, jemalloc's classes already
-/// round by under a sixteenth of the length, and a slab's bookkeeping would
-/// cost more than the rounding it saves.
+/// The shortest value a slab holds. Below it, an entry's fixed costs, its
+/// key and its slot in the cache, are already a large share of what it
+/// costs, and each doubling covered adds 32 classes.
 pub const MIN_SLAB_BYTES: usize = 1024;
 
 /// Each doubling of the length is split into `1 << CLASSES_PER_DOUBLING_BITS`
