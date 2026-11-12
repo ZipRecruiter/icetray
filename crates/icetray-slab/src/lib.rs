@@ -5,9 +5,12 @@
 //! and, in its `chunk` module, the only `unsafe` the slabs need (RFD 029
 //! (Unsafe code)).
 
+mod chunk;
 mod class;
+mod slabs;
 
 pub use class::{
     CHUNK_TARGET_BYTES, MAX_SLOTS_PER_CHUNK, MIN_SLAB_BYTES, MIN_SLOTS_PER_CHUNK, in_slabs,
     jemalloc_class, slab_class, slots_per_chunk,
 };
+pub use slabs::Slabs;

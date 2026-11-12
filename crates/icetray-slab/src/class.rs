@@ -63,6 +63,23 @@ pub const fn slab_class(len: usize) -> usize {
     len.next_multiple_of(spacing)
 }
 
+/// A slab class's place among the slab classes from `MIN_SLAB_BYTES`'s,
+/// which is 0, so consecutive classes take consecutive places. Defined for
+/// a `class` that `slab_class` returns.
+pub(crate) const fn class_index(class: usize) -> usize {
+    class_ordinal(class) - class_ordinal(slab_class(MIN_SLAB_BYTES))
+}
+
+/// A slab class's place among every slab class: the classes of the
+/// doublings below its own, then its step above the power of two that
+/// starts its doubling.
+const fn class_ordinal(class: usize) -> usize {
+    let doubling = (class - 1).ilog2();
+    let floor = 1_usize << doubling;
+    let spacing = floor >> CLASSES_PER_DOUBLING_BITS;
+    ((doubling as usize) << CLASSES_PER_DOUBLING_BITS) + (class - floor) / spacing
+}
+
 /// The slots in a chunk of slots of `class` bytes: as many as fit in
 /// `CHUNK_TARGET_BYTES`, within `MIN_SLOTS_PER_CHUNK` and
 /// `MAX_SLOTS_PER_CHUNK`. Written without `clamp`, which is not yet a
@@ -113,6 +130,21 @@ mod tests {
         assert_eq!(slab_class(4242), 4352);
         assert_eq!(slab_class(65_536), 65_536);
         assert_eq!(slab_class(65_637), 67_584);
+    }
+
+    #[test]
+    fn test_class_index_counts_the_classes_in_order() {
+        let mut previous = slab_class(MIN_SLAB_BYTES);
+        let mut expected = 0;
+        for len in MIN_SLAB_BYTES..=MAX {
+            let class = slab_class(len);
+            if class != previous {
+                previous = class;
+                expected += 1;
+            }
+            assert_eq!(class_index(class), expected, "{len} -> {class}");
+        }
+        assert_eq!(class_index(slab_class(MIN_SLAB_BYTES)), 0);
     }
 
     #[test]
