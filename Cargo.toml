@@ -35,6 +35,7 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 unwrap_used = "deny"
 wildcard_enum_match_arm = "deny"
+undocumented_unsafe_blocks = "deny"
 
 # arrow and parquet stay on the major iceberg depends on: the testkit hands
 # iceberg's writer arrow batches, and one workspace must not compile two

@@ -37,8 +37,9 @@ paragraph here, never halfway.
 ## Lints
 
 `[workspace.lints]` in the root `Cargo.toml` is the whole policy: clippy
-pedantic denied, four pedantic lints allowed, `unwrap_used` and
-`wildcard_enum_match_arm` denied, `missing_docs` warned. Every crate opts in with `[lints] workspace = true`.
+pedantic denied, four pedantic lints allowed, `unwrap_used`,
+`wildcard_enum_match_arm`, and `undocumented_unsafe_blocks` denied,
+`missing_docs` warned. Every crate opts in with `[lints] workspace = true`.
 CI runs clippy with `-D warnings` on all targets, so a warning is a failure.
 
 - Do not add `#[allow(...)]` to get past a lint. Fix the code. If a lint is
@@ -64,6 +65,14 @@ CI runs clippy with `-D warnings` on all targets, so a warning is a failure.
   "..."))`, and the reader's commit removes that one too.
   `dev/ci-checks.sh` refuses any tree that still carries either form, so a
   marker never reaches a push or a merge.
+- `unsafe` only in a module an RFD names, which states the invariants the
+  module's `unsafe` relies on and the tests that check them (RFD 029).
+  Every block carries a `// SAFETY:` comment naming its invariant. Rust
+  code that manages memory itself has tests Miri runs, on a pinned nightly
+  that arrives with the first such module, together with its `dev/`
+  script and CI job. A crate built to make a kind of `unsafe` call
+  safe, as rustix is for system calls, comes before `unsafe` of our own. A change that needs
+  `unsafe` anywhere else needs that RFD first.
 - `unwrap()` in production code never. `expect("reason")` marks a case that
   cannot happen and says why. `?` handles everything else. Tests may
   `unwrap()`; `clippy.toml` exempts them.
