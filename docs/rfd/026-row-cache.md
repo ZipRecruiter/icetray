@@ -37,10 +37,12 @@ and will check each hit against the generation's files and deletes.
   file in place and icetray refuses a snapshot with two live rows for a
   key (RFD 005 (Generations and refresh), RFD 021 (Merge-on-read)).
   Otherwise icetray reads the row as it would without the cache and
-  replaces the entry with what it read. icetray never invalidates
-  entries: after a merge-on-read update only the changed keys' entries
-  fail the check, after a rewrite only the replaced files' entries, and
-  failed entries are evicted like any other.
+  replaces the entry with what it read, or drops the entry when the key
+  has no live row, the column takes its default, or the value read is
+  too large to cache. A refresh invalidates no entry: after a
+  merge-on-read update only the changed keys' entries fail the check,
+  after a rewrite only the replaced files' entries, and a failed entry no
+  lookup reaches again is evicted like any other.
 - **What a hit costs.** A hash and the check. icetray reads no page for a
   hit and uses no fan-out slot; the hit counts as a warm hit and does not
   change the table's level (RFD 020 (Lookup levels)).
@@ -84,7 +86,7 @@ packs small rows more densely but refuses fresh keys once full, and an
 arena of icetray's own could match its density.
 
 Rows on the local disk as well. Rejected because the page cache's disk
-level already has the pages icetray reads on a miss.
+level already has the pages icetray reads on a cache miss.
 
 ## Consequences
 
@@ -97,7 +99,8 @@ The cache is correct only while icetray serves at most one live row per
 key. Allowing two, as equality deletes would, means changing the check
 too.
 
-icetray reports the row cache's hits, misses, stale entries, and bytes.
+icetray reports the row cache's hits, cache misses, stale entries, and
+bytes.
 The counting tests of RFD 014 (Test layering) check that a hit reads no
 page, and that icetray never serves a deleted or rewritten row, keeps a
 reused file's entries, and never serves a replaced table's entries to

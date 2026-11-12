@@ -50,7 +50,7 @@ use crate::manifest::{self, Bucketing, DataFileEntry, DeleteFileEntry, TableLayo
 use crate::metric::LookupResult;
 use crate::order::ScanBounds;
 use crate::parquet_io::{FileHandle, Segments};
-use crate::row_cache::{Caching, Entry, Held, Part, Source, TableRows};
+use crate::row_cache::{Caching, Entry, Held, Part, Source, TableRows, caches};
 use crate::scan::{self, Scanned};
 use crate::shard;
 use crate::snapshot::{SequenceNumber, SnapshotId};
@@ -608,8 +608,8 @@ impl Generation {
     /// column was added answers that column's default, reads no page of
     /// it, and is cached nowhere (RFD 023). Every entry the lookup found
     /// and could not serve, for a key no candidate holds as for a column
-    /// answered by its default, is dropped unless another lookup has
-    /// replaced it. `Present` carries one value per column named, each its
+    /// answered by its default or by a value too large to cache, is
+    /// dropped unless another lookup has replaced it. `Present` carries one value per column named, each its
     /// bytes or `None` for a null; `Absent` is a key no candidate holds.
     /// The GET cost is the index's: in the Full tier one GET per column
     /// named and not served from the row cache for a cold hit, two for a
@@ -1354,9 +1354,10 @@ fn served_whole(probes: &[Probe], columns: usize) -> Option<Row> {
 /// What a lookup of `key` naming `columns`, which found the row at
 /// `source` and took each column's value as `read` says, leaves in `rows`
 /// and counts there: a presence-only lookup caches the row's presence; an
-/// entry found stale for a column answered by its default is dropped, since
-/// no read replaced it; a part served from the cache is a hit, and a part
-/// read through the index is a miss, a stale one among them.
+/// entry found stale for a column answered by its default, or read as a
+/// value too large to cache, is dropped, since no read replaced it; a part
+/// served from the cache is a hit, and a part read through the index is a
+/// cache miss, a stale one among them.
 fn settle(
     rows: &TableRows,
     key: &Key,
@@ -1372,16 +1373,23 @@ fn settle(
         misses += 1;
     }
     for &(part, stale_source) in stale {
-        let by_default = match part {
+        let answered = match part {
             Part::Column(column) => columns
                 .iter()
                 .zip(read)
-                .any(|(&named, (_, _, by))| named == column && *by == Served::Default),
-            Part::Presence => false,
+                .find(|(named, _)| **named == column)
+                .map(|(_, (value, _, by))| (value, *by)),
+            Part::Presence => None,
         };
-        if by_default {
-            rows.remove(key, part, stale_source);
-            misses += 1;
+        match answered {
+            Some((_, Served::Default)) => {
+                rows.remove(key, part, stale_source);
+                misses += 1;
+            }
+            Some((value, Served::Page)) if !caches(Caching::Column(value.as_deref())) => {
+                rows.remove(key, part, stale_source);
+            }
+            Some((_, Served::Page | Served::Cache)) | None => {}
         }
     }
     rows.count(served(Served::Cache), misses, stale.len());
@@ -6814,6 +6822,43 @@ mod tests {
             FileFault::Delete(DeleteFault::RecordCountMismatch {
                 manifest: approx::count(keys.len()) + 1,
                 footer: i64::try_from(keys.len()).unwrap(),
+            })
+        );
+    }
+
+    /// A lookup that finds a stale entry and reads the column's new value
+    /// from its page drops the entry when the value is too large to cache,
+    /// since nothing replaced it, and leaves the entry its read cached when
+    /// the value fits.
+    #[test]
+    fn test_settle_drops_a_stale_entry_no_cacheable_value_replaced() {
+        use crate::row_cache::{ROW_CACHE_MAX_VALUE_BYTES, RowCache};
+        let cache = RowCache::new(crate::approx::units::GIB);
+        let rows = cache.for_table("settled");
+        let key = Key::Long(1);
+        let part = Part::Column(0);
+        let at = |position| Source {
+            file: FileNumber::from_le_bytes(7_u64.to_le_bytes()),
+            position: RowPosition(position),
+        };
+        let (old, new) = (at(1), at(2));
+        let over = Bytes::from(vec![0_u8; approx::length(ROW_CACHE_MAX_VALUE_BYTES) + 1]);
+        rows.insert(&key, part, old, Caching::Column(Some(b"small")));
+        rows.insert(&key, part, new, Caching::Column(Some(&over)));
+        let read = [(Some(over), false, Served::Page)];
+        settle(&rows, &key, &[0], new, &read, &[(part, old)]);
+        assert_eq!(rows.get(&key, part), None, "the stale entry is dropped");
+
+        let fits = Bytes::from_static(b"fits");
+        rows.insert(&key, part, old, Caching::Column(Some(b"small")));
+        rows.insert(&key, part, new, Caching::Column(Some(&fits)));
+        let read = [(Some(fits.clone()), false, Served::Page)];
+        settle(&rows, &key, &[0], new, &read, &[(part, old)]);
+        assert_eq!(
+            rows.get(&key, part),
+            Some(Entry {
+                source: new,
+                held: Held::Value(fits),
             })
         );
     }

@@ -31,11 +31,12 @@ pub const ROW_CACHE_HITS_TOTAL: &str = "icetray_row_cache_hits_total";
 /// Value reads, and presence-only lookups of present keys, that icetray
 /// did not serve from the row cache (RFD 026), each then read through the
 /// index and the page cache, and the stale entries it found
-/// (`ROW_CACHE_STALE_TOTAL`).
+/// (`ROW_CACHE_STALE_TOTAL`). A lookup of an absent key, and a column
+/// answered by its default, counts none but its stale entries.
 pub const ROW_CACHE_MISSES_TOTAL: &str = "icetray_row_cache_misses_total";
 /// Row-cache entries icetray found for a lookup and could not serve,
 /// because the lookup's generation no longer holds the entry's file or has
-/// deleted its row (RFD 026); each is a miss too.
+/// deleted its row (RFD 026); each is counted as a cache miss too.
 pub const ROW_CACHE_STALE_TOTAL: &str = "icetray_row_cache_stale_total";
 /// Lookups answered, by `table` and `result`.
 pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
@@ -270,7 +271,7 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 59] = [
     (
         ROW_CACHE_MISSES_TOTAL,
         Kind::Counter,
-        "Value reads and presence-only lookups of present keys not served from the row cache.",
+        "Value reads and presence-only lookups of present keys not served from the row cache; an absent key counts none.",
     ),
     (
         ROW_CACHE_STALE_TOTAL,

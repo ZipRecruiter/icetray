@@ -241,6 +241,15 @@ pub(crate) enum Caching<'a> {
     Presence,
 }
 
+/// Whether `TableRows::insert` caches `held`: everything but a value over
+/// `ROW_CACHE_MAX_VALUE_BYTES`.
+pub(crate) fn caches(held: Caching<'_>) -> bool {
+    match held {
+        Caching::Column(Some(bytes)) => approx::count(bytes.len()) <= ROW_CACHE_MAX_VALUE_BYTES,
+        Caching::Column(None) | Caching::Presence => true,
+    }
+}
+
 /// One entry: where it was read and what it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Entry {
@@ -598,12 +607,10 @@ impl TableRows {
     }
 
     /// Caches `part` of `key`'s row as read at `source`, holding `held`,
-    /// replacing any entry there. A value over `ROW_CACHE_MAX_VALUE_BYTES`
-    /// is not cached.
+    /// replacing any entry there, unless `caches` refuses `held`, when it
+    /// leaves the cache as it was.
     pub(crate) fn insert(&self, key: &Key, part: Part, source: Source, held: Caching<'_>) {
-        if let Caching::Column(Some(bytes)) = held
-            && approx::count(bytes.len()) > ROW_CACHE_MAX_VALUE_BYTES
-        {
+        if !caches(held) {
             return;
         }
         let (key, value) = entry(self.table, part, &key.as_bytes(), source, held);
