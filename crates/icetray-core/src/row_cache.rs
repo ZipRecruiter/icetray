@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
+use icetray_slab::jemalloc_class;
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use quick_cache::{DefaultHashBuilder, Equivalent, OptionsBuilder, Weighter};
 
@@ -52,7 +53,7 @@ const SHARED_HEADER_LEN: usize = 24;
 
 /// What the shared header takes in jemalloc's size class
 /// (`SHARED_HEADER_LEN`).
-const SHARED_HEADER_BYTES: u64 = approx::count(size_class(SHARED_HEADER_LEN));
+const SHARED_HEADER_BYTES: u64 = approx::count(jemalloc_class(SHARED_HEADER_LEN));
 
 /// The weight of an average entry, which `quick_cache` divides the budget by
 /// to choose how many shards to split into: what a value of about a
@@ -126,36 +127,6 @@ impl GhostReserve {
     }
 }
 
-/// The smallest allocation jemalloc makes and the finest spacing of its
-/// size classes: sizes up to this round to it, and sizes above round to a
-/// multiple of at least this.
-const MIN_SIZE_CLASS_BYTES: usize = 16;
-
-/// jemalloc splits each doubling of the size into `1 << SIZE_CLASS_BITS`
-/// classes, four.
-const SIZE_CLASS_BITS: u32 = 2;
-
-/// The bytes jemalloc allocates for a request of `len` bytes: `len` rounded
-/// up to its size class, a multiple of `MIN_SIZE_CLASS_BYTES` for small
-/// sizes and of a quarter of the size's power of two above them. Nothing is
-/// allocated for no bytes. A `const fn`, so a constant's size class is
-/// derived from its length.
-const fn size_class(len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    if len <= MIN_SIZE_CLASS_BYTES {
-        return MIN_SIZE_CLASS_BYTES;
-    }
-    let spacing = 1_usize << (len - 1).ilog2().saturating_sub(SIZE_CLASS_BITS);
-    let spacing = if spacing < MIN_SIZE_CLASS_BYTES {
-        MIN_SIZE_CLASS_BYTES
-    } else {
-        spacing
-    };
-    len.next_multiple_of(spacing)
-}
-
 /// What an entry is charged against the budget: its key's allocation of
 /// `key_len` bytes and its value's of `value_len` bytes (`None` for a
 /// cached null or a presence entry, which allocates no value), each in
@@ -163,9 +134,9 @@ const fn size_class(len: usize) -> usize {
 /// the shared header a read allocates (`SHARED_HEADER_BYTES`).
 fn charged(key_len: usize, value_len: Option<usize>) -> u64 {
     let value = value_len.map_or(0, |len| {
-        approx::count(size_class(len)) + SHARED_HEADER_BYTES
+        approx::count(jemalloc_class(len)) + SHARED_HEADER_BYTES
     });
-    approx::count(size_class(key_len)) + value + ROW_SLOT_BYTES
+    approx::count(jemalloc_class(key_len)) + value + ROW_SLOT_BYTES
 }
 
 /// What an entry for a table key of `key_len` bytes and a value of

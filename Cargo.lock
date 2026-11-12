@@ -2654,6 +2654,7 @@ dependencies = [
  "futures",
  "iceberg",
  "iceberg-catalog-rest",
+ "icetray-slab",
  "jiff",
  "libc",
  "metrics",
@@ -2689,6 +2690,13 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "icetray-slab"
+version = "0.3.1"
+dependencies = [
+ "bytes",
 ]
 
 [[package]]

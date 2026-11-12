@@ -60,12 +60,12 @@ out as a reference to its slot rather than a copy.
 - **Locking.** A slab takes its lock to claim and to free a slot, and a
   store copies its bytes into the slot outside the lock, since nothing
   refers to a slot until its store returns. A hit takes no slab lock.
-- **The `unsafe`.** Reading a slot in place needs `unsafe`, allowed in one
-  module under RFD 029 (Unsafe code), behind an API whose only ways in
-  are storing bytes and dropping the `Bytes` it returns. Its invariants:
-  a slot is written only while nothing refers to it; a chunk outlives
-  every slot in it; and slots lie inside their chunk, apart from each
-  other. Tests that Miri runs check each, and a test of many threads
+- **The `unsafe`.** Reading a slot in place needs `unsafe`, allowed in the
+  `icetray-slab` crate's `chunk` module under RFD 029 (Unsafe code),
+  behind an API whose only ways in are storing bytes and dropping the
+  `Bytes` it returns. Its invariants: a slot is written only while
+  nothing refers to it; a chunk outlives every slot in it; and slots lie
+  inside their chunk, apart from each other. Tests that Miri runs check each, and a test of many threads
   storing, evicting, and reading at once checks every read against the
   bytes its key was stored with.
 

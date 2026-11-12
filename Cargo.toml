@@ -43,6 +43,7 @@ undocumented_unsafe_blocks = "deny"
 [workspace.dependencies]
 icetray-core = { path = "crates/icetray-core" }
 icetray-proto = { path = "crates/icetray-proto" }
+icetray-slab = { path = "crates/icetray-slab" }
 icetray-testkit = { path = "crates/icetray-testkit" }
 
 arc-swap = "1.9.2"
