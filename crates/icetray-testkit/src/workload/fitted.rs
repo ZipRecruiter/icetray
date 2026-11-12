@@ -344,6 +344,10 @@ pub const EMBEDDING_SIZES: &[SizeBucket] = &[
 /// Keys per batch of the document workload, the day's 2.7 million
 /// batches of documents shown together: p10 1, p25 2, p50 4, p75 13, p90
 /// 37, p99 107, mean 13.1, at most 1,544, which closes the last bucket.
+/// Each of the day's buckets from 5 keys up to 999 is split as the
+/// busiest hour's batches split it, since a log-uniform draw over the
+/// day's wider buckets overshot the mean by a quarter; the draw's mean is
+/// 13.3.
 pub const DOCUMENT_SIZES: &[SizeBucket] = &[
     SizeBucket {
         least: 1,
@@ -362,28 +366,63 @@ pub const DOCUMENT_SIZES: &[SizeBucket] = &[
     },
     SizeBucket {
         least: 5,
+        most: 6,
+        requests: 205_794,
+    },
+    SizeBucket {
+        least: 7,
         most: 9,
-        requests: 431_610,
+        requests: 225_816,
     },
     SizeBucket {
         least: 10,
+        most: 13,
+        requests: 191_942,
+    },
+    SizeBucket {
+        least: 14,
         most: 19,
-        requests: 359_714,
+        requests: 167_772,
     },
     SizeBucket {
         least: 20,
+        most: 29,
+        requests: 165_481,
+    },
+    SizeBucket {
+        least: 30,
         most: 49,
-        requests: 309_638,
+        requests: 144_157,
     },
     SizeBucket {
         least: 50,
+        most: 69,
+        requests: 131_596,
+    },
+    SizeBucket {
+        least: 70,
         most: 99,
-        requests: 160_686,
+        requests: 29_090,
     },
     SizeBucket {
         least: 100,
+        most: 149,
+        requests: 19_348,
+    },
+    SizeBucket {
+        least: 150,
+        most: 249,
+        requests: 9_009,
+    },
+    SizeBucket {
+        least: 250,
+        most: 499,
+        requests: 2_969,
+    },
+    SizeBucket {
+        least: 500,
         most: 999,
-        requests: 31_581,
+        requests: 256,
     },
     SizeBucket {
         least: 1_000,
@@ -795,6 +834,20 @@ mod tests {
     /// the measured one lies in, and log-uniform spreading inside a bucket
     /// moves it by at most 12 percent for these histograms (the p90 of the
     /// embedding batches, at 863 against 784, moves most).
+    /// Each histogram's draw keeps the measured mean of keys per batch
+    /// within 2 percent: 340 for the embedding batches, 13.1 for the
+    /// documents.
+    #[test]
+    fn test_size_dist_keeps_the_measured_mean() {
+        for (buckets, measured) in [(EMBEDDING_SIZES, 340.0), (DOCUMENT_SIZES, 13.1)] {
+            let mean = SizeDist::new(buckets).mean();
+            assert!(
+                (mean - measured).abs() <= 0.02 * measured,
+                "drew a mean of {mean} against {measured}"
+            );
+        }
+    }
+
     #[test]
     fn test_size_dist_draws_the_measured_median_and_p90() {
         let draws = 200_000;
