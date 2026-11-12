@@ -2,16 +2,17 @@
 //! (RFD 030 (Cache slabs), under RFD 029 (Unsafe code)).
 //!
 //! A chunk is one allocation holding one class's slots side by side. A store
-//! claims a free slot from its chunk, fills it once, and wraps it in the
-//! `Bytes` it returns, which reads the slot in place; the slot returns to its
-//! chunk when the last clone of that `Bytes` drops. Every `unsafe` block and
-//! impl here relies on one of three invariants:
+//! reserves a free slot of a chunk under its class's lock, then, outside the
+//! lock, fills it and wraps it in the `Bytes` it returns, which reads the
+//! slot in place; the slot returns to its chunk when the last clone of that
+//! `Bytes` drops. Every `unsafe` block and impl here relies on one of three
+//! invariants:
 //!
-//! 1. **A slot is written only while nothing refers to it.** `Chunk::claim`
-//!    hands out a slot only while its chunk marks it free and marks it held
-//!    as it does, so one `Slot` at a time owns it. `Slot::fill` writes it,
-//!    taking that `Slot` by value before any `Bytes` holds it, and nothing
-//!    writes it again until the `Slot` drops and marks it free.
+//! 1. **A slot is written only while nothing refers to it.** `Chunk::reserve`
+//!    hands out a slot only while its chunk marks it free, and marks it held
+//!    as it does. `Reserved::fill` writes it once, before the slot's owner
+//!    exists, and nothing writes it again until that owner drops and marks
+//!    it free.
 //! 2. **A chunk outlives every slot in it.** A chunk frees its memory on
 //!    drop only when it marks every slot free; dropped with a slot held, it
 //!    leaks the memory instead, which the slot goes on reading.
@@ -20,10 +21,14 @@
 //!    is below the chunk's slot count, and a slot's length is at most
 //!    `slot_bytes`.
 //!
-//! These hold whatever the pool in the `slabs` module does with its
-//! bookkeeping: `Chunk::release` checks that a slot returns to the chunk it
-//! lies in and is released once, so routing a slot to the wrong chunk
-//! panics instead of freeing a slot that is still read.
+//! The rest of the crate reaches a slot only through this module's API,
+//! which admits storing bytes and dropping the `Bytes` that reads them. A
+//! `Reserved` slot has one use, `fill`, which returns the `Bytes`; the
+//! owner that reads the slot is private here and exists only filled. A slot
+//! is marked free only through `Chunk::release`, whose `Returning` only an
+//! owner's drop makes, once, and which checks that the slot lies in the
+//! chunk it returns to. So the pool's bookkeeping, in the `slabs` module,
+//! can strand memory or panic, but it cannot break an invariant.
 
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
@@ -118,39 +123,25 @@ impl Chunk {
         self.free != 0
     }
 
-    /// A free slot, now held, for a value of `len` bytes, which returns to
-    /// `pool` when it drops; `class` and `chunk` name this chunk to the
-    /// pool. `None` when every slot is held.
-    pub(crate) fn claim<P: Release>(
-        &mut self,
-        pool: &Arc<P>,
-        class: usize,
-        chunk: ChunkId,
-        len: usize,
-    ) -> Option<Slot<P>> {
-        assert!(
-            len <= self.slot_bytes,
-            "a value of {len} bytes fits a slot of {}",
-            self.slot_bytes
-        );
+    /// A free slot, now held until the `Bytes` its `fill` returns drops.
+    /// `None` when every slot is held.
+    pub(crate) fn reserve(&mut self) -> Option<Reserved> {
         if self.free == 0 {
             return None;
         }
         let index = self.free.trailing_zeros();
         self.free &= !(1 << index);
-        Some(Slot {
-            pool: Arc::clone(pool),
-            class,
-            chunk,
+        Some(Reserved {
             index,
             ptr: self.slot_ptr(index),
-            len,
+            slot_bytes: self.slot_bytes,
         })
     }
 
-    /// Marks `slot` free and returns its index. Panics unless `slot` lies
-    /// in this chunk and is held.
-    pub(crate) fn release<P: Release>(&mut self, slot: &Slot<P>) -> usize {
+    /// Marks the slot that `returning` returns free and gives its index.
+    /// Panics unless that slot lies in this chunk and is held.
+    pub(crate) fn release<P: Release>(&mut self, returning: Returning<'_, P>) -> usize {
+        let slot = returning.into_slot();
         assert!(
             ptr::eq(slot.ptr, self.slot_ptr(slot.index)),
             "a slot returns to the chunk it lies in"
@@ -158,18 +149,17 @@ impl Chunk {
         let bit = 1 << slot.index;
         assert!(self.free & bit == 0, "a slot is released once");
         self.free |= bit;
-        slot.index()
+        slot_index(slot.index)
     }
 
     /// The first byte of slot `index`, which is below the chunk's slot
     /// count, so the slot lies inside the chunk (invariant 3).
     fn slot_ptr(&self, index: u32) -> *mut u8 {
         assert!(index < self.slots, "slot {index} of {}", self.slots);
-        let index = usize::try_from(index).expect("a slot index fits a usize");
         self.base
             .as_ptr()
             .cast::<u8>()
-            .wrapping_add(index * self.slot_bytes)
+            .wrapping_add(slot_index(index) * self.slot_bytes)
     }
 }
 
@@ -179,9 +169,10 @@ impl Drop for Chunk {
             return;
         }
         let memory = ptr::slice_from_raw_parts_mut(self.base.as_ptr(), self.units);
-        // SAFETY: invariant 2. Every slot is free, so no `Slot` points into
-        // the memory, and `memory` is the pointer and length `Box::into_raw`
-        // returned in `new`, so the `Box` rebuilt here is the one allocated.
+        // SAFETY: invariant 2. Every slot is free, so no slot's owner points
+        // into the memory, and `memory` is the pointer and length
+        // `Box::into_raw` returned in `new`, so the `Box` rebuilt here is the
+        // one allocated.
         drop(unsafe { Box::from_raw(memory) });
     }
 }
@@ -190,24 +181,104 @@ impl Drop for Chunk {
 // when no slot in it is held, from whichever thread drops it.
 unsafe impl Send for Chunk {}
 
-// SAFETY: invariants 1 and 3. A shared chunk reads only its own fields; the
-// slots' bytes are reached only through `Slot`s.
-unsafe impl Sync for Chunk {}
-
 /// Every slot of a chunk of `slots` slots, as free slots.
 fn all_free(slots: u32) -> FreeMask {
     FreeMask::MAX >> (FreeMask::BITS - slots)
 }
 
-/// The pool a slot returns to when it drops.
-pub(crate) trait Release: Send + Sync + Sized + 'static {
-    /// Returns `slot` to its chunk, through `Chunk::release`.
-    fn release(&self, slot: &Slot<Self>);
+/// A slot index as a `usize`.
+fn slot_index(index: u32) -> usize {
+    usize::try_from(index).expect("a slot index fits a usize")
 }
 
-/// One held slot: the owner of the `Bytes` a store returns, which reads its
-/// `len` bytes in place and returns the slot to its pool on drop.
-pub(crate) struct Slot<P: Release> {
+/// A slot `Chunk::reserve` marked held, not yet filled. Its one use is
+/// `fill`; dropped unfilled, it keeps its slot held, so the slot's chunk
+/// is never freed.
+pub(crate) struct Reserved {
+    index: u32,
+    ptr: *mut u8,
+    slot_bytes: usize,
+}
+
+impl Reserved {
+    /// The slot's index in its chunk.
+    pub(crate) fn index(&self) -> usize {
+        slot_index(self.index)
+    }
+
+    /// `bytes`, at most a slot long, copied into the slot, as a `Bytes`
+    /// exactly as long that reads them in place. The slot returns to
+    /// `pool`, which names its chunk as `class` and `chunk`, when the last
+    /// clone of the `Bytes` drops, or at once if `bytes` do not fit.
+    pub(crate) fn fill<P: Release>(
+        self,
+        pool: Arc<P>,
+        class: usize,
+        chunk: ChunkId,
+        bytes: &[u8],
+    ) -> Bytes {
+        let slot = Slot {
+            pool,
+            class,
+            chunk,
+            index: self.index,
+            ptr: self.ptr,
+            len: bytes.len(),
+        };
+        assert!(
+            slot.len <= self.slot_bytes,
+            "a value of {} bytes fits a slot of {}",
+            slot.len,
+            self.slot_bytes
+        );
+        // SAFETY: invariant 1: the slot was free when `reserve` made `self`,
+        // which `fill` consumes, and `slot`, the only owner, is not yet in a
+        // `Bytes`, so nothing reads the slot. Invariant 2: the chunk lives
+        // while its slot is held. Invariant 3: the slot's `len` bytes lie
+        // inside its chunk and apart from every other slot, so `bytes`,
+        // which nothing writes while it is borrowed and which may lie in
+        // another slot, does not overlap them.
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), slot.ptr, slot.len) };
+        Bytes::from_owner(slot)
+    }
+}
+
+/// The pool a slot returns to when it drops.
+pub(crate) trait Release: Send + Sync + Sized + 'static {
+    /// Returns the slot `returning` names to its chunk, through
+    /// `Chunk::release`.
+    fn release(&self, returning: Returning<'_, Self>);
+}
+
+/// A dropping slot, on its way back to its chunk. Only a slot's drop makes
+/// one, and `Chunk::release` consumes it, so a slot is marked free only
+/// once its owner is gone.
+pub(crate) struct Returning<'a, P: Release> {
+    slot: &'a Slot<P>,
+}
+
+impl<'a, P: Release> Returning<'a, P> {
+    /// The dropping slot, taking `self`, so one `Returning` marks one slot
+    /// free once.
+    fn into_slot(self) -> &'a Slot<P> {
+        self.slot
+    }
+
+    /// The index of the slot's class in its pool.
+    pub(crate) fn class(&self) -> usize {
+        self.slot.class
+    }
+
+    /// The slot's chunk among its class's chunks.
+    pub(crate) fn chunk(&self) -> ChunkId {
+        self.slot.chunk
+    }
+}
+
+/// A filled slot: the owner of the `Bytes` that `Reserved::fill` returns,
+/// which reads its `len` bytes in place and returns the slot to its pool on
+/// drop.
+struct Slot<P: Release> {
     pool: Arc<P>,
     class: usize,
     chunk: ChunkId,
@@ -216,47 +287,12 @@ pub(crate) struct Slot<P: Release> {
     len: usize,
 }
 
-impl<P: Release> Slot<P> {
-    /// The index of the slot's class in its pool.
-    pub(crate) fn class(&self) -> usize {
-        self.class
-    }
-
-    /// The slot's chunk among its class's chunks.
-    pub(crate) fn chunk(&self) -> ChunkId {
-        self.chunk
-    }
-
-    /// The slot's index in its chunk.
-    pub(crate) fn index(&self) -> usize {
-        usize::try_from(self.index).expect("a slot index fits a usize")
-    }
-
-    /// `bytes`, which are as long as the slot was claimed for, copied into
-    /// the slot, as a `Bytes` that reads them in place.
-    pub(crate) fn fill(self, bytes: &[u8]) -> Bytes {
-        assert_eq!(
-            bytes.len(),
-            self.len,
-            "a slot is filled with the length it was claimed for"
-        );
-        // SAFETY: invariant 1: `self` is the slot's only `Slot`, taken by
-        // value, and no `Bytes` holds it yet, so nothing reads the slot.
-        // Invariant 2: the chunk lives while `self` does. Invariant 3: the
-        // slot's `len` bytes lie inside its chunk and apart from every other
-        // slot, so `bytes`, which nothing writes while it is borrowed and
-        // which may lie in another slot, does not overlap them.
-        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr, self.len) };
-        Bytes::from_owner(self)
-    }
-}
-
 impl<P: Release> AsRef<[u8]> for Slot<P> {
     fn as_ref(&self) -> &[u8] {
         // SAFETY: invariant 1: `fill` wrote all `len` bytes before the
-        // `Bytes` that reads them existed, and nothing writes them until
-        // this slot drops. Invariant 2: the chunk lives while the slot
-        // does. Invariant 3: the bytes lie inside the chunk and apart from
+        // `Bytes` that calls this existed, and nothing writes them until
+        // this slot drops. Invariant 2: the chunk lives while the slot is
+        // held. Invariant 3: the bytes lie inside the chunk and apart from
         // the other slots, which other threads write.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
@@ -264,16 +300,84 @@ impl<P: Release> AsRef<[u8]> for Slot<P> {
 
 impl<P: Release> Drop for Slot<P> {
     fn drop(&mut self) {
-        P::release(&self.pool, self);
+        P::release(&self.pool, Returning { slot: self });
     }
 }
 
 // SAFETY: invariants 1 and 2. The pointer is the one field that is not
-// `Send` of itself: its bytes are only read once `fill` returns, from any
-// thread, and stay allocated until the slot drops, from any thread, which
-// returns it through the pool's lock.
+// `Send` of itself: its bytes are only read once `fill` has written them,
+// from any thread, and stay allocated until the slot drops, from any
+// thread, which returns it through the pool's lock.
 unsafe impl<P: Release> Send for Slot<P> {}
 
-// SAFETY: invariant 1. A shared slot only reads its bytes, which nothing
-// writes while it lives.
-unsafe impl<P: Release> Sync for Slot<P> {}
+#[cfg(test)]
+mod tests {
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::{Mutex, PoisonError};
+
+    use super::*;
+
+    /// The bytes of each slot of the tests' chunks.
+    const SLOT_BYTES: usize = 1024;
+
+    /// A pool of one chunk.
+    struct OneChunk(Mutex<Chunk>);
+
+    impl Release for OneChunk {
+        fn release(&self, returning: Returning<'_, Self>) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .release(returning);
+        }
+    }
+
+    fn one_chunk(slots: usize) -> Arc<OneChunk> {
+        Arc::new(OneChunk(Mutex::new(Chunk::new(SLOT_BYTES, slots))))
+    }
+
+    fn reserve(pool: &OneChunk) -> Reserved {
+        pool.0.lock().unwrap().reserve().unwrap()
+    }
+
+    #[test]
+    fn test_reserve_marks_the_slot_held_until_its_bytes_drop() {
+        let pool = one_chunk(2);
+        let value = vec![7; SLOT_BYTES];
+        let bytes = reserve(&pool).fill(Arc::clone(&pool), 0, ChunkId::new(0), &value);
+        assert_eq!(pool.0.lock().unwrap().held(), 1);
+        assert_eq!(bytes[..], value[..]);
+
+        drop(bytes);
+
+        assert_eq!(pool.0.lock().unwrap().held(), 0);
+    }
+
+    #[test]
+    fn test_reserve_refuses_a_full_chunk() {
+        let pool = one_chunk(1);
+        let reserved = reserve(&pool);
+        assert!(pool.0.lock().unwrap().reserve().is_none());
+        let bytes = reserved.fill(Arc::clone(&pool), 0, ChunkId::new(0), &[1; SLOT_BYTES]);
+        drop(bytes);
+        assert!(pool.0.lock().unwrap().has_free());
+    }
+
+    #[test]
+    fn test_fill_that_does_not_fit_returns_its_slot() {
+        let pool = one_chunk(2);
+        let reserved = reserve(&pool);
+        let first = reserved.index();
+        let too_long = vec![1; SLOT_BYTES + 1];
+
+        let filled = panic::catch_unwind(AssertUnwindSafe(|| {
+            reserved.fill(Arc::clone(&pool), 0, ChunkId::new(0), &too_long)
+        }));
+
+        assert!(filled.is_err());
+        assert_eq!(pool.0.lock().unwrap().held(), 0);
+        let again = reserve(&pool);
+        assert_eq!(again.index(), first);
+        drop(again.fill(Arc::clone(&pool), 0, ChunkId::new(0), &[1; SLOT_BYTES]));
+    }
+}

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 
-use crate::chunk::{Chunk, ChunkId, Release, Slot};
+use crate::chunk::{Chunk, ChunkId, Release, Reserved, Returning};
 use crate::class::{MIN_SLAB_BYTES, class_index, in_slabs, slab_class, slots_per_chunk};
 
 /// Slabs for values from `MIN_SLAB_BYTES` to a longest length, one per slab
@@ -60,7 +60,8 @@ impl<R: Clone + Send + Sync + 'static> Slabs<R> {
             return None;
         }
         let class = class_index(slab_class(bytes.len()));
-        Some(self.pool.claim(class, bytes.len(), record).fill(bytes))
+        let (reserved, chunk) = self.pool.reserve(class, record);
+        Some(reserved.fill(Arc::clone(&self.pool), class, chunk, bytes))
     }
 
     /// Bytes of every chunk the slabs hold, their free slots included.
@@ -87,55 +88,59 @@ struct Pool<R> {
 }
 
 impl<R: Send + 'static> Pool<R> {
-    /// A free slot of class `class` for a value of `len` bytes, now held
-    /// with `record`: in the fullest chunk with room, or in a new chunk
-    /// when none has room. The slot is filled after the class's lock is
-    /// released, since nothing refers to it until its store returns.
-    fn claim(self: &Arc<Self>, class: usize, len: usize, record: R) -> Slot<Self> {
+    /// A free slot of class `class`, now held with `record`, and its chunk:
+    /// the fullest chunk with room, or a new chunk when none has room. The
+    /// caller fills the slot after the class's lock is released, since
+    /// nothing refers to it until its store returns. Any record the slot
+    /// still had drops after the lock is released.
+    fn reserve(&self, class: usize, record: R) -> (Reserved, ChunkId) {
         let slab = &self.classes[class];
-        let mut guard = slab.lock();
-        let state = &mut *guard;
-        let id = if let Some(&(_, id)) = state.room.last() {
-            id
-        } else {
-            let chunk = ChunkState::new(Chunk::new(slab.slot_bytes, slab.slots), slab.slots);
-            self.chunk_bytes
-                .fetch_add(count(chunk.chunk.bytes()), Ordering::Relaxed);
-            state.add(chunk)
+        let (reserved, id, _replaced) = {
+            let mut guard = slab.lock();
+            let state = &mut *guard;
+            let id = if let Some(&(_, id)) = state.room.last() {
+                id
+            } else {
+                let chunk = ChunkState::new(Chunk::new(slab.slot_bytes, slab.slots), slab.slots);
+                self.chunk_bytes
+                    .fetch_add(count(chunk.chunk.bytes()), Ordering::Relaxed);
+                state.add(chunk)
+            };
+            let chunk = state.chunks[id.index()]
+                .as_mut()
+                .expect("a chunk in the set of chunks with room is in its class");
+            let held = chunk.chunk.held();
+            let reserved = chunk
+                .chunk
+                .reserve()
+                .expect("a chunk with room, or a new one, has a free slot");
+            let replaced = chunk.records[reserved.index()].replace(record);
+            state.room.remove(&(held, id));
+            if chunk.chunk.has_free() {
+                state.room.insert((chunk.chunk.held(), id));
+            }
+            self.held_slots.fetch_add(1, Ordering::Relaxed);
+            (reserved, id, replaced)
         };
-        let chunk = state.chunks[id.index()]
-            .as_mut()
-            .expect("a chunk in the set of chunks with room is in its class");
-        let held = chunk.chunk.held();
-        let slot = chunk
-            .chunk
-            .claim(self, class, id, len)
-            .expect("a chunk with room, or a new one, has a free slot");
-        chunk.records[slot.index()] = Some(record);
-        state.room.remove(&(held, id));
-        if chunk.chunk.has_free() {
-            state.room.insert((chunk.chunk.held(), id));
-        }
-        self.held_slots.fetch_add(1, Ordering::Relaxed);
-        slot
+        (reserved, id)
     }
 }
 
 impl<R: Send + 'static> Release for Pool<R> {
-    /// Returns `slot` to its chunk and clears its record, and frees the
+    /// Returns the slot to its chunk and clears its record, and frees the
     /// chunk when no slot in it is held. The record and the chunk drop
     /// after the class's lock is released.
-    fn release(&self, slot: &Slot<Self>) {
+    fn release(&self, returning: Returning<'_, Self>) {
         let (_record, _freed) = {
-            let mut guard = self.classes[slot.class()].lock();
+            let mut guard = self.classes[returning.class()].lock();
             let state = &mut *guard;
-            let id = slot.chunk();
+            let id = returning.chunk();
             let entry = &mut state.chunks[id.index()];
             let chunk = entry
                 .as_mut()
                 .expect("a held slot's chunk stays in its class");
             let held = chunk.chunk.held();
-            let index = chunk.chunk.release(slot);
+            let index = chunk.chunk.release(returning);
             let record = chunk.records[index].take();
             state.room.remove(&(held, id));
             self.held_slots.fetch_sub(1, Ordering::Relaxed);
