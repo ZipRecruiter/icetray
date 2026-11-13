@@ -64,7 +64,12 @@ out as a reference to its slot rather than a copy.
   MultiGet holds the values it returns, and any reader of a page until it
   is done with it. A chunk being emptied takes no new values, and the slab
   frees it when its last held slot drops; a gauge reports the bytes in
-  chunks waiting.
+  chunks waiting. Until then such a chunk counts whole against the
+  reserve, and while readers hold slots of enough of them, the cache's
+  memory passes the reserve, and the budget, by those chunks, the one way
+  it does. An entry an insert caches while its slot's chunk is being
+  marked is dropped by that insert, so no entry holds a chunk being
+  emptied for longer than the insert takes.
 - **Locking.** A slab takes its lock to claim and to free a slot, and a
   store copies its bytes into the slot outside the lock, since nothing
   refers to a slot until its store returns. A hit takes no slab lock.

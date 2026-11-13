@@ -531,10 +531,13 @@ pub struct RowCache(Arc<Inner>);
 impl RowCache {
     /// A cache whose entries, as `charged` charges them, ghost list, and
     /// slabs' bytes no entry is charged for (`Slabs::uncharged_bytes`)
-    /// together take at most `capacity_bytes` while no reader holds a slot
-    /// of a chunk being emptied: the slabs' reserve is held back from it
-    /// (`SLAB_RESERVE_DIVISOR`), the ghost list's slots are reserved out of
-    /// the rest (`GhostReserve`), and the entries hold what remains. Its
+    /// together take at most `capacity_bytes`: the slabs' reserve is held
+    /// back from it (`SLAB_RESERVE_DIVISOR`), the ghost list's slots are
+    /// reserved out of the rest (`GhostReserve`), and the entries hold what
+    /// remains. Only chunks being emptied whose slots readers still hold
+    /// take more: each counts whole among the slabs' bytes until its last
+    /// reader drops its value, and together they can pass the reserve, and
+    /// the cache its budget, by as much as the readers hold. Its
     /// hit, miss, stale, and slab wait counters are registered at zero in
     /// the recorder current now. It splits into shards chosen for
     /// `capacity_bytes`, each holding its share of the entries' part, so
@@ -605,14 +608,38 @@ impl RowCache {
         self.fit();
     }
 
+    /// Caches `key` and `value`, an entry `entry` made, and fits the cache
+    /// within its budget (`fit`). An emptying can mark the chunk of the
+    /// entry's slot between the store that filled the slot and the insert,
+    /// and then find no entry by the slot's record, so the insert comes
+    /// first and the ask after (`Slabs::is_emptying`): an emptying that
+    /// marked the chunk before the ask is seen by it, and the entry
+    /// dropped, and one that marks it after finds the entry by its record.
+    fn admit(&self, key: EntryKey, value: EntryValue) {
+        let built = self.0.built.load();
+        let slot = match (&value.entry.held, value.home) {
+            (Held::Value(bytes), Home::Slot) => Some((key.clone(), bytes.clone())),
+            (Held::Value(_), Home::Own) | (Held::Null | Held::Present, _) => None,
+        };
+        built.cache.insert(key, value);
+        if let Some((key, bytes)) = slot
+            && self.0.slabs.is_emptying(&bytes)
+        {
+            let at = bytes.as_ptr().addr();
+            built.cache.remove_if(&key, |value| value.holds_slot(at));
+        }
+        drop(built);
+        self.fit();
+    }
+
     /// Brings the slabs' uncharged bytes back within the reserve: while
     /// they pass it, and the chunks being emptied alone do not, so the free
     /// slots are what pushes them over, empties the sparsest chunk of the
     /// class whose free slots hold the most, dropping the entries that
     /// hold its slots. A chunk that no reader holds is freed then; one a
-    /// reader holds, or whose slot an insert has reserved and not yet
-    /// cached, waits for that slot to drop, counted among the chunks being
-    /// emptied, and nothing waits for it here. Each round takes one chunk
+    /// reader holds waits for the reader to drop its slot, counted among the
+    /// chunks being emptied, and nothing waits for it here. A slot an insert
+    /// has filled and not yet cached is dropped by that insert (`admit`). Each round takes one chunk
     /// out of those a store may fill, so the rounds end.
     fn fit(&self) {
         let built = self.0.built.load();
@@ -750,12 +777,10 @@ impl TableRows {
             return;
         }
         let inner = &self.cache.0;
-        let built = inner.built.load();
-        let slabs = built.uses_slabs().then_some(&inner.slabs);
+        let uses_slabs = inner.built.load().uses_slabs();
+        let slabs = uses_slabs.then_some(&inner.slabs);
         let (key, value) = entry(slabs, self.table, part, &key.as_bytes(), source, held);
-        built.cache.insert(key, value);
-        drop(built);
-        self.cache.fit();
+        self.cache.admit(key, value);
     }
 
     /// Drops the entry for `part` of `key`'s row if it is still the one
@@ -1263,6 +1288,47 @@ mod tests {
         );
         drop(readers);
         assert_eq!(slabs.waiting_bytes(), 0, "every waiting chunk is freed");
+    }
+
+    /// An entry whose slot's chunk is marked for emptying between the store
+    /// that fills the slot and the insert that caches the entry, so the
+    /// emptying finds no entry by the slot's record, is dropped by the
+    /// insert, and the chunk is freed.
+    #[test]
+    fn test_an_insert_racing_an_emptying_leaves_no_entry_in_the_chunk() {
+        let cache = RowCache::new(ROOMY_BYTES);
+        let rows = cache.for_table(TABLE);
+        let at = key(1, 0);
+        let value = vec![9_u8; 4242];
+        let (entry_key, entry_value) = entry(
+            Some(&cache.0.slabs),
+            rows.table,
+            Part::Column(at.column),
+            &long(at.n).as_bytes(),
+            source(at.n),
+            Caching::Column(Some(&value)),
+        );
+        let slabs = &cache.0.slabs;
+        let class = slabs
+            .class_over(0)
+            .expect("the slot's chunk has free slots");
+        for Emptied { record, at: slot } in slabs.empty_sparsest(class) {
+            let removed = cache
+                .0
+                .built
+                .load()
+                .cache
+                .remove_if(&record, |held| held.holds_slot(slot));
+            assert!(removed.is_none(), "no entry holds the slot yet");
+        }
+        assert!(slabs.waiting_bytes() > 0, "the chunk is being emptied");
+        cache.admit(entry_key, entry_value);
+        assert!(
+            !cache.holds(&at),
+            "the entry pinning a chunk being emptied stays"
+        );
+        assert_eq!(slabs.chunk_bytes(), 0, "the chunk is freed");
+        assert_eq!(slabs.waiting_bytes(), 0);
     }
 
     /// Many inserts across classes, evicting entries and emptying chunks,
