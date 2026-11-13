@@ -34,6 +34,7 @@
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use bytes::Bytes;
 
@@ -276,6 +277,14 @@ impl<'a, P: Release> Returning<'a, P> {
     pub(crate) fn chunk(&self) -> ChunkId {
         self.slot.chunk
     }
+}
+
+/// Bytes of what `Bytes::from_owner` allocates for a slot of pool `P`'s:
+/// `bytes`' own reference count beside the slot, its owner. The owner holds
+/// the pool by an `Arc`, a pointer whatever the pool, so the length is the
+/// same for every pool.
+pub(crate) const fn owner_handle_len<P: Release>() -> usize {
+    size_of::<AtomicUsize>() + size_of::<Slot<P>>()
 }
 
 /// A filled slot: the owner of the `Bytes` that `Reserved::fill` returns,

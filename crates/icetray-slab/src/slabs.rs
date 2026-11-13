@@ -9,8 +9,16 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use crate::chunk::{Chunk, ChunkId, Release, Reserved, Returning};
-use crate::class::{MIN_SLAB_BYTES, class_index, in_slabs, slab_class, slots_per_chunk};
+use crate::chunk::{Chunk, ChunkId, Release, Reserved, Returning, owner_handle_len};
+use crate::class::{
+    MIN_SLAB_BYTES, class_index, in_slabs, jemalloc_class, slab_class, slots_per_chunk,
+};
+
+/// Bytes jemalloc allocates for the handle every `Bytes` that `Slabs::store`
+/// returns reads its slot through: what `Bytes::from_owner` boxes, the
+/// slot's owner and a reference count, in jemalloc's size class. Each value
+/// in a slab pays it once, however many clones share it, beside its slot.
+pub const SLOT_HANDLE_BYTES: usize = jemalloc_class(owner_handle_len::<Pool<()>>());
 
 /// Slabs for values from `MIN_SLAB_BYTES` to a longest length, one per slab
 /// class, each recording an `R` for every value it holds. A clone shares
@@ -463,6 +471,18 @@ mod tests {
         let mut records: Vec<R> = emptied.into_iter().map(|e| e.record).collect();
         records.sort();
         records
+    }
+
+    /// The handle's length is the slot's owner and a reference count,
+    /// whatever the records the pool keeps, and its charge is that length
+    /// in jemalloc's size class.
+    #[test]
+    fn test_slot_handle_bytes_is_the_owner_and_its_count() {
+        let len = owner_handle_len::<Pool<()>>();
+        assert_eq!(len, owner_handle_len::<Pool<[u64; 64]>>());
+        assert!(len > size_of::<usize>() + size_of::<Arc<Pool<()>>>());
+        assert_eq!(SLOT_HANDLE_BYTES, jemalloc_class(len));
+        assert!(SLOT_HANDLE_BYTES >= len);
     }
 
     #[test]
