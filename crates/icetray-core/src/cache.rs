@@ -26,7 +26,7 @@ use foyer::{
     HybridCache, HybridCacheBuilder, HybridCachePolicy, HybridCacheProperties, RecoverMode,
     S3FifoConfig, Source,
 };
-use icetray_slab::{ClassId, Emptied, MAX_SLOTS_PER_CHUNK, Slabs, in_slabs, is_slot};
+use icetray_slab::{ChunkToken, ClassId, Emptied, MAX_SLOTS_PER_CHUNK, Slabs, in_slabs, is_slot};
 use metrics::Counter;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
@@ -72,11 +72,12 @@ const MAX_SLAB_PAGE_BYTES: u64 = 2 * VALUE_PAGE_BYTES;
 const RECHECKS_PER_FIT: usize = MAX_SLOTS_PER_CHUNK;
 
 /// A chunk an emptying marked, kept while it is being emptied
-/// (`PageCache::recheck`): its class, and the key of the page that held
-/// each slot the emptying handed out, with the slot's address. An
-/// emptying hands out at least one slot, so `slots` is never empty.
+/// (`PageCache::recheck`): its class, its token (`Slabs::is_being_emptied`),
+/// and the key of the page that held each slot the emptying handed out,
+/// with the slot's address.
 struct Emptying {
     class: ClassId,
+    chunk: ChunkToken,
     slots: Vec<(PageKey, usize)>,
 }
 
@@ -430,15 +431,17 @@ struct PageSlabs {
     /// `PAGE_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL`, which
     /// `PageCache::publish_usage` sets from the slabs' own count.
     slab_wait: Counter,
-    /// One entry per chunk an emptying of this cache marked, in the order
-    /// the next fits look in its slots again (`PageCache::recheck`). Each
-    /// fit drops every entry whose first slot no longer lies in a chunk
-    /// being emptied (`Slabs::is_emptying_in`), so after a fit the list
-    /// holds one entry for each chunk being emptied that this cache marked,
-    /// and one more for each earlier chunk at the same address whose
-    /// freeing no fit found before the later chunk was marked. The chunks
-    /// being emptied are those `slab_policy::fit` marked while the chunks
-    /// waiting were within the reserve, plus the chunk it marked last.
+    /// The chunks an emptying of this cache marked, in the order the next
+    /// fits look in their slots again (`PageCache::recheck`). An emptying
+    /// marks a chunk once, and each fit drops every kept chunk it finds no
+    /// longer being emptied, by the chunk's token, which no other chunk
+    /// takes (`Slabs::is_being_emptied`), so the list holds one entry per
+    /// chunk being emptied that this cache marked, as of the last fit's
+    /// check of it: a chunk freed since, by a reader or the disk level's
+    /// write queue dropping its last slot, stays until the next fit, and a
+    /// fit in progress holds out the few it is looking in. The chunks being
+    /// emptied are those `slab_policy::fit` marked while the chunks waiting
+    /// were within the reserve, plus the chunk it marked last.
     emptied: Mutex<VecDeque<Emptying>>,
     /// How many times `PageCache::resize_memory` has resized the memory
     /// level: what the capacity test counts, since foyer reports the
@@ -1361,60 +1364,73 @@ impl PageCache {
     fn fit_within(&self, reserve: u64) {
         let mut marked = Vec::new();
         slab_policy::fit(&self.slabs.slabs, reserve, |class, emptied| {
+            let Some(chunk) = emptied.first().map(|slot| slot.chunk) else {
+                return;
+            };
             let slots = emptied
                 .into_iter()
-                .map(|Emptied { record, at }| {
+                .map(|Emptied { record, at, .. }| {
                     self.evict_slot(&record, at);
                     (record, at)
                 })
                 .collect();
-            marked.push(Emptying { class, slots });
+            marked.push(Emptying {
+                class,
+                chunk,
+                slots,
+            });
         });
         self.recheck(marked);
     }
 
     /// Adds `marked`, the chunks an emptying just marked, to those kept
-    /// (`PageSlabs::emptied`), drops every kept chunk that has been freed,
-    /// and looks again in the slots of the chunks at the front, putting them
-    /// at the end, until it has looked in `RECHECKS_PER_FIT` slots or in
-    /// every kept chunk's: a page memory holds in one is taken out as an
-    /// emptying takes one (`evict_slot`). foyer puts a page back in memory
-    /// in such a slot on its own, a fetch's it inserts after the emptying
-    /// marked the chunk or one its disk level's write queue hands back, and
-    /// the read that would move it (`settle`) can be gone by then, so
-    /// without this the page would keep its chunk from going back until
-    /// foyer evicted it. Freed chunks are found by one `is_emptying_in` per
-    /// kept chunk, which takes no lock for a class with no chunk being
-    /// emptied. The list's lock is held throughout, so fits look in it one
-    /// at a time; nothing that `evict_slot` locks takes it.
+    /// (`PageSlabs::emptied`), drops every kept chunk no longer being
+    /// emptied (`Slabs::is_being_emptied`), and takes the chunks at the
+    /// front out of the list until their slots number `RECHECKS_PER_FIT` or
+    /// it has taken every kept chunk. With the list's lock released, it
+    /// looks in their slots, taking a page memory holds in one out as an
+    /// emptying takes one (`evict_slot`), and then puts the chunks back at
+    /// the end, those its look freed left out. foyer puts a page back
+    /// in memory in such a slot on its own, a fetch's it inserts after the
+    /// emptying marked the chunk or one its disk level's write queue hands
+    /// back, and the read that would move it (`settle`) can be gone by
+    /// then, so without this the page would keep its chunk from going back
+    /// until foyer evicted it. The list's lock is held only around the list:
+    /// `is_being_emptied` takes a slab class's lock under it, and nothing
+    /// that takes a slab class's lock takes the list's.
     fn recheck(&self, marked: Vec<Emptying>) {
         let slabs = &self.slabs.slabs;
-        let mut kept = self
-            .slabs
-            .emptied
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        kept.extend(marked);
-        kept.retain(|chunk| {
-            chunk
-                .slots
-                .first()
-                .is_some_and(|&(_, at)| slabs.is_emptying_in(chunk.class, at))
-        });
-        let mut looked = 0;
-        for _ in 0..kept.len() {
-            if looked >= RECHECKS_PER_FIT {
-                break;
+        let due: Vec<Emptying> = {
+            let mut kept = self
+                .slabs
+                .emptied
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            kept.extend(marked);
+            kept.retain(|chunk| slabs.is_being_emptied(chunk.class, chunk.chunk));
+            let mut slots = 0;
+            let mut take = 0;
+            for chunk in kept.iter() {
+                if slots >= RECHECKS_PER_FIT {
+                    break;
+                }
+                slots += chunk.slots.len();
+                take += 1;
             }
-            let Some(chunk) = kept.pop_front() else {
-                break;
-            };
+            kept.drain(..take).collect()
+        };
+        for chunk in &due {
             for (key, at) in &chunk.slots {
                 self.evict_slot(key, *at);
             }
-            looked += chunk.slots.len();
-            kept.push_back(chunk);
         }
+        let mut due = due;
+        due.retain(|chunk| slabs.is_being_emptied(chunk.class, chunk.chunk));
+        self.slabs
+            .emptied
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(due);
     }
 
     /// One page served without a fetch.
@@ -3451,6 +3467,43 @@ mod tests {
                 .len();
             assert_eq!(kept, 0, "round {round}");
         }
+    }
+
+    /// A chunk freed outside a fit, whose address the next chunk of its
+    /// class takes, which the next fit marks while a reader holds a slot of
+    /// it, leaves no entry behind for the freed one: round after round the
+    /// list of kept chunks holds only the chunk being emptied now.
+    #[tokio::test]
+    async fn test_a_freed_chunk_whose_address_is_marked_again_is_not_kept() {
+        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let Level::Memory(memory) = cache.level.as_ref() else {
+            panic!("a cache without a disk level is memory only");
+        };
+        let slabs = &cache.slabs.slabs;
+        let rounds = 4;
+        let mut addresses = Vec::new();
+        for round in 0..rounds {
+            let key = PageKey(Arc::from(FILE_ID), round);
+            let value = PageValue::copied(cache.slabs.taking(), &key, &page_of(SLAB_PAGE_LEN, 2));
+            let reader = value.bytes.clone();
+            addresses.push(reader.as_ptr().addr());
+            memory.insert(key, value);
+            cache.fit_within(0);
+            assert!(slabs.waiting_bytes() > 0, "the reader's chunk waits");
+            let kept = cache
+                .slabs
+                .emptied
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len();
+            assert_eq!(kept, 1, "round {round}");
+            drop(reader);
+            assert_eq!(slabs.waiting_bytes(), 0, "freed outside a fit");
+        }
+        assert!(
+            addresses.windows(2).any(|pair| pair[0] == pair[1]),
+            "a chunk took a freed one's address: {addresses:?}"
+        );
     }
 
     /// A page read back from the disk level keeps the age foyer gave it

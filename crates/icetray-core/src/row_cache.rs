@@ -591,7 +591,7 @@ impl RowCache {
     fn fit(&self) {
         let built = self.0.built.load();
         slab_policy::fit(&self.0.slabs, built.reserve(), |_, emptied| {
-            for Emptied { record, at } in emptied {
+            for Emptied { record, at, .. } in emptied {
                 // Only the entry still holding the slot is dropped. A freed
                 // chunk's address can be reused, so once the slot's chunk is
                 // freed this can drop a newer entry at the same address: a
@@ -1253,7 +1253,10 @@ mod tests {
         let class = slabs
             .class_over(0)
             .expect("the slot's chunk has free slots");
-        for Emptied { record, at: slot } in slabs.empty_sparsest(class) {
+        for Emptied {
+            record, at: slot, ..
+        } in slabs.empty_sparsest(class)
+        {
             let removed = cache
                 .0
                 .built
