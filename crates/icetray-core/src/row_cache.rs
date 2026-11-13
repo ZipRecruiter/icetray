@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use icetray_slab::{Slabs, is_slot, jemalloc_class};
+use icetray_slab::{Emptied, Slabs, is_slot, jemalloc_class};
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use quick_cache::{DefaultHashBuilder, Equivalent, OptionsBuilder, Weighter};
 
@@ -590,12 +590,14 @@ impl RowCache {
     /// is dropped by that insert (`admit`).
     fn fit(&self) {
         let built = self.0.built.load();
-        slab_policy::fit(&self.0.slabs, built.reserve(), |record, at, _| {
-            // Only the entry still holding the slot is dropped. A freed
-            // chunk's address can be reused, so once the slot's chunk is
-            // freed this can drop a newer entry at the same address: a
-            // cache miss, never a wrong answer.
-            built.cache.remove_if(&record, |value| value.holds_slot(at));
+        slab_policy::fit(&self.0.slabs, built.reserve(), |_, emptied| {
+            for Emptied { record, at } in emptied {
+                // Only the entry still holding the slot is dropped. A freed
+                // chunk's address can be reused, so once the slot's chunk is
+                // freed this can drop a newer entry at the same address: a
+                // cache miss, never a wrong answer.
+                built.cache.remove_if(&record, |value| value.holds_slot(at));
+            }
         });
     }
 
