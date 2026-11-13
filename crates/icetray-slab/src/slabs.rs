@@ -171,12 +171,14 @@ impl<R: Clone + Send + Sync + 'static> Slabs<R> {
         self.pool.empty_sparsest(class.index())
     }
 
-    /// Whether `bytes`, a value `store` returned or a part of one, lie in a
-    /// chunk of these slabs being emptied: a cache that cached a value
-    /// while its chunk was being marked asks this after caching it, and
-    /// drops the entry when the answer is yes, since the mark handed out
-    /// the slot's record before the entry existed. False for bytes of any
-    /// other allocation.
+    /// Whether `bytes`, a value `store` returned or a part of one whose
+    /// length is in the value's class, lie in a chunk of these slabs being
+    /// emptied: the class is taken from the length, so a part short enough
+    /// to fall in another class is looked for there, and the answer is
+    /// false. A cache that cached a value while its chunk was being marked
+    /// asks this after caching it, and drops the entry when the answer is
+    /// yes, since the mark handed out the slot's record before the entry
+    /// existed. False for bytes of any other allocation.
     ///
     /// It reads the class's count of chunks being emptied, which changes
     /// under the class's lock, without the lock, and takes the lock, to
@@ -597,7 +599,10 @@ mod tests {
         let emptied = slabs.empty_sparsest(class_of(LEN_4352_CLASS));
         assert_eq!(records(emptied), vec![1, 2]);
         assert!(slabs.is_emptying(&first));
-        assert!(slabs.is_emptying(&second[1..]), "a part of a slot");
+        assert!(
+            slabs.is_emptying(&second[1..]),
+            "a part of a slot in its class"
+        );
         assert!(!slabs.is_emptying(&other), "another class");
         assert!(!slabs.is_emptying(&outside), "bytes outside the slabs");
         let later = slabs.store(&pattern(LEN_4352_CLASS, 5), 5).unwrap();

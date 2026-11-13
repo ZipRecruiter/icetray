@@ -10,12 +10,12 @@
 //!
 //! 1. **A slot is written only while nothing refers to it.** `Chunk::reserve`
 //!    hands out a slot only while its chunk marks it free, and marks it held
-//!    as it does. `Reserved::fill` writes it once, before the slot's owner
-//!    exists, and nothing writes it again until that owner drops and marks
-//!    it free.
-//! 2. **A chunk outlives every slot in it.** A chunk frees its memory on
-//!    drop only when it marks every slot free; dropped with a slot held, it
-//!    leaks the memory instead, which the slot goes on reading.
+//!    as it does. `Reserved::fill` writes it once, before the `Bytes` that
+//!    reads it through the slot's owner exists, and nothing writes it again
+//!    until that owner drops and marks it free.
+//! 2. **A chunk's memory outlives every slot in it.** A chunk frees its
+//!    memory on drop only when it marks every slot free; dropped with a slot
+//!    held, it leaks the memory instead, which the slot goes on reading.
 //! 3. **Slots lie inside their chunk, apart from each other.** Slot `i` of a
 //!    chunk of `slot_bytes`-byte slots starts `i * slot_bytes` bytes in, `i`
 //!    is below the chunk's slot count, and a slot's length is at most
@@ -25,11 +25,12 @@
 //! which admits storing bytes and dropping the `Bytes` that reads them, and
 //! learning a slot's address as a number, which reaches nothing. A
 //! `Reserved` slot has one use, `fill`, which returns the `Bytes`; the
-//! owner that reads the slot is private here and exists only filled. A slot
-//! is marked free only through `Chunk::release`, whose `Returning` only an
-//! owner's drop makes, once, and which checks that the slot lies in the
-//! chunk it returns to. So the pool's bookkeeping, in the `slabs` module,
-//! can strand memory or panic, but it cannot break an invariant.
+//! owner that reads the slot is private here and is read only once filled.
+//! A slot is marked free only through `Chunk::release`, whose `Returning`
+//! only an owner's drop makes, once, and which checks that the slot lies in
+//! the chunk it returns to and is held there. So the pool's bookkeeping, in
+//! the `slabs` module, can strand memory or panic, but it cannot break an
+//! invariant.
 
 use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
@@ -237,8 +238,8 @@ impl Reserved {
         );
         // SAFETY: invariant 1: the slot was free when `reserve` made `self`,
         // which `fill` consumes, and `slot`, the only owner, is not yet in a
-        // `Bytes`, so nothing reads the slot. Invariant 2: the chunk lives
-        // while its slot is held. Invariant 3: the slot's `len` bytes lie
+        // `Bytes`, so nothing reads the slot. Invariant 2: the chunk's memory
+        // lives while its slot is held. Invariant 3: the slot's `len` bytes lie
         // inside its chunk and apart from every other slot, so `bytes`,
         // which nothing writes while it is borrowed and which may lie in
         // another slot, does not overlap them.
@@ -303,8 +304,8 @@ impl<P: Release> AsRef<[u8]> for Slot<P> {
     fn as_ref(&self) -> &[u8] {
         // SAFETY: invariant 1: `fill` wrote all `len` bytes before the
         // `Bytes` that calls this existed, and nothing writes them until
-        // this slot drops. Invariant 2: the chunk lives while the slot is
-        // held. Invariant 3: the bytes lie inside the chunk and apart from
+        // this slot drops. Invariant 2: the chunk's memory lives while the
+        // slot is held. Invariant 3: the bytes lie inside the chunk and apart from
         // the other slots, which other threads write.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
@@ -350,6 +351,65 @@ mod tests {
 
     fn reserve(pool: &OneChunk) -> Reserved {
         pool.0.lock().unwrap().reserve().unwrap()
+    }
+
+    /// A pool of two chunks whose bookkeeping returns every slot to the
+    /// second, wherever it lies.
+    struct Misrouting(Mutex<[Chunk; 2]>);
+
+    impl Release for Misrouting {
+        fn release(&self, returning: Returning<'_, Self>) {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner)[1].release(returning);
+        }
+    }
+
+    /// A pool of one chunk whose bookkeeping has marked every slot free
+    /// already when a slot returns.
+    struct Twice(Mutex<Chunk>);
+
+    impl Release for Twice {
+        fn release(&self, returning: Returning<'_, Self>) {
+            let mut chunk = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            chunk.free = all_free(chunk.slots);
+            chunk.release(returning);
+        }
+    }
+
+    /// A slot that the pool returns to a chunk it does not lie in panics
+    /// there, before any chunk marks it free; the chunk it lies in still
+    /// holds it, so the test marks it free by hand for the chunk to free
+    /// its memory.
+    #[test]
+    fn test_a_slot_released_to_another_chunk_panics() {
+        let pool = Arc::new(Misrouting(Mutex::new([
+            Chunk::new(SLOT_BYTES, 1),
+            Chunk::new(SLOT_BYTES, 1),
+        ])));
+        let reserved = pool.0.lock().unwrap()[0].reserve().unwrap();
+        let bytes = reserved.fill(Arc::clone(&pool), 0, ChunkId::new(0), &[1; SLOT_BYTES]);
+
+        let released = panic::catch_unwind(AssertUnwindSafe(|| drop(bytes)));
+
+        assert!(released.is_err());
+        let mut chunks = pool.0.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(chunks[0].held(), 1, "the slot's own chunk still holds it");
+        assert_eq!(chunks[1].held(), 0, "the other chunk marked nothing");
+        chunks[0].free = all_free(chunks[0].slots);
+    }
+
+    /// A slot returned to its chunk while the chunk marks it free already
+    /// panics there.
+    #[test]
+    fn test_a_slot_released_while_marked_free_panics() {
+        let pool = Arc::new(Twice(Mutex::new(Chunk::new(SLOT_BYTES, 2))));
+        let reserved = pool.0.lock().unwrap().reserve().unwrap();
+        let bytes = reserved.fill(Arc::clone(&pool), 0, ChunkId::new(0), &[1; SLOT_BYTES]);
+
+        let released = panic::catch_unwind(AssertUnwindSafe(|| drop(bytes)));
+
+        assert!(released.is_err());
+        let chunk = pool.0.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(chunk.held(), 0);
     }
 
     #[test]

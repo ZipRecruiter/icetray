@@ -92,10 +92,11 @@ out as a reference to its slot rather than a copy.
   `icetray-slab` crate's `chunk` module under RFD 029 (Unsafe code),
   behind an API whose only ways in are storing bytes and dropping the
   `Bytes` it returns. Its invariants: a slot is written only while
-  nothing refers to it; a chunk outlives every slot in it; and slots lie
-  inside their chunk, apart from each other. Tests that Miri runs check each, and a test of many threads
-  storing, evicting, and reading at once checks every read against the
-  bytes its key was stored with.
+  nothing refers to it; a chunk's memory outlives every slot in it; and
+  slots lie inside their chunk, apart from each other. Tests that Miri
+  runs check each, and a test of many threads storing, evicting, and
+  reading at once checks every read against the bytes its key was stored
+  with.
 
 ## Alternatives Considered
 
