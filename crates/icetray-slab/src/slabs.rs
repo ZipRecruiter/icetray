@@ -123,7 +123,8 @@ impl<R: Clone + Send + Sync + 'static> Slabs<R> {
 
     /// Bytes the slabs hold that no value is charged for: the free slots
     /// of chunks not being emptied, and the whole of every chunk being
-    /// emptied. A cache's capacity for its entries is its budget less this.
+    /// emptied. A cache holds a reserve of its budget for these, and
+    /// empties chunks when they pass it.
     pub fn uncharged_bytes(&self) -> u64 {
         self.pool.uncharged_bytes.load(Ordering::Relaxed)
     }
@@ -161,8 +162,32 @@ impl<R: Clone + Send + Sync + 'static> Slabs<R> {
         self.pool.empty_sparsest(class.index())
     }
 
+    /// Whether `bytes`, a value `store` returned or a part of one, lie in a
+    /// chunk of these slabs being emptied: a cache that cached a value
+    /// while its chunk was being marked asks this after caching it, and
+    /// drops the entry when the answer is yes, since the mark handed out
+    /// the slot's record before the entry existed. False for bytes of any
+    /// other allocation.
+    ///
+    /// It reads the class's count of chunks being emptied, which changes
+    /// under the class's lock, without the lock, and takes the lock, to
+    /// find the chunk among those being emptied, only while the count is
+    /// not zero. Every emptying that happens before the call raised the
+    /// count before it, so the call sees it; an emptying that does not
+    /// happen before the call finds the caller's entry by the slot's
+    /// record instead, as `empty_sparsest` hands it out.
+    pub fn is_emptying(&self, bytes: &[u8]) -> bool {
+        if !in_slabs(bytes.len(), self.pool.max_bytes) {
+            return false;
+        }
+        let class = class_index(slab_class(bytes.len()));
+        self.pool.is_emptying(class, bytes.as_ptr().addr())
+    }
+
     /// Nanoseconds that stores, frees, and emptying spent waiting for a
     /// class's lock, counted only from a `try_lock` that found it held.
+    /// Emptying includes `is_emptying`, which takes the lock only while a
+    /// chunk of its class is being emptied.
     pub fn lock_wait_nanos(&self) -> u64 {
         self.pool.lock_wait_nanos.load(Ordering::Relaxed)
     }
@@ -261,6 +286,8 @@ impl<R: Send + 'static> Pool<R> {
             .as_mut()
             .expect("a chunk in the set of chunks with room is in its class");
         chunk.emptying = true;
+        state.emptying.push(id);
+        slab.emptying_chunks.fetch_add(1, Ordering::Relaxed);
         let free = slab.chunk_charge - u64::from(held) * slab.slot_charge;
         slab.free_bytes.fetch_sub(free, Ordering::Relaxed);
         self.uncharged_bytes
@@ -278,6 +305,23 @@ impl<R: Send + 'static> Pool<R> {
                 })
             })
             .collect()
+    }
+
+    /// `Slabs::is_emptying` for an address `at` in class `class`.
+    fn is_emptying(&self, class: usize, at: usize) -> bool {
+        let slab = &self.classes[class];
+        if slab.emptying_chunks.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let guard = self.lock(class);
+        let chunk_len = slab.slot_bytes * slab.slots;
+        guard.emptying.iter().any(|id| {
+            let chunk = guard.chunks[id.index()]
+                .as_ref()
+                .expect("a chunk being emptied is in its class until it is freed");
+            let start = chunk.chunk.slot_addr(0);
+            (start..start + chunk_len).contains(&at)
+        })
     }
 
     /// Counts `bytes` more of class `slab`'s free slots in chunks not being
@@ -323,6 +367,10 @@ impl<R: Send + 'static> Release for Pool<R> {
                 self.chunk_bytes
                     .fetch_sub(slab.chunk_charge, Ordering::Relaxed);
                 if emptying {
+                    if let Some(at) = state.emptying.iter().position(|&being| being == id) {
+                        state.emptying.swap_remove(at);
+                    }
+                    slab.emptying_chunks.fetch_sub(1, Ordering::Relaxed);
                     self.waiting_bytes
                         .fetch_sub(slab.chunk_charge, Ordering::Relaxed);
                     self.uncharged_bytes
@@ -356,6 +404,9 @@ struct Class<R> {
     /// Bytes of free slots in the class's chunks not being emptied. Changes
     /// under `state`'s lock, read without it.
     free_bytes: AtomicU64,
+    /// The class's chunks being emptied (`ClassState::emptying`). Changes
+    /// under `state`'s lock, read without it by `Slabs::is_emptying`.
+    emptying_chunks: AtomicU64,
     state: Mutex<ClassState<R>>,
 }
 
@@ -369,10 +420,12 @@ impl<R> Class<R> {
             slot_charge: count(slot_bytes),
             chunk_charge: count(slot_bytes * slots),
             free_bytes: AtomicU64::new(0),
+            emptying_chunks: AtomicU64::new(0),
             state: Mutex::new(ClassState {
                 chunks: Vec::new(),
                 free_ids: Vec::new(),
                 room: BTreeSet::new(),
+                emptying: Vec::new(),
             }),
         }
     }
@@ -388,6 +441,8 @@ struct ClassState<R> {
     /// (held slots, id) of every chunk with a free slot that is not being
     /// emptied, so the first is the sparsest and the last the fullest.
     room: BTreeSet<(u32, ChunkId)>,
+    /// The ids of the chunks being emptied, until each is freed.
+    emptying: Vec<ChunkId>,
 }
 
 impl<R> ClassState<R> {
@@ -471,6 +526,38 @@ mod tests {
         let mut records: Vec<R> = emptied.into_iter().map(|e| e.record).collect();
         records.sort();
         records
+    }
+
+    /// `is_emptying` answers yes for the slots, and a part of a slot, of a
+    /// chunk being emptied, and no for a chunk of the class not being
+    /// emptied, for another class, for bytes outside the slabs, and once
+    /// the chunk is freed.
+    #[test]
+    fn test_is_emptying_names_only_slots_of_chunks_being_emptied() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let first = slabs.store(&pattern(LEN_4352_CLASS, 1), 1).unwrap();
+        let second = slabs.store(&pattern(LEN_4352_CLASS, 2), 2).unwrap();
+        let other = slabs.store(&pattern(MIN_SLAB_BYTES, 3), 3).unwrap();
+        let outside = pattern(LEN_4352_CLASS, 4);
+        for bytes in [&first, &second, &other] {
+            assert!(!slabs.is_emptying(bytes), "no chunk is being emptied");
+        }
+        let emptied = slabs.empty_sparsest(class_of(LEN_4352_CLASS));
+        assert_eq!(records(emptied), vec![1, 2]);
+        assert!(slabs.is_emptying(&first));
+        assert!(slabs.is_emptying(&second[1..]), "a part of a slot");
+        assert!(!slabs.is_emptying(&other), "another class");
+        assert!(!slabs.is_emptying(&outside), "bytes outside the slabs");
+        let later = slabs.store(&pattern(LEN_4352_CLASS, 5), 5).unwrap();
+        assert!(
+            !slabs.is_emptying(&later),
+            "a chunk of the class not being emptied"
+        );
+        drop((first, second));
+        assert_eq!(slabs.waiting_bytes(), 0, "the emptied chunk is freed");
+        assert!(!slabs.is_emptying(&later));
+        let reused = slabs.store(&pattern(LEN_4352_CLASS, 6), 6).unwrap();
+        assert!(!slabs.is_emptying(&reused), "after the chunk is freed");
     }
 
     /// The handle's length is the slot's owner and a reference count,
