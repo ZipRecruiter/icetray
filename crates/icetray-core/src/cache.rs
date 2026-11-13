@@ -17,7 +17,7 @@ use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -86,6 +86,14 @@ fn slab_max_bytes() -> usize {
     approx::length(MAX_SLAB_PAGE_BYTES)
 }
 
+/// The slab floor of the memory level's slabs (`slab_policy::floor_bytes`),
+/// about 455 MiB, summed once: every fetch asks whether the budget is over
+/// it.
+fn slab_floor_bytes() -> u64 {
+    static FLOOR: LazyLock<u64> = LazyLock::new(|| slab_policy::floor_bytes(slab_max_bytes()));
+    *FLOOR
+}
+
 /// What a page of `len` bytes held in `home` costs the memory budget:
 /// what its home charges (`Home::charged`) and the entry overhead.
 fn charged(len: usize, home: Home) -> u64 {
@@ -96,7 +104,7 @@ fn charged(len: usize, home: Home) -> u64 {
 /// entries take: the budget less the slabs' reserve
 /// (`slab_policy::reserve`).
 fn entries_bytes(budget: u64) -> u64 {
-    budget - slab_policy::reserve(budget, slab_max_bytes())
+    budget - slab_policy::reserve(budget, slab_floor_bytes())
 }
 
 /// The shards of the memory level: `shard::count()`, the runtime's worker
@@ -135,7 +143,7 @@ fn eviction() -> S3FifoConfig {
 pub(crate) fn min_memory_bytes(shards: usize) -> u64 {
     let len = approx::length(VALUE_PAGE_BYTES);
     let page = charged(len, Home::Slot).max(charged(len, Home::Own));
-    slab_policy::budget_holding(approx::count(shards) * page, slab_max_bytes())
+    slab_policy::budget_holding(approx::count(shards) * page, slab_floor_bytes())
 }
 
 /// `ConfigViolation::PageCacheTooSmall` for a memory budget of `bytes`
@@ -470,13 +478,13 @@ impl PageSlabs {
     /// The bytes of the budget held in reserve for the slabs
     /// (`slab_policy::reserve`).
     fn reserve(&self) -> u64 {
-        slab_policy::reserve(self.budget(), slab_max_bytes())
+        slab_policy::reserve(self.budget(), slab_floor_bytes())
     }
 
     /// The slabs a page cached now is stored into: none under the slab
     /// floor (`slab_policy::uses_slabs`).
     fn taking(&self) -> Option<&Slabs<PageKey>> {
-        slab_policy::uses_slabs(self.budget(), slab_max_bytes()).then_some(&self.slabs)
+        slab_policy::uses_slabs(self.budget(), slab_floor_bytes()).then_some(&self.slabs)
     }
 }
 
@@ -575,8 +583,10 @@ impl PageCache {
     /// more: each counts whole among the slabs' bytes until the last of
     /// them drops its page, and together they can pass the reserve, and
     /// the cache its budget, by as much as they hold. A budget under the
-    /// slab floor of 8 MiB (`slab_policy::floor_bytes`) keeps every page in
-    /// an allocation of its own and holds back no reserve. Its hit, fetch,
+    /// slab floor of about
+    /// 455 MiB (`slab_floor_bytes`), whose reserve holds one chunk of every
+    /// slab class, keeps every page in an allocation of its own and holds
+    /// back no reserve. Its hit, fetch,
     /// and slab wait counters are registered at zero in the recorder
     /// current now. `open_with` checks the budget against
     /// `min_memory_bytes` of the shards first (`check_capacity`), and a
@@ -1833,7 +1843,7 @@ mod tests {
 
     use super::*;
     use crate::approx::count;
-    use crate::approx::units::{KIB, MIB};
+    use crate::approx::units::MIB;
     use crate::config::LocalConfig;
     use crate::generation::testing::TABLE;
     use crate::local::LocalDir;
@@ -3084,8 +3094,11 @@ mod tests {
     }
 
     /// A memory budget at which the memory level keeps pages in slabs:
-    /// twice its slab floor of 8 MiB.
-    const SLAB_BYTES: u64 = 16 * MIB;
+    /// twice its slab floor (`slab_floor_bytes`). Only what a test caches
+    /// takes memory, so a large budget costs a test nothing.
+    fn slab_bytes() -> u64 {
+        2 * slab_floor_bytes()
+    }
     /// A page length a slab class holds, whose chunk holds 15 slots of
     /// 4,352 bytes.
     const SLAB_PAGE_LEN: usize = 4242;
@@ -3149,7 +3162,7 @@ mod tests {
             charge < charged(len, Home::Own),
             "the slot saves on jemalloc's class"
         );
-        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let cache = PageCache::new(slab_bytes(), None).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         let served = fetch_into(&cache, FIRST_OFFSET, &page_of(len, 7), &runs).await;
         assert_eq!(served, page_of(len, 7));
@@ -3165,7 +3178,7 @@ mod tests {
     /// chunk.
     #[tokio::test]
     async fn test_a_page_outside_the_classes_is_charged_its_jemalloc_class() {
-        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let cache = PageCache::new(slab_bytes(), None).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         let lens = [PAGE.len(), 1023, slab_max_bytes() + 1];
         for (offset, len) in (0..).zip(lens) {
@@ -3186,7 +3199,7 @@ mod tests {
     async fn test_an_emptied_page_is_served_from_the_disk_level() {
         let dir = tempfile::tempdir().unwrap();
         let (level, stats) = disk_level(dir.path());
-        let cache = PageCache::new(SLAB_BYTES, Some(level)).await.unwrap();
+        let cache = PageCache::new(slab_bytes(), Some(level)).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         let page = page_of(SLAB_PAGE_LEN, 3);
         fetch_into(&cache, FIRST_OFFSET, &page, &runs).await;
@@ -3233,7 +3246,7 @@ mod tests {
     /// read asks.
     #[tokio::test]
     async fn test_a_memory_hit_hands_out_the_slot() {
-        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let cache = PageCache::new(slab_bytes(), None).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         let page = page_of(SLAB_PAGE_LEN, 9);
         fetch_into(&cache, FIRST_OFFSET, &page, &runs).await;
@@ -3261,14 +3274,13 @@ mod tests {
         );
     }
 
-    /// Under the slab floor of 8 MiB pages stay in allocations of their
-    /// own and no reserve is held; a resize across the floor decides where
-    /// pages cached from then on live, and a resize under it empties the
-    /// chunks with free slots, which no reserve holds any more.
+    /// Under the slab floor pages stay in allocations of their own and no
+    /// reserve is held; a resize across the floor decides where pages
+    /// cached from then on live, and a resize under it empties the chunks
+    /// with free slots, which no reserve holds any more.
     #[tokio::test]
     async fn test_a_page_part_under_the_slab_floor_keeps_pages_on_jemalloc() {
-        let floor = slab_policy::floor_bytes(slab_max_bytes());
-        assert_eq!(floor, 8 * MIB);
+        let floor = slab_floor_bytes();
         let cache = PageCache::new(floor - 1, None).await.unwrap();
         assert_eq!(built_capacity(&cache), floor - 1, "no reserve");
         let runs = Arc::new(AtomicU64::new(0));
@@ -3304,7 +3316,7 @@ mod tests {
     /// caller is served (`settle`). Either way the chunk is freed.
     #[tokio::test]
     async fn test_a_page_cached_while_its_chunk_is_emptied_leaves_the_chunk() {
-        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let cache = PageCache::new(slab_bytes(), None).await.unwrap();
         let Level::Memory(memory) = cache.level.as_ref() else {
             panic!("a cache without a disk level is memory only");
         };
@@ -3334,35 +3346,40 @@ mod tests {
         }
     }
 
-    /// Memory filled to its budget with pages of one class, every other
-    /// one read again, then filled again with pages of another, which
-    /// evicts the first class's pages read once before those read again,
-    /// so free slots lie in every chunk of the first class until the cache
-    /// empties chunks: after every fetch the pages and the slabs' uncharged
-    /// bytes together hold the budget (`usage`), and the uncharged bytes
-    /// are back within the reserve, since no reader holds a slot.
+    /// Memory holding pages of one class, every other one then dropped and
+    /// a page of another class fetched in its place, so free slots lie in
+    /// every chunk of the first class until the cache empties chunks: after
+    /// every fetch the pages and the slabs' uncharged bytes together hold
+    /// the budget (`usage`), and the uncharged bytes are back within the
+    /// reserve, since no reader holds a slot. A dropped page frees its slot
+    /// as an evicted one does, so memory, at its slab floor, need not be
+    /// filled.
     #[tokio::test]
     async fn test_the_reserve_bounds_free_slots() {
-        let reserve = SLAB_BYTES / slab_policy::SLAB_RESERVE_DIVISOR;
-        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let budget = slab_floor_bytes();
+        let reserve = budget / slab_policy::SLAB_RESERVE_DIVISOR;
+        let cache = PageCache::new(budget, None).await.unwrap();
+        let Level::Memory(memory) = cache.level.as_ref() else {
+            panic!("a cache without a disk level is memory only");
+        };
         let runs = Arc::new(AtomicU64::new(0));
+        let id: Arc<str> = Arc::from(FILE_ID);
         let (first, second) = (page_of(SLAB_PAGE_LEN, 1), page_of(2048, 2));
-        let fill = 2 * SLAB_BYTES / charged(first.len(), Home::Slot);
-        let refill = 2 * SLAB_BYTES / charged(second.len(), Home::Slot);
+        let reserves_of_first = 3;
+        let fill = reserves_of_first * reserve / count(slab_class(first.len()));
+        for n in 0..fill {
+            fetch_into(&cache, n, &first, &runs).await;
+        }
         let mut most_uncharged = 0;
-        for (n, page) in (0..fill)
-            .map(|n| (n, &first))
-            .chain((fill..fill + refill).map(|n| (n, &second)))
-        {
-            fetch_into(&cache, n, page, &runs).await;
-            if n >= fill || n % 2 == 0 {
-                fetch_into(&cache, n, page, &runs).await;
-            }
+        for n in (1..fill).step_by(2) {
+            memory.remove(&PageKey(Arc::clone(&id), n));
+            fetch_into(&cache, fill + n, &second, &runs).await;
+            assert!(cache.held_page(&id, fill + n).is_some(), "page {n}");
             let uncharged = cache.slabs.slabs.uncharged_bytes();
             most_uncharged = most_uncharged.max(uncharged);
             assert!(
-                cache.usage() <= SLAB_BYTES,
-                "{} over {SLAB_BYTES} after page {n}",
+                cache.usage() <= budget,
+                "{} over {budget} after page {n}",
                 cache.usage()
             );
             assert!(
@@ -3374,6 +3391,44 @@ mod tests {
             most_uncharged > reserve / 2,
             "free slots reached the reserve: {most_uncharged}"
         );
+        assert!(
+            (0..fill)
+                .step_by(2)
+                .any(|n| cache.held_page(&id, n).is_none()),
+            "chunks of the first class were emptied"
+        );
+    }
+
+    /// Pages of every slab class fetched one after another, two of each,
+    /// all stay in memory: from the slab floor on, the reserve holds the
+    /// chunk each class fills, so no class's new chunk passes it to be
+    /// emptied, the page just cached in it with it; under the floor, at a
+    /// quarter of it, the pages stay on jemalloc.
+    #[tokio::test]
+    async fn test_pages_of_every_class_stay_where_they_are_cached() {
+        let floor = slab_floor_bytes();
+        let lens: Vec<usize> = icetray_slab::classes(slab_max_bytes()).collect();
+        let of_each = 2;
+        let id: Arc<str> = Arc::from(FILE_ID);
+        for budget in [floor / 4, floor, 3 * floor] {
+            let cache = PageCache::new(budget, None).await.unwrap();
+            let runs = Arc::new(AtomicU64::new(0));
+            let pages = (0..of_each).flat_map(|_| lens.iter());
+            for (offset, &len) in (0..).zip(pages) {
+                fetch_into(&cache, offset, &page_of(len, 5), &runs).await;
+            }
+            let cached = count(of_each * lens.len());
+            for offset in 0..cached {
+                assert!(
+                    cache.held_page(&id, offset).is_some(),
+                    "page {offset} at {budget}"
+                );
+            }
+            let slabs = &cache.slabs.slabs;
+            let in_slots = if budget >= floor { cached } else { 0 };
+            assert_eq!(slabs.held_slots(), in_slots, "{budget}");
+            assert_eq!(slabs.waiting_bytes(), 0, "{budget}");
+        }
     }
 
     /// A page foyer puts back in memory in a chunk being emptied with no
@@ -3386,7 +3441,7 @@ mod tests {
         let key = PageKey(Arc::clone(&id), FIRST_OFFSET);
         let page = page_of(SLAB_PAGE_LEN, 6);
 
-        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let cache = PageCache::new(slab_bytes(), None).await.unwrap();
         let Level::Memory(memory) = cache.level.as_ref() else {
             panic!("a cache without a disk level is memory only");
         };
@@ -3408,7 +3463,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let (level, _) = disk_level(dir.path());
-        let cache = PageCache::new(SLAB_BYTES, Some(level)).await.unwrap();
+        let cache = PageCache::new(slab_bytes(), Some(level)).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         fetch_into(&cache, FIRST_OFFSET, &page, &runs).await;
         let memory = hybrid(&cache).memory();
@@ -3439,7 +3494,7 @@ mod tests {
     /// (`PageSlabs::emptied`) is empty again after the fit.
     #[tokio::test]
     async fn test_the_slots_of_freed_chunks_are_not_kept_past_the_fit() {
-        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let cache = PageCache::new(slab_bytes(), None).await.unwrap();
         let Level::Memory(memory) = cache.level.as_ref() else {
             panic!("a cache without a disk level is memory only");
         };
@@ -3477,7 +3532,7 @@ mod tests {
     /// emptied now.
     #[tokio::test]
     async fn test_a_freed_chunk_whose_address_is_marked_again_is_not_kept() {
-        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let cache = PageCache::new(slab_bytes(), None).await.unwrap();
         let Level::Memory(memory) = cache.level.as_ref() else {
             panic!("a cache without a disk level is memory only");
         };
@@ -3509,7 +3564,7 @@ mod tests {
     async fn test_a_page_read_back_from_disk_is_not_written_again() {
         let dir = tempfile::tempdir().unwrap();
         let (level, _) = disk_level(dir.path());
-        let cache = PageCache::new(SLAB_BYTES, Some(level)).await.unwrap();
+        let cache = PageCache::new(slab_bytes(), Some(level)).await.unwrap();
         let runs = Arc::new(AtomicU64::new(0));
         let page = page_of(SLAB_PAGE_LEN, 8);
         fetch_into(&cache, FIRST_OFFSET, &page, &runs).await;
@@ -3538,46 +3593,66 @@ mod tests {
 
     /// The memory level's entries take the budget less the slabs' reserve,
     /// set when the cache is built and when the budget changes: pages of
-    /// many classes churning through memory, evicting pages and emptying
-    /// chunks, resize nothing, and neither does a resize to the budget the
-    /// cache has; a resize to another one does, and memory then holds no
-    /// more than its part beside the new reserve.
+    /// many classes going through memory, dropped pages freeing slots and
+    /// the cache emptying chunks, resize nothing, and neither does a resize
+    /// to the budget the cache has; a resize to another one does, and
+    /// memory then holds no more than its part beside the new reserve,
+    /// none under the slab floor.
     #[tokio::test]
     async fn test_the_memory_level_capacity_changes_only_with_the_budget() {
-        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
-        let reserve = SLAB_BYTES / slab_policy::SLAB_RESERVE_DIVISOR;
-        assert_eq!(built_capacity(&cache), SLAB_BYTES - reserve);
+        let budget = slab_floor_bytes();
+        let cache = PageCache::new(budget, None).await.unwrap();
+        let Level::Memory(memory) = cache.level.as_ref() else {
+            panic!("a cache without a disk level is memory only");
+        };
+        let reserve = budget / slab_policy::SLAB_RESERVE_DIVISOR;
+        assert_eq!(built_capacity(&cache), budget - reserve);
         let resizes = || cache.slabs.resizes.load(Ordering::Relaxed);
         let runs = Arc::new(AtomicU64::new(0));
-        let lens = [1500, SLAB_PAGE_LEN, 2048, 40_000, 65_637];
-        let churn = 4 * SLAB_BYTES / (16 * KIB);
-        for n in 0..churn {
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let (lens, others) = (
+            [1500, SLAB_PAGE_LEN, 2048, 40_000, 65_637],
+            [3000, 9000, 20_000],
+        );
+        let mean = count(lens.iter().sum::<usize>() / lens.len());
+        let reserves_of_pages = 3;
+        let pages = reserves_of_pages * reserve / mean;
+        let rounds = count(lens.len());
+        let removed = |n: &u64| (n / rounds) % 2 == 1;
+        for n in 0..pages {
             let len = lens[approx::length(n) % lens.len()];
             fetch_into(&cache, n, &page_of(len, 2), &runs).await;
+        }
+        for n in (0..pages).filter(removed) {
+            memory.remove(&PageKey(Arc::clone(&id), n));
+            let len = others[approx::length(n) % others.len()];
+            fetch_into(&cache, pages + n, &page_of(len, 3), &runs).await;
             assert!(
-                cache.usage() <= SLAB_BYTES,
-                "{} over {SLAB_BYTES} after page {n}",
+                cache.usage() <= budget,
+                "{} over {budget} after page {n}",
                 cache.usage()
             );
         }
         assert!(
-            cache.slabs.slabs.chunk_bytes() > 0,
-            "the churn went through the slabs"
+            (0..pages)
+                .filter(|n| !removed(n))
+                .any(|n| cache.held_page(&id, n).is_none()),
+            "chunks were emptied"
         );
-        assert!(entries_usage(&cache) <= SLAB_BYTES - reserve);
+        assert!(entries_usage(&cache) <= budget - reserve);
         assert_eq!(resizes(), 0, "the churn resized nothing");
-        cache.resize_memory(SLAB_BYTES).unwrap();
+        cache.resize_memory(budget).unwrap();
         assert_eq!(resizes(), 0, "the same budget");
-        let half = SLAB_BYTES / 2;
-        cache.resize_memory(half).unwrap();
+        let under = budget / 8;
+        cache.resize_memory(under).unwrap();
         assert_eq!(resizes(), 1, "another budget");
-        for n in churn..2 * churn {
+        let refill = 2 * under / mean;
+        for n in 2 * pages..2 * pages + refill {
             let len = lens[approx::length(n) % lens.len()];
             fetch_into(&cache, n, &page_of(len, 4), &runs).await;
         }
-        let half_reserve = half / slab_policy::SLAB_RESERVE_DIVISOR;
-        assert!(entries_usage(&cache) <= half - half_reserve);
-        assert!(cache.usage() <= half, "{} over {half}", cache.usage());
+        assert!(entries_usage(&cache) <= under);
+        assert!(cache.usage() <= under, "{} over {under}", cache.usage());
     }
 
     /// A page under a kibibyte is charged its allocation's jemalloc size

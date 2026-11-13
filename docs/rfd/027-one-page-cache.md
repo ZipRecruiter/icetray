@@ -48,7 +48,8 @@ only the runs of pages neither holds.
   lives in the memory level alone, as a key-value table's do today.
 - **Counted.** The page cache's series lose their `cache` label, one page
   cache remaining.
-- **Memory.** While its part of the budget is at least 8 MiB, the memory
+- **Memory.** While its part of the budget is at least about 455 MiB,
+  the least whose reserve holds a slab chunk of every size class, the memory
   level holds a page of 1 KiB to twice a value page in a slot of the
   slabs of RFD 030 (Cache slabs), which a hit hands out in place, and a
   page read back from the disk level moves into one. It charges each page

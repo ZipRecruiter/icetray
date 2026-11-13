@@ -34,11 +34,12 @@ out as a reference to its slot rather than a copy.
   adds 32 classes, so a value or page under 1 KiB stays in an allocation
   of its own, as does one above the largest class; both are charged
   jemalloc's size class. A cache keeps values in slabs only while its
-  budget is at least 16 times its largest chunk, 4 MiB for the row cache
-  and 8 MiB for the page cache, whose largest page in slabs is twice a
-  value page, so its reserve holds a chunk of any class; under that,
-  values stay on jemalloc and no reserve is held, so a chunk a larger
-  budget left with a free slot is emptied.
+  budget is at least 16 times one chunk of every class in its range,
+  274,171,904 bytes (about 261 MiB) for the row cache and 477,595,648
+  bytes (about 455 MiB) for the page cache, whose largest page in slabs
+  is twice a value page, so its reserve holds a chunk being filled in
+  every class at once; under that, values stay on jemalloc and no reserve
+  is held, so a chunk a larger budget left with a free slot is emptied.
 - **Chunks.** A slab holds one class's slots in chunks, each allocated
   whole and holding a small fixed number of slots: a few for the largest
   classes, a few dozen for the smallest.
@@ -160,11 +161,21 @@ now within it, since a slot costs about what a page was charged.
 
 A class's free slots lie in whichever chunks the cache evicted from, so
 many chunks of a class can be partly filled at once, and a cache whose
-lengths spread over many classes holds a chunk being filled in each. That
-cost is largest where a budget is smallest, the page cache's share among
-them. RFD 028's smallest budget, one value page per shard, stands: a
-page part under the slab floor keeps its pages on jemalloc and holds no
-reserve, so the smallest budget needs no room for chunks.
+lengths spread over many classes holds a chunk being filled in each. A
+store into a class with no chunk being filled allocates one, whose other
+slots are free; a full cache's free slots sit near the reserve, and with
+a reserve too small to hold such a chunk in every class in use, the new
+chunk would pass it, be the sparsest chunk of the class with the most
+free slots, and be emptied by the fit that follows the store, taking the
+value just cached with it. Spread lengths, such as compressed value
+pages, would then have the cache evict much of what it cached at
+budgets of tens of MiB. That is why the slab floor is a chunk of every
+class, and why budgets under about 261 MiB for the row cache and 455 MiB
+for the page cache's memory level keep jemalloc's rounding and gain
+nothing from the slabs. RFD 028's smallest budget, one value page per
+shard, stands: a page part under the slab floor keeps its pages on
+jemalloc and holds no reserve, so the smallest budget needs no room for
+chunks.
 Emptying a chunk evicts entries the cache's eviction policy did not
 choose, hot ones included, and a class whose free slots hover at the
 threshold would empty chunks repeatedly.

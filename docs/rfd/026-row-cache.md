@@ -57,7 +57,8 @@ and will check each hit against the generation's files and deletes.
 - **What an entry weighs.** icetray charges an entry its key's and
   value's bytes at what their allocations cost, plus its overhead, so
   the budget bounds the cache's memory (RFD 028 (Cache budget)). While
-  the budget is at least 4 MiB, a value of 1 KiB or more lives in a slot
+  the budget is at least about 261 MiB, the least whose reserve holds a
+  slab chunk of every size class, a value of 1 KiB or more lives in a slot
   of the cache's slabs and is charged its slab's size class (RFD 030
   (Cache slabs)); a shorter value, any value under a smaller budget, and
   the key are charged jemalloc's size class. The slabs' free slots, which

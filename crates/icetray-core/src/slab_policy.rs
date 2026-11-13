@@ -5,7 +5,8 @@
 //! charged for, and how a cache empties chunks to stay within it.
 
 use icetray_slab::{
-    ClassId, Emptied, SLOT_HANDLE_BYTES, Slabs, jemalloc_class, slab_class, slots_per_chunk,
+    ClassId, Emptied, SLOT_HANDLE_BYTES, Slabs, classes, jemalloc_class, slab_class,
+    slots_per_chunk,
 };
 
 use crate::approx;
@@ -21,9 +22,9 @@ use crate::approx;
 /// share of the entries.
 ///
 /// A cache keeps values in slabs only while its budget is at least this
-/// many of its largest chunk (`floor_bytes`), so the reserve holds a chunk
-/// of any class; under that, values stay in allocations of their own and
-/// no reserve is held.
+/// many of one chunk of every class in its slabs' range (`floor_bytes`),
+/// so the reserve holds a chunk being filled in each class in use; under
+/// that, values stay in allocations of their own and no reserve is held.
 pub(crate) const SLAB_RESERVE_DIVISOR: u64 = 16;
 
 /// Bytes of the shared header the first clone of a `Bytes` over an
@@ -64,38 +65,49 @@ impl Home {
 }
 
 /// The smallest budget under which a cache whose slabs hold values up to
-/// `max_bytes` long keeps values there: `SLAB_RESERVE_DIVISOR` times the
-/// bytes of a chunk of the class of `max_bytes`, the largest, so the
-/// reserve holds one chunk of any class.
+/// `max_bytes` long keeps values there, its slab floor:
+/// `SLAB_RESERVE_DIVISOR` times the bytes of one chunk of every slab class
+/// from `MIN_SLAB_BYTES`'s to that of `max_bytes`, so the reserve holds a
+/// chunk being filled in every class at once. A class a store first
+/// takes a slot of allocates a chunk whose other slots are free, and while
+/// the reserve could not hold such a chunk in each class in use, a full
+/// cache's free slots would pass it with each such chunk, and the
+/// emptying would take that chunk, the sparsest of the class with the
+/// most free slots, and with it the value just cached. About 261 MiB for
+/// the row cache's slabs, to 64 KiB, and 455 MiB for the page cache's, to
+/// 128 KiB. A cache computes it once (`RowCache`'s and `PageCache`'s
+/// `slab_floor_bytes`), since it sums over every class.
 pub(crate) fn floor_bytes(max_bytes: usize) -> u64 {
-    let largest = slab_class(max_bytes);
-    SLAB_RESERVE_DIVISOR * approx::count(slots_per_chunk(largest) * largest)
+    let chunks: usize = classes(max_bytes)
+        .map(|class| slots_per_chunk(class) * class)
+        .sum();
+    SLAB_RESERVE_DIVISOR * approx::count(chunks)
 }
 
-/// Whether `budget` keeps values in slabs holding up to `max_bytes`
-/// (`floor_bytes`).
-pub(crate) fn uses_slabs(budget: u64, max_bytes: usize) -> bool {
-    budget >= floor_bytes(max_bytes)
+/// Whether `budget` keeps values in the slabs of a cache whose slab floor
+/// is `floor` (`floor_bytes`).
+pub(crate) fn uses_slabs(budget: u64, floor: u64) -> bool {
+    budget >= floor
 }
 
-/// The bytes of `budget` held in reserve for slabs holding up to
-/// `max_bytes`: a sixteenth (`SLAB_RESERVE_DIVISOR`) while the budget keeps
-/// values in slabs, else none, since no store then fills a chunk.
-pub(crate) fn reserve(budget: u64, max_bytes: usize) -> u64 {
-    if uses_slabs(budget, max_bytes) {
+/// The bytes of `budget` held in reserve for the slabs of a cache whose
+/// slab floor is `floor` (`floor_bytes`): a sixteenth
+/// (`SLAB_RESERVE_DIVISOR`) while the budget keeps values in slabs, else
+/// none, since no store then fills a chunk.
+pub(crate) fn reserve(budget: u64, floor: u64) -> u64 {
+    if uses_slabs(budget, floor) {
         budget / SLAB_RESERVE_DIVISOR
     } else {
         0
     }
 }
 
-/// A budget from which on the part beside the reserve of slabs holding up
-/// to `max_bytes` holds at least `entries` bytes: `entries` itself, unless
-/// the floor's part is under it, since a budget at the floor holds back a
-/// reserve that one just under it does not; then the budget whose part
-/// beside its sixteenth holds `entries`.
-pub(crate) fn budget_holding(entries: u64, max_bytes: usize) -> u64 {
-    let floor = floor_bytes(max_bytes);
+/// A budget from which on the part beside the reserve of a cache whose
+/// slab floor is `floor` (`floor_bytes`) holds at least `entries` bytes:
+/// `entries` itself, unless the floor's part is under it, since a budget
+/// at the floor holds back a reserve that one just under it does not; then
+/// the budget whose part beside its sixteenth holds `entries`.
+pub(crate) fn budget_holding(entries: u64, floor: u64) -> u64 {
     if entries <= floor - floor / SLAB_RESERVE_DIVISOR {
         entries
     } else {
@@ -133,20 +145,39 @@ pub(crate) fn fit<R: Clone + Send + Sync + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::approx::units::MIB;
+    use bytes::Bytes;
 
-    /// The longest value the tests' slabs hold.
+    use super::*;
+
+    /// The longest value the tests' slabs hold, the row cache's.
     const MAX_BYTES: usize = 64 * 1024;
+
+    /// The floor is the divisor times one chunk of every class in range:
+    /// what slabs holding one value of each class allocate. Pinned for the
+    /// row cache's range, to 64 KiB, and the page cache's, to 128 KiB,
+    /// which the docs state.
+    #[test]
+    fn test_the_floor_holds_a_chunk_of_every_class() {
+        let row_cache_floor = 274_171_904;
+        let page_cache_floor = 477_595_648;
+        for (max_bytes, floor) in [(MAX_BYTES, row_cache_floor), (128 * 1024, page_cache_floor)] {
+            assert_eq!(floor_bytes(max_bytes), floor, "to {max_bytes}");
+            let slabs = Slabs::new(max_bytes);
+            let values: Vec<Bytes> = classes(max_bytes)
+                .map(|class| slabs.store(&vec![1; class], ()).unwrap())
+                .collect();
+            assert_eq!(values.len(), classes(max_bytes).count());
+            assert_eq!(SLAB_RESERVE_DIVISOR * slabs.chunk_bytes(), floor);
+        }
+    }
 
     #[test]
     fn test_reserve_is_a_sixteenth_from_the_floor_and_none_under_it() {
         let floor = floor_bytes(MAX_BYTES);
-        assert_eq!(floor, 4 * MIB);
-        assert_eq!(reserve(floor - 1, MAX_BYTES), 0);
-        assert_eq!(reserve(floor, MAX_BYTES), floor / SLAB_RESERVE_DIVISOR);
-        assert!(!uses_slabs(floor - 1, MAX_BYTES));
-        assert!(uses_slabs(floor, MAX_BYTES));
+        assert_eq!(reserve(floor - 1, floor), 0);
+        assert_eq!(reserve(floor, floor), floor / SLAB_RESERVE_DIVISOR);
+        assert!(!uses_slabs(floor - 1, floor));
+        assert!(uses_slabs(floor, floor));
     }
 
     /// From the budget `budget_holding` names on, every budget's part
@@ -155,9 +186,9 @@ mod tests {
     #[test]
     fn test_budget_holding_holds_the_entries_from_there_on() {
         let floor = floor_bytes(MAX_BYTES);
-        let beside = |budget: u64| budget - reserve(budget, MAX_BYTES);
+        let beside = |budget: u64| budget - reserve(budget, floor);
         for entries in [1, floor / 2, beside(floor), floor - 1, floor, 3 * floor] {
-            let budget = budget_holding(entries, MAX_BYTES);
+            let budget = budget_holding(entries, floor);
             assert!(budget >= entries, "{entries}");
             for at in [budget, budget + 1, floor - 1, floor, floor + 1, 4 * floor] {
                 if at >= budget {
@@ -165,8 +196,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(budget_holding(beside(floor), MAX_BYTES), beside(floor));
-        assert!(budget_holding(floor - 1, MAX_BYTES) > floor);
+        assert_eq!(budget_holding(beside(floor), floor), beside(floor));
+        assert!(budget_holding(floor - 1, floor) > floor);
     }
 
     #[test]

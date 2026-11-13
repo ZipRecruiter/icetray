@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -141,6 +141,13 @@ fn charged(key_len: usize, value: Option<(usize, Home)>) -> u64 {
 /// (`ROW_CACHE_MAX_VALUE_BYTES`).
 fn slab_max_bytes() -> usize {
     approx::length(ROW_CACHE_MAX_VALUE_BYTES)
+}
+
+/// The slab floor of the cache's slabs (`slab_policy::floor_bytes`), about
+/// 261 MiB, summed once: every insert asks whether the budget is over it.
+fn slab_floor_bytes() -> u64 {
+    static FLOOR: LazyLock<u64> = LazyLock::new(|| slab_policy::floor_bytes(slab_max_bytes()));
+    *FLOOR
 }
 
 /// What an entry for a table key of `key_len` bytes and a value of
@@ -419,12 +426,12 @@ impl Built {
     /// The bytes of the budget held in reserve for the slabs
     /// (`slab_policy::reserve`).
     fn reserve(&self) -> u64 {
-        slab_policy::reserve(self.budget(), slab_max_bytes())
+        slab_policy::reserve(self.budget(), slab_floor_bytes())
     }
 
     /// Whether the budget keeps values in slabs (`slab_policy::uses_slabs`).
     fn uses_slabs(&self) -> bool {
-        slab_policy::uses_slabs(self.budget(), slab_max_bytes())
+        slab_policy::uses_slabs(self.budget(), slab_floor_bytes())
     }
 
     /// Gives the cache a budget of `budget` bytes and sets its entries'
@@ -496,8 +503,9 @@ impl RowCache {
     /// under one `ROW_CACHE_MAX_VALUE_BYTES` value per shard caches only
     /// smaller values, and a budget of zero, a server none of whose tables
     /// reads through the cache, caches nothing. A budget under the slab
-    /// floor of 4 MiB (`slab_policy::floor_bytes`) keeps every value in an
-    /// allocation of its own and holds back no reserve.
+    /// floor of about 261 MiB (`slab_floor_bytes`), whose reserve holds one
+    /// chunk of every slab class, keeps every value in an allocation of its
+    /// own and holds back no reserve.
     #[must_use]
     pub fn new(capacity_bytes: u64) -> Self {
         Self(Arc::new(Inner {
@@ -784,7 +792,7 @@ mod tests {
     use icetray_slab::{Emptied, slab_class, slots_per_chunk};
 
     use super::*;
-    use crate::approx::units::{GIB, KIB, MIB};
+    use crate::approx::units::{GIB, KIB};
     use crate::index::RowPosition;
     use crate::metric::testing::{Series, recorded_with};
     use crate::slab_policy::{SHARED_HEADER_BYTES, SLAB_RESERVE_DIVISOR};
@@ -845,6 +853,9 @@ mod tests {
         /// The value the cache holds at `at`, counted nowhere and leaving
         /// its place in the queues as it was.
         fn peek(&self, at: &At) -> Option<Bytes>;
+        /// Drops the entry at `at`, freeing its slot as an eviction does
+        /// unless a reader holds the value.
+        fn remove(&self, at: &At);
         fn shard_of(&self, at: &At) -> usize;
     }
 
@@ -896,6 +907,11 @@ mod tests {
                 Held::Value(bytes) => Some(bytes),
                 Held::Null | Held::Present => None,
             }
+        }
+
+        fn remove(&self, at: &At) {
+            self.for_table(TABLE)
+                .remove(&long(at.n), Part::Column(at.column), source(at.n));
         }
 
         fn shard_of(&self, at: &At) -> usize {
@@ -1141,32 +1157,30 @@ mod tests {
         );
     }
 
-    /// A cache filled to its budget with values of one class, every other
-    /// one read again, then filled again with values of another, each read
-    /// again, which evicts the first class's entries read once before those
-    /// read again,
-    /// so free slots lie in every chunk of the first class until the cache
-    /// empties chunks: after every insert the entries
-    /// and the slabs' uncharged bytes together hold the budget (`usage`),
-    /// and the uncharged bytes are back within the reserve, since no reader
-    /// holds a slot.
+    /// A cache holding values of one class, every other one then dropped
+    /// and a value of another class cached in its place, so free slots lie
+    /// in every chunk of the first class until the cache empties chunks:
+    /// after every insert the entries and the slabs' uncharged bytes
+    /// together hold the budget (`usage`), and the uncharged bytes are back
+    /// within the reserve, since no reader holds a slot. A dropped entry
+    /// frees its slot as an evicted one does, so the cache, at its slab
+    /// floor, need not be filled.
     #[test]
     fn test_the_reserve_bounds_free_slots() {
-        let budget = 16 * MIB;
+        let budget = slab_floor_bytes();
         let reserve = budget / SLAB_RESERVE_DIVISOR;
         let cache = RowCache::new(budget);
         let (first, second) = (vec![1_u8; 4242], vec![2_u8; 2048]);
-        let fill = 2 * budget / weigh(LONG_KEY_BYTES, Some(first.len()));
-        let refill = 2 * budget / weigh(LONG_KEY_BYTES, Some(second.len()));
+        let reserves_of_first = 3;
+        let fill = reserves_of_first * reserve / approx::count(slab_class(first.len()));
+        for n in 0..fill {
+            cache.insert(key(n, 0), Some(&first));
+        }
         let mut most_uncharged = 0;
-        for (n, value) in (0..fill)
-            .map(|n| (n, &first))
-            .chain((fill..fill + refill).map(|n| (n, &second)))
-        {
-            cache.insert(key(n, 0), Some(value));
-            if n >= fill || n % 2 == 0 {
-                assert_ne!(cache.get(&key(n, 0)), Cached::Absent);
-            }
+        for n in (1..fill).step_by(2) {
+            cache.remove(&key(n, 0));
+            cache.insert(key(fill + n, 0), Some(&second));
+            assert_ne!(cache.get(&key(fill + n, 0)), Cached::Absent);
             let uncharged = cache.0.slabs.uncharged_bytes();
             most_uncharged = most_uncharged.max(uncharged);
             assert!(
@@ -1183,8 +1197,10 @@ mod tests {
             most_uncharged > reserve / 2,
             "free slots reached the reserve: {most_uncharged}"
         );
-        let held = |range: std::ops::Range<u64>| range.filter(|&n| cache.holds(&key(n, 0))).count();
-        assert!(held(fill..fill + refill) > 0, "the second class is cached");
+        assert!(
+            (0..fill).step_by(2).any(|n| !cache.holds(&key(n, 0))),
+            "chunks of the first class were emptied"
+        );
     }
 
     /// Chunks that readers hold, once emptied, wait for the readers and
@@ -1193,32 +1209,31 @@ mod tests {
     /// emptying every chunk while the readers hold theirs.
     #[test]
     fn test_waiting_chunks_over_the_reserve_stop_the_emptying() {
-        let budget = 16 * MIB;
+        let budget = slab_floor_bytes();
         let reserve = budget / SLAB_RESERVE_DIVISOR;
         let cache = RowCache::new(budget);
         let (first, second) = (vec![1_u8; 4242], vec![2_u8; 2048]);
-        let fill = budget / 2 / weigh(LONG_KEY_BYTES, Some(first.len()));
+        let class = slab_class(first.len());
+        let reserves_of_first = 3;
+        let fill = reserves_of_first * reserve / approx::count(class);
         let mut readers = Vec::new();
         for n in 0..fill {
             cache.insert(key(n, 0), Some(&first));
             readers.extend(cache.peek(&key(n, 0)));
         }
-        let refill = 2 * budget / weigh(LONG_KEY_BYTES, Some(second.len()));
-        for n in fill..fill + refill {
-            cache.insert(key(n, 0), Some(&second));
-            assert_ne!(cache.get(&key(n, 0)), Cached::Absent);
+        for n in 0..fill {
+            cache.remove(&key(n, 0));
         }
+        let slots = slots_per_chunk(class);
         let mut kept = 0;
         readers.retain(|_| {
             kept += 1;
-            kept % 2 == 0
+            (kept - 1) % slots == 0
         });
-        assert!(!cache.holds(&key(0, 0)), "the first class was evicted");
-        cache.insert(key(fill + refill, 0), Some(&second));
+        cache.insert(key(fill, 0), Some(&second));
         let slabs = &cache.0.slabs;
         assert!(slabs.waiting_bytes() >= reserve, "the readers' chunks wait");
-        let one_chunk =
-            approx::count(slots_per_chunk(slab_class(first.len())) * slab_class(first.len()));
+        let one_chunk = approx::count(slots * class);
         assert!(
             slabs.waiting_bytes() < reserve + one_chunk,
             "emptying stopped once the waiting chunks filled the reserve"
@@ -1275,21 +1290,39 @@ mod tests {
         assert_eq!(slabs.waiting_bytes(), 0);
     }
 
-    /// Many inserts across classes, evicting entries and emptying chunks,
-    /// leave the entries' capacity where the budget set it; a resize to
-    /// another budget changes it, and one to the same budget does not.
+    /// Many inserts across classes, removals freeing slots and the cache
+    /// emptying chunks, leave the entries' capacity where the budget set
+    /// it; a resize to another budget changes it, and one to the same
+    /// budget does not.
     #[test]
     fn test_capacity_changes_only_with_the_budget() {
-        let budget = 16 * MIB;
+        let budget = slab_floor_bytes();
+        let reserve = budget / SLAB_RESERVE_DIVISOR;
         let cache = RowCache::new(budget);
         let capacity = cache.shape().entries_capacity;
-        let lengths = [1500, 4242, 2048, 40_000];
-        for n in 0..4 * budget / KIB {
+        let (lengths, others) = ([1500, 4242, 2048, 40_000], [3000, 9000, 20_000]);
+        let mean = approx::count(lengths.iter().sum::<usize>() / lengths.len());
+        let reserves_of_rows = 3;
+        let rows = reserves_of_rows * reserve / mean;
+        for n in 0..rows {
             let len = lengths[approx::length(n) % lengths.len()];
             cache.insert(key(n, 0), Some(&vec![3_u8; len]));
             assert_eq!(cache.shape().entries_capacity, capacity, "after row {n}");
         }
-        assert!(cache.0.slabs.chunk_bytes() > 0);
+        let rounds = approx::count(lengths.len());
+        let removed = |n: &u64| (n / rounds) % 2 == 1;
+        for n in (0..rows).filter(removed) {
+            cache.remove(&key(n, 0));
+            let len = others[approx::length(n) % others.len()];
+            cache.insert(key(rows + n, 0), Some(&vec![4_u8; len]));
+            assert_eq!(cache.shape().entries_capacity, capacity, "after row {n}");
+        }
+        assert!(
+            (0..rows)
+                .filter(|n| !removed(n))
+                .any(|n| !cache.holds(&key(n, 0))),
+            "chunks were emptied"
+        );
         cache.resize(budget);
         assert_eq!(cache.shape().entries_capacity, capacity, "the same budget");
         cache.resize(budget / 2);
@@ -1299,14 +1332,40 @@ mod tests {
         );
     }
 
-    /// Under the slab floor of 4 MiB values stay in allocations of their
-    /// own and no reserve is held; a resize across the floor decides where
-    /// values cached from then on live, and a resize under it empties the
-    /// chunks with free slots, which no reserve holds any more.
+    /// Values of every slab class cached one after another, two of each,
+    /// all stay: from the slab floor on, the reserve holds the chunk each
+    /// class fills, so no class's new chunk passes it to be emptied, the
+    /// value just cached in it with it; under the floor, at a quarter of
+    /// it, the values stay on jemalloc.
+    #[test]
+    fn test_values_of_every_class_stay_where_they_are_cached() {
+        let floor = slab_floor_bytes();
+        let lengths: Vec<usize> = icetray_slab::classes(slab_max_bytes()).collect();
+        let of_each = 2;
+        for budget in [floor / 4, floor, 3 * floor] {
+            let cache = RowCache::new(budget);
+            let rows = (0..of_each).flat_map(|_| lengths.iter());
+            for (n, &len) in (0..).zip(rows) {
+                cache.insert(key(n, 0), Some(&vec![5_u8; len]));
+            }
+            let cached = of_each * lengths.len();
+            for n in 0..approx::count(cached) {
+                assert!(cache.holds(&key(n, 0)), "row {n} at {budget}");
+            }
+            let slabs = &cache.0.slabs;
+            let in_slots = if budget >= floor { cached } else { 0 };
+            assert_eq!(slabs.held_slots(), approx::count(in_slots), "{budget}");
+            assert_eq!(slabs.waiting_bytes(), 0, "{budget}");
+        }
+    }
+
+    /// Under the slab floor values stay in allocations of their own and no
+    /// reserve is held; a resize across the floor decides where values
+    /// cached from then on live, and a resize under it empties the chunks
+    /// with free slots, which no reserve holds any more.
     #[test]
     fn test_a_budget_under_the_slab_floor_keeps_values_on_jemalloc() {
-        let floor = slab_policy::floor_bytes(slab_max_bytes());
-        assert_eq!(floor, 4 * MIB);
+        let floor = slab_floor_bytes();
         let value = vec![5_u8; 4242];
         let cache = RowCache::new(floor - 1);
         cache.insert(key(1, 0), Some(&value));
@@ -1610,17 +1669,24 @@ mod tests {
     /// keeps its ghost list whole.
     #[test]
     fn test_the_ghost_list_outlasts_churn_through_the_slabs() {
-        let budget = SHARD_ROWS_ESTIMATE * weigh(LONG_KEY_BYTES, Some(approx::length(KIB)));
+        let budget = slab_floor_bytes();
         let cache = RowCache::new(budget);
         assert!(cache.0.built.load().uses_slabs());
-        let value = vec![0_u8; approx::length(KIB)];
+        let (value, other) = (vec![0_u8; approx::length(KIB)], vec![1_u8; 2048]);
         let churned_from = 1 << 20;
-        for n in churned_from..churned_from + 10 * budget / KIB {
+        let reserves_of_churn = 3;
+        let churned = reserves_of_churn * (budget / SLAB_RESERVE_DIVISOR) / KIB;
+        let churn = churned_from..churned_from + churned;
+        for n in churn.clone() {
             cache.insert(key(n, 0), Some(&value));
         }
+        for n in churn.clone().step_by(2) {
+            cache.remove(&key(n, 0));
+            cache.insert(key(n + churned, 0), Some(&other));
+        }
         assert!(
-            cache.0.slabs.held_slots() > 0,
-            "the churn went through the slabs"
+            churn.skip(1).step_by(2).any(|n| !cache.holds(&key(n, 0))),
+            "the churn emptied chunks"
         );
         assert!(readmits_a_ghost_as_hot(&cache), "the ghost list is kept");
     }
