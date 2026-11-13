@@ -3469,10 +3469,12 @@ mod tests {
         }
     }
 
-    /// A chunk freed outside a fit, whose address the next chunk of its
-    /// class takes, which the next fit marks while a reader holds a slot of
-    /// it, leaves no entry behind for the freed one: round after round the
-    /// list of kept chunks holds only the chunk being emptied now.
+    /// A chunk freed outside a fit leaves no entry behind when the next
+    /// fit marks the next chunk of its class while a reader holds a slot of
+    /// it, whether or not the allocator gave that chunk the freed one's
+    /// address: the kept chunks are known by token, not address. Round
+    /// after round the list of kept chunks holds only the chunk being
+    /// emptied now.
     #[tokio::test]
     async fn test_a_freed_chunk_whose_address_is_marked_again_is_not_kept() {
         let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
@@ -3481,12 +3483,10 @@ mod tests {
         };
         let slabs = &cache.slabs.slabs;
         let rounds = 4;
-        let mut addresses = Vec::new();
         for round in 0..rounds {
             let key = PageKey(Arc::from(FILE_ID), round);
             let value = PageValue::copied(cache.slabs.taking(), &key, &page_of(SLAB_PAGE_LEN, 2));
             let reader = value.bytes.clone();
-            addresses.push(reader.as_ptr().addr());
             memory.insert(key, value);
             cache.fit_within(0);
             assert!(slabs.waiting_bytes() > 0, "the reader's chunk waits");
@@ -3500,10 +3500,6 @@ mod tests {
             drop(reader);
             assert_eq!(slabs.waiting_bytes(), 0, "freed outside a fit");
         }
-        assert!(
-            addresses.windows(2).any(|pair| pair[0] == pair[1]),
-            "a chunk took a freed one's address: {addresses:?}"
-        );
     }
 
     /// A page read back from the disk level keeps the age foyer gave it
