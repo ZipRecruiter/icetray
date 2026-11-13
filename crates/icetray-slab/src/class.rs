@@ -1,6 +1,8 @@
 //! The size classes: jemalloc's, which the caches charge for allocations
 //! outside the slabs, and the slabs' own.
 
+use std::iter;
+
 /// The smallest allocation jemalloc makes and the finest spacing of its
 /// size classes: sizes up to this round to it, and sizes above round to a
 /// multiple of at least this.
@@ -95,6 +97,16 @@ pub const fn slots_per_chunk(class: usize) -> usize {
     }
 }
 
+/// The slab classes of slabs holding values from `MIN_SLAB_BYTES` to
+/// `max_bytes` long, shortest first: none when `max_bytes` is under
+/// `MIN_SLAB_BYTES`.
+pub fn classes(max_bytes: usize) -> impl Iterator<Item = usize> {
+    let first = (max_bytes >= MIN_SLAB_BYTES).then(|| slab_class(MIN_SLAB_BYTES));
+    iter::successors(first, move |&class| {
+        (class < max_bytes).then(|| slab_class(class + 1))
+    })
+}
+
 /// Whether a value of `len` bytes is stored in a slab, given the longest
 /// value `max` the cache keeps there.
 pub fn in_slabs(len: usize, max: usize) -> bool {
@@ -153,6 +165,19 @@ mod tests {
         assert_eq!(slots_per_chunk(4352), 15);
         assert_eq!(slots_per_chunk(67_584), 4);
         assert_eq!(slots_per_chunk(128 * 1024), 4);
+    }
+
+    #[test]
+    fn test_classes_are_every_slab_class_in_the_range_in_order() {
+        let mut expected: Vec<usize> = (MIN_SLAB_BYTES..=MAX).map(slab_class).collect();
+        expected.dedup();
+        assert_eq!(classes(MAX).collect::<Vec<_>>(), expected);
+        assert_eq!(
+            classes(MIN_SLAB_BYTES).collect::<Vec<_>>(),
+            [MIN_SLAB_BYTES]
+        );
+        assert_eq!(classes(MIN_SLAB_BYTES - 1).count(), 0);
+        assert_eq!(classes(0).count(), 0);
     }
 
     #[test]

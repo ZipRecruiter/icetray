@@ -10,9 +10,7 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::chunk::{Chunk, ChunkId, Release, Reserved, Returning, owner_handle_len};
-use crate::class::{
-    MIN_SLAB_BYTES, class_index, in_slabs, jemalloc_class, slab_class, slots_per_chunk,
-};
+use crate::class::{class_index, classes, in_slabs, jemalloc_class, slab_class, slots_per_chunk};
 
 /// Bytes jemalloc allocates for the handle every `Bytes` that `Slabs::store`
 /// returns reads its slot through: what `Bytes::from_owner` boxes, the
@@ -83,16 +81,7 @@ impl<R: Clone + Send + Sync + 'static> Slabs<R> {
     /// Slabs for values from `MIN_SLAB_BYTES` to `max_bytes` long, holding
     /// no chunks yet.
     pub fn new(max_bytes: usize) -> Slabs<R> {
-        let classes = if max_bytes < MIN_SLAB_BYTES {
-            Vec::new()
-        } else {
-            let last = slab_class(max_bytes);
-            iter::successors(Some(slab_class(MIN_SLAB_BYTES)), |&class| {
-                (class < last).then(|| slab_class(class + 1))
-            })
-            .map(Class::new)
-            .collect()
-        };
+        let classes = classes(max_bytes).map(Class::new).collect();
         Slabs {
             pool: Arc::new(Pool {
                 max_bytes,
