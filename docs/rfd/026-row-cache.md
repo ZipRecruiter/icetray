@@ -6,8 +6,8 @@
 
 > Updated 2026-11-12: values of 1 KiB or more live in slabs of icetray's
 > own size classes, a hit hands out a reference to the value's slot, and
-> the slabs' free slots count against the budget. See RFD 030 (Cache
-> slabs).
+> a sixteenth of the budget is held in reserve for the slabs' free slots.
+> See RFD 030 (Cache slabs).
 
 ## Problem
 
@@ -56,12 +56,14 @@ and will check each hit against the generation's files and deletes.
   only the index and the pages show that a Scan's range is complete.
 - **What an entry weighs.** icetray charges an entry its key's and
   value's bytes at what their allocations cost, plus its overhead, so
-  the budget bounds the cache's memory (RFD 028 (Cache budget)). A value
-  of 1 KiB or more lives in a slot of the cache's slabs and is charged
-  its slab's size class (RFD 030 (Cache slabs)); a shorter value, and
-  the key, are charged jemalloc's size class. The slabs' free slots,
-  which no entry is charged for, count against the budget too. icetray
-  does not cache a value above a bound.
+  the budget bounds the cache's memory (RFD 028 (Cache budget)). While
+  the budget is at least 4 MiB, a value of 1 KiB or more lives in a slot
+  of the cache's slabs and is charged its slab's size class (RFD 030
+  (Cache slabs)); a shorter value, any value under a smaller budget, and
+  the key are charged jemalloc's size class. The slabs' free slots, which
+  no entry is charged for, take a sixteenth of the budget held in reserve
+  for them, and the entries the rest. icetray does not cache a value
+  above a bound.
 - **The library.** quick_cache, the fastest in a bake-off against foyer
   and segcache over rows of 100 bytes to 8 KiB, and the only one whose
   throughput grew under hot keys.

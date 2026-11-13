@@ -33,7 +33,10 @@ out as a reference to its slot rather than a copy.
   are already a large share of what it costs, and each doubling covered
   adds 32 classes, so a value or page under 1 KiB stays in an allocation
   of its own, as does one above the largest class; both are charged
-  jemalloc's size class.
+  jemalloc's size class. A cache keeps values in slabs only while its
+  budget is at least 16 times its largest chunk, 4 MiB for the row cache,
+  so its reserve holds a chunk of any class; under that, values stay on
+  jemalloc.
 - **Chunks.** A slab holds one class's slots in chunks, each allocated
   whole and holding a small fixed number of slots: a few for the largest
   classes, a few dozen for the smallest.
@@ -43,14 +46,19 @@ out as a reference to its slot rather than a copy.
   its slab's free list when the last clone drops.
 - **The budget counts slabs.** Every slot of every chunk counts against
   the budget, free or held, so the budget bounds the caches' memory
-  however the slabs fill. A free slot costs hit rate, since the cache
-  evicts elsewhere to stay within the budget, and never memory beyond it.
+  however the slabs fill. A cache holds a fixed share of its budget, a
+  sixteenth, in reserve for its slabs' free slots and the chunks being
+  emptied, and its entries take the rest, a capacity that changes only
+  with the budget. A free slot within the reserve costs nothing beyond
+  it, and the reserve costs that share of the entries.
 - **Chunks go back.** The slab frees a chunk whose slots are all free.
-  When the budget shrinks, or when one class's free slots pass a share of
-  the budget, the cache evicts the entries of the class's chunk with the
-  fewest held slots and frees the chunk, so it gives back memory that a
-  shift in lengths left stranded. Each slot records which entry holds it,
-  so the cache can find the entries to evict.
+  When the free slots and the chunks being emptied pass the reserve, and
+  the free slots are what push them over, the cache evicts the entries of
+  the chunk with the fewest held slots in the class whose free slots hold
+  the most, and frees the chunk, until they are back within it, so it
+  gives back memory that a shift in lengths left stranded. Each slot
+  records which entry holds it, so the cache can find the entries to
+  evict.
 - **Held slots.** A slot stays held as long as anything holds its
   `Bytes`: a response until gRPC has encoded it, which for a Get or
   MultiGet holds the values it returns, and any reader of a page until it
@@ -84,6 +92,9 @@ where it rose with hits that read the slot in place.
 Charging only the slots that hold an entry. Rejected because a slab's free
 slots would then be memory the budget does not see.
 
+Lowering the entries' capacity as free slots grow. Rejected because
+quick_cache shrinks its ghost list on every capacity change.
+
 Compacting a sparse chunk by moving its entries into free slots elsewhere.
 Rejected because a value a caller holds cannot move, and emptying a chunk
 loses only the few dozen entries it holds at most.
@@ -93,7 +104,7 @@ A third-party slab. Rejected because none known supports both handing out
 would be read as icetray's own under RFD 029 anyway.
 
 Sharding each slab's free list. Deferred until a measurement asks for it:
-icetray will count the time stores and frees wait on slab locks, and a
+icetray counts the time stores, frees, and emptying wait on slab locks, and a
 run with more tasks than the measurement used shows whether one lock per
 class holds up. Shards would multiply the chunks being filled in each class.
 

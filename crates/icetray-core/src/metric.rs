@@ -38,10 +38,11 @@ pub const ROW_CACHE_MISSES_TOTAL: &str = "icetray_row_cache_misses_total";
 /// because the lookup's generation no longer holds the entry's file or has
 /// deleted its row (RFD 026); each is counted as a cache miss too.
 pub const ROW_CACHE_STALE_TOTAL: &str = "icetray_row_cache_stale_total";
-/// Seconds that stores into the row cache's slabs, frees of their slots,
-/// and the emptying of their chunks waited for a slab class's lock (RFD
-/// 030), in whole seconds.
-pub const ROW_CACHE_SLAB_WAIT_SECONDS_TOTAL: &str = "icetray_row_cache_slab_wait_seconds_total";
+/// Microseconds that stores into the row cache's slabs, frees of their
+/// slots, and the emptying of their chunks waited for a slab class's lock
+/// (RFD 030).
+pub const ROW_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL: &str =
+    "icetray_row_cache_slab_wait_microseconds_total";
 /// Lookups answered, by `table` and `result`.
 pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
 /// Value-page GETs lookups and Scans issued to object storage, by `table`
@@ -126,7 +127,8 @@ pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
 /// Bytes the row cache holds against its budget (RFD 026, RFD 030): each
 /// entry's key and value at their allocation size, a value in a slab at
 /// its slot's, plus the per-entry overhead, and the slabs' bytes no entry
-/// is charged for: free slots, and chunks being emptied.
+/// is charged for, free slots and chunks being emptied, which a sixteenth
+/// of the budget is held in reserve for.
 pub const ROW_CACHE_BYTES: &str = "icetray_row_cache_bytes";
 /// Bytes of the row cache's slab chunks being emptied, each waiting for a
 /// reader to drop the last value it holds from the chunk (RFD 030).
@@ -288,9 +290,9 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 61] = [
         "Row-cache entries found whose file or row the lookup's generation no longer serves.",
     ),
     (
-        ROW_CACHE_SLAB_WAIT_SECONDS_TOTAL,
+        ROW_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL,
         Kind::Counter,
-        "Whole seconds that stores into the row cache's slabs, frees of their slots, and emptying of their chunks waited for a slab class's lock.",
+        "Microseconds that stores into the row cache's slabs, frees of their slots, and emptying of their chunks waited for a slab class's lock.",
     ),
     (
         LOOKUPS_TOTAL,
