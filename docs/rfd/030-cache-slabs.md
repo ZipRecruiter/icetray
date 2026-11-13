@@ -36,7 +36,8 @@ out as a reference to its slot rather than a copy.
   jemalloc's size class. A cache keeps values in slabs only while its
   budget is at least 16 times its largest chunk, 4 MiB for the row cache,
   so its reserve holds a chunk of any class; under that, values stay on
-  jemalloc.
+  jemalloc and no reserve is held, so a chunk a larger budget left with a
+  free slot is emptied.
 - **Chunks.** A slab holds one class's slots in chunks, each allocated
   whole and holding a small fixed number of slots: a few for the largest
   classes, a few dozen for the smallest.

@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use icetray_slab::{Emptied, Slabs, is_slot, jemalloc_class, slab_class, slots_per_chunk};
+use icetray_slab::{Slabs, is_slot, jemalloc_class};
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use quick_cache::{DefaultHashBuilder, Equivalent, OptionsBuilder, Weighter};
 
@@ -30,6 +30,7 @@ use crate::index::RowPosition;
 use crate::key::Key;
 use crate::metric;
 use crate::shard::Tally;
+use crate::slab_policy::{self, Home};
 use crate::time;
 
 /// The largest value, in bytes, the cache keeps: one contract value page.
@@ -50,32 +51,9 @@ const QUICK_CACHE_SLOT_BYTES: usize = 64;
 const ROW_SLOT_BYTES: u64 =
     approx::count(QUICK_CACHE_SLOT_BYTES + size_of::<EntryKey>() + size_of::<EntryValue>());
 
-/// Bytes of the shared header the first clone of a cached value's `Bytes`
-/// allocates, which every value entry that is read pays: `bytes`' `Shared`,
-/// a buffer pointer, its capacity, and a reference count.
-const SHARED_HEADER_LEN: usize = 24;
-
-/// What the shared header takes in jemalloc's size class
-/// (`SHARED_HEADER_LEN`).
-const SHARED_HEADER_BYTES: u64 = approx::count(jemalloc_class(SHARED_HEADER_LEN));
-
 /// Bytes of an `Arc`'s allocation before what it holds: its strong and weak
 /// counts. An entry's key is an `Arc`, which its slot's record shares.
 const ARC_COUNTS_BYTES: usize = 2 * size_of::<usize>();
-
-/// The share of the budget held in reserve for the slabs' bytes that no
-/// entry is charged for, their free slots and the chunks being emptied, as
-/// the divisor of one: a sixteenth. The entries' capacity is the budget
-/// less the reserve, set once per budget, since `quick_cache` shrinks its
-/// ghost list on every change of capacity. When the slabs' uncharged bytes
-/// pass the reserve, the cache empties chunks until they are back within
-/// it (`RowCache::fit`), so a free slot within the reserve costs nothing
-/// beyond it, and the reserve costs that share of the entries.
-///
-/// The cache keeps values in slabs only while its budget is at least this
-/// many of its largest chunk (`slab_floor_bytes`), so the reserve holds a
-/// chunk of any class; under that, values stay in allocations of their own.
-const SLAB_RESERVE_DIVISOR: u64 = 16;
 
 /// The weight of an average entry, which `quick_cache` divides the budget by
 /// to choose how many shards to split into: what a value of about a
@@ -149,31 +127,13 @@ impl GhostReserve {
     }
 }
 
-/// Where an entry keeps its value's bytes: in a slot of the cache's slabs,
-/// or in an allocation of its own. A value's home is fixed when it is
-/// cached, by its length and the budget then (`entry`), and its charge
-/// follows it, since `quick_cache` weighs an entry again when it evicts it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Home {
-    /// A slot of the slabs, read in place.
-    Slot,
-    /// An allocation of the value's own.
-    Own,
-}
-
 /// What an entry is charged against the budget: its key's `Arc`
 /// allocation of `key_len` bytes and the counts before them, in jemalloc's
 /// size class; its slot (`ROW_SLOT_BYTES`); and for a value, its length and
 /// its home (`None` for a cached null or a presence entry, which holds no
-/// value). A value in a slot takes the slot's class and the handle its
-/// `Bytes` reads the slot through (`icetray_slab::SLOT_HANDLE_BYTES`); one
-/// in its own allocation takes jemalloc's size class and the shared header
-/// a read allocates (`SHARED_HEADER_BYTES`).
+/// value), charged what its home charges (`Home::charged`).
 fn charged(key_len: usize, value: Option<(usize, Home)>) -> u64 {
-    let value = value.map_or(0, |(len, home)| match home {
-        Home::Slot => approx::count(slab_class(len) + icetray_slab::SLOT_HANDLE_BYTES),
-        Home::Own => approx::count(jemalloc_class(len)) + SHARED_HEADER_BYTES,
-    });
+    let value = value.map_or(0, |(len, home)| home.charged(len));
     approx::count(jemalloc_class(ARC_COUNTS_BYTES + key_len)) + value + ROW_SLOT_BYTES
 }
 
@@ -181,15 +141,6 @@ fn charged(key_len: usize, value: Option<(usize, Home)>) -> u64 {
 /// (`ROW_CACHE_MAX_VALUE_BYTES`).
 fn slab_max_bytes() -> usize {
     approx::length(ROW_CACHE_MAX_VALUE_BYTES)
-}
-
-/// The smallest budget under which the cache keeps values in slabs:
-/// `SLAB_RESERVE_DIVISOR` times the bytes of a chunk of its largest class,
-/// the class of `ROW_CACHE_MAX_VALUE_BYTES`, so the reserve holds one chunk
-/// of any class: 4 MiB.
-fn slab_floor_bytes() -> u64 {
-    let largest = slab_class(slab_max_bytes());
-    SLAB_RESERVE_DIVISOR * approx::count(slots_per_chunk(largest) * largest)
 }
 
 /// What an entry for a table key of `key_len` bytes and a value of
@@ -429,7 +380,7 @@ struct Built {
     cache: Cache<EntryKey, EntryValue, RowWeighter>,
     ghosts: GhostReserve,
     /// The budget `new` or the last resize gave the cache, which the
-    /// entries and the slabs' reserve share (`SLAB_RESERVE_DIVISOR`).
+    /// entries and the slabs' reserve share (`slab_policy::reserve`).
     budget: AtomicU64,
 }
 
@@ -466,14 +417,14 @@ impl Built {
     }
 
     /// The bytes of the budget held in reserve for the slabs
-    /// (`SLAB_RESERVE_DIVISOR`).
+    /// (`slab_policy::reserve`).
     fn reserve(&self) -> u64 {
-        self.budget() / SLAB_RESERVE_DIVISOR
+        slab_policy::reserve(self.budget(), slab_max_bytes())
     }
 
-    /// Whether the budget keeps values in slabs (`slab_floor_bytes`).
+    /// Whether the budget keeps values in slabs (`slab_policy::uses_slabs`).
     fn uses_slabs(&self) -> bool {
-        self.budget() >= slab_floor_bytes()
+        slab_policy::uses_slabs(self.budget(), slab_max_bytes())
     }
 
     /// Gives the cache a budget of `budget` bytes and sets its entries'
@@ -532,7 +483,7 @@ impl RowCache {
     /// A cache whose entries, as `charged` charges them, ghost list, and
     /// slabs' bytes no entry is charged for (`Slabs::uncharged_bytes`)
     /// together take at most `capacity_bytes`: the slabs' reserve is held
-    /// back from it (`SLAB_RESERVE_DIVISOR`), the ghost list's slots are
+    /// back from it (`slab_policy::reserve`), the ghost list's slots are
     /// reserved out of the rest (`GhostReserve`), and the entries hold what
     /// remains. Only chunks being emptied whose slots readers still hold
     /// take more: each counts whole among the slabs' bytes until its last
@@ -545,8 +496,8 @@ impl RowCache {
     /// under one `ROW_CACHE_MAX_VALUE_BYTES` value per shard caches only
     /// smaller values, and a budget of zero, a server none of whose tables
     /// reads through the cache, caches nothing. A budget under the slab
-    /// floor (`slab_floor_bytes`) keeps every value in an allocation of
-    /// its own.
+    /// floor of 4 MiB (`slab_policy::floor_bytes`) keeps every value in an
+    /// allocation of its own and holds back no reserve.
     #[must_use]
     pub fn new(capacity_bytes: u64) -> Self {
         Self(Arc::new(Inner {
@@ -593,7 +544,8 @@ impl RowCache {
     /// zero builds the cache `new` would for `capacity_bytes` in its place
     /// instead, which every clone reads from its next call on. The slabs
     /// are kept, and a value already in them stays there until it leaves
-    /// the cache, whichever side of the slab floor the new budget is on.
+    /// the cache or its chunk is emptied: a budget under the slab floor
+    /// holds no reserve, so every chunk with a free slot is emptied then.
     pub(crate) fn resize(&self, capacity_bytes: u64) {
         let built = self.0.built.load();
         let budget = built.budget();
@@ -632,35 +584,19 @@ impl RowCache {
         self.fit();
     }
 
-    /// Brings the slabs' uncharged bytes back within the reserve: while
-    /// they pass it, and the chunks being emptied alone do not, so the free
-    /// slots are what pushes them over, empties the sparsest chunk of the
-    /// class whose free slots hold the most, dropping the entries that
-    /// hold its slots. A chunk that no reader holds is freed then; one a
-    /// reader holds waits for the reader to drop its slot, counted among the
-    /// chunks being emptied, and nothing waits for it here. A slot an insert
-    /// has filled and not yet cached is dropped by that insert (`admit`). Each round takes one chunk
-    /// out of those a store may fill, so the rounds end.
+    /// Brings the slabs' uncharged bytes back within the reserve
+    /// (`slab_policy::fit`), dropping the entries that hold the slots of
+    /// each chunk emptied. A slot an insert has filled and not yet cached
+    /// is dropped by that insert (`admit`).
     fn fit(&self) {
         let built = self.0.built.load();
-        let slabs = &self.0.slabs;
-        let reserve = built.reserve();
-        while slabs.uncharged_bytes() > reserve && slabs.waiting_bytes() < reserve {
-            let Some(class) = slabs.class_over(0) else {
-                break;
-            };
-            let emptied = slabs.empty_sparsest(class);
-            if emptied.is_empty() {
-                break;
-            }
-            for Emptied { record, at } in emptied {
-                // Only the entry still holding the slot is dropped. A freed
-                // chunk's address can be reused, so once the slot's chunk is
-                // freed this can drop a newer entry at the same address: a
-                // cache miss, never a wrong answer.
-                built.cache.remove_if(&record, |value| value.holds_slot(at));
-            }
-        }
+        slab_policy::fit(&self.0.slabs, built.reserve(), |record, at| {
+            // Only the entry still holding the slot is dropped. A freed
+            // chunk's address can be reused, so once the slot's chunk is
+            // freed this can drop a newer entry at the same address: a
+            // cache miss, never a wrong answer.
+            built.cache.remove_if(&record, |value| value.holds_slot(at));
+        });
     }
 
     /// How the cache is built now: what a test compares with a freshly
@@ -843,10 +779,13 @@ impl fmt::Debug for RowCache {
 mod tests {
     use bytes::Bytes;
 
+    use icetray_slab::{Emptied, slab_class, slots_per_chunk};
+
     use super::*;
     use crate::approx::units::{GIB, KIB, MIB};
     use crate::index::RowPosition;
     use crate::metric::testing::{Series, recorded_with};
+    use crate::slab_policy::{SHARED_HEADER_BYTES, SLAB_RESERVE_DIVISOR};
 
     /// The table the tests' entries are cached for.
     const TABLE: &str = "a_table";
@@ -1356,11 +1295,12 @@ mod tests {
     }
 
     /// Under the slab floor of 4 MiB values stay in allocations of their
-    /// own; a resize across the floor decides where values cached from then
-    /// on live, and a value already in a slot stays there until it leaves.
+    /// own and no reserve is held; a resize across the floor decides where
+    /// values cached from then on live, and a resize under it empties the
+    /// chunks with free slots, which no reserve holds any more.
     #[test]
     fn test_a_budget_under_the_slab_floor_keeps_values_on_jemalloc() {
-        let floor = slab_floor_bytes();
+        let floor = slab_policy::floor_bytes(slab_max_bytes());
         assert_eq!(floor, 4 * MIB);
         let value = vec![5_u8; 4242];
         let cache = RowCache::new(floor - 1);
@@ -1379,17 +1319,11 @@ mod tests {
         let slot = charged(key_len, Some((value.len(), Home::Slot)));
         assert_eq!(cache.0.built.load().cache.weight(), own + slot);
         cache.resize(floor - 1);
+        assert_eq!(cache.0.slabs.chunk_bytes(), 0, "the chunk is emptied");
+        assert!(!cache.holds(&key(2, 0)), "with the value in its slot");
         cache.insert(key(3, 0), Some(&value));
-        assert_eq!(
-            cache.0.slabs.held_slots(),
-            1,
-            "the slot stays, the new value is its own"
-        );
-        let Cached::Value(in_slot) = cache.get(&key(2, 0)) else {
-            panic!("the value in a slot is still cached");
-        };
-        assert_eq!(in_slot, value);
-        assert_eq!(cache.0.built.load().cache.weight(), 2 * own + slot);
+        assert_eq!(cache.0.slabs.chunk_bytes(), 0, "the new value is its own");
+        assert_eq!(cache.usage(), 2 * own);
     }
 
     /// A budget smaller than one chunk of the class a value takes is not

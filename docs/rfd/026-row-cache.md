@@ -61,8 +61,8 @@ and will check each hit against the generation's files and deletes.
   of the cache's slabs and is charged its slab's size class (RFD 030
   (Cache slabs)); a shorter value, any value under a smaller budget, and
   the key are charged jemalloc's size class. The slabs' free slots, which
-  no entry is charged for, take a sixteenth of the budget held in reserve
-  for them, and the entries the rest. icetray does not cache a value
+  no entry is charged for, take a sixteenth of such a budget held in
+  reserve for them, and the entries the rest. icetray does not cache a value
   above a bound.
 - **The library.** quick_cache, the fastest in a bake-off against foyer
   and segcache over rows of 100 bytes to 8 KiB, and the only one whose
