@@ -51,6 +51,13 @@ impl ClassId {
     }
 }
 
+/// A chunk of a slab class, by a number the class gives no other chunk:
+/// what `Slabs::is_being_emptied` asks about. A chunk freed and another
+/// allocated at its address take different tokens, so the token, unlike
+/// the address, names one chunk for the slabs' life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkToken(u64);
+
 /// A held slot of a chunk that `Slabs::empty_sparsest` marked as being
 /// emptied.
 #[derive(Debug)]
@@ -59,6 +66,8 @@ pub struct Emptied<R> {
     pub record: R,
     /// The slot's address, which `is_slot` compares with a `Bytes`'.
     pub at: usize,
+    /// The slot's chunk, which `Slabs::is_being_emptied` asks about.
+    pub chunk: ChunkToken,
 }
 
 /// Whether `bytes` start at `at`, the address of a slot in an `Emptied`:
@@ -184,15 +193,15 @@ impl<R: Clone + Send + Sync + 'static> Slabs<R> {
         self.pool.is_emptying(class, bytes.as_ptr().addr())
     }
 
-    /// Whether the slot at `at` of class `class`, as `empty_sparsest`
-    /// handed them out, lies in a chunk being emptied: true until that
-    /// chunk is freed, so a cache that keeps the slots an emptying handed
-    /// out knows when to let one go. A chunk freed and another of the class
-    /// allocated at its address and marked makes it true again, for as long
-    /// as that chunk is being emptied. It takes the class's lock as
+    /// Whether the chunk `chunk` of class `class`, as `empty_sparsest`
+    /// handed it out, is still being emptied: true until that chunk is
+    /// freed and never again, whatever chunk takes its address, so a cache
+    /// that keeps the chunks an emptying marked knows when to let one go.
+    /// It reads the class's count of chunks being emptied without the
+    /// class's lock and takes the lock only while the count is not zero, as
     /// `is_emptying` does.
-    pub fn is_emptying_in(&self, class: ClassId, at: usize) -> bool {
-        self.pool.is_emptying(class.index(), at)
+    pub fn is_being_emptied(&self, class: ClassId, chunk: ChunkToken) -> bool {
+        self.pool.is_being_emptied(class.index(), chunk)
     }
 
     /// Nanoseconds that stores, frees, and emptying spent waiting for a
@@ -257,7 +266,12 @@ impl<R: Send + 'static> Pool<R> {
             let id = if let Some(&(_, id)) = state.room.last() {
                 id
             } else {
-                let chunk = ChunkState::new(Chunk::new(slab.slot_bytes, slab.slots), slab.slots);
+                // Wrapping, so nothing here can panic; a class would allocate
+                // 2^64 chunks before a token came back.
+                let token = ChunkToken(state.next_token);
+                state.next_token = state.next_token.wrapping_add(1);
+                let chunk =
+                    ChunkState::new(Chunk::new(slab.slot_bytes, slab.slots), slab.slots, token);
                 self.chunk_bytes
                     .fetch_add(slab.chunk_charge, Ordering::Relaxed);
                 self.add_free(slab, slab.chunk_charge);
@@ -305,7 +319,12 @@ impl<R: Send + 'static> Pool<R> {
             .fetch_add(slab.chunk_charge - free, Ordering::Relaxed);
         self.waiting_bytes
             .fetch_add(slab.chunk_charge, Ordering::Relaxed);
-        let ChunkState { chunk, records, .. } = chunk;
+        let ChunkState {
+            chunk,
+            records,
+            token,
+            ..
+        } = chunk;
         records
             .iter_mut()
             .enumerate()
@@ -313,9 +332,25 @@ impl<R: Send + 'static> Pool<R> {
                 record.take().map(|record| Emptied {
                     record,
                     at: chunk.slot_addr(index),
+                    chunk: *token,
                 })
             })
             .collect()
+    }
+
+    /// `Slabs::is_being_emptied` for chunk `chunk` of class `class`.
+    fn is_being_emptied(&self, class: usize, chunk: ChunkToken) -> bool {
+        if self.classes[class].emptying_chunks.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let guard = self.lock(class);
+        guard.emptying.iter().any(|id| {
+            guard.chunks[id.index()]
+                .as_ref()
+                .expect("a chunk being emptied is in its class until it is freed")
+                .token
+                == chunk
+        })
     }
 
     /// `Slabs::is_emptying` for an address `at` in class `class`.
@@ -437,6 +472,7 @@ impl<R> Class<R> {
                 free_ids: Vec::new(),
                 room: BTreeSet::new(),
                 emptying: Vec::new(),
+                next_token: 0,
             }),
         }
     }
@@ -454,6 +490,8 @@ struct ClassState<R> {
     room: BTreeSet<(u32, ChunkId)>,
     /// The ids of the chunks being emptied, until each is freed.
     emptying: Vec<ChunkId>,
+    /// The token the class's next new chunk takes.
+    next_token: u64,
 }
 
 impl<R> ClassState<R> {
@@ -478,15 +516,18 @@ struct ChunkState<R> {
     /// Each slot's record, `None` while the slot is free and once its
     /// chunk is being emptied, which hands the records out.
     records: Vec<Option<R>>,
+    /// The chunk's token, which no other chunk of its class takes.
+    token: ChunkToken,
 }
 
 impl<R> ChunkState<R> {
-    /// `chunk`, of `slots` free slots, not being emptied.
-    fn new(chunk: Chunk, slots: usize) -> ChunkState<R> {
+    /// `chunk`, of `slots` free slots, not being emptied, under `token`.
+    fn new(chunk: Chunk, slots: usize, token: ChunkToken) -> ChunkState<R> {
         ChunkState {
             chunk,
             emptying: false,
             records: iter::repeat_with(|| None).take(slots).collect(),
+            token,
         }
     }
 }
@@ -571,28 +612,34 @@ mod tests {
         assert!(!slabs.is_emptying(&reused), "after the chunk is freed");
     }
 
-    /// `is_emptying_in` answers yes for every slot an emptying handed out
-    /// until its chunk is freed, and no for the slots of another class.
+    /// `is_being_emptied` answers yes for the chunk an emptying marked
+    /// until it is freed, and no after, also once a new chunk of the class
+    /// is marked: one the allocator may place at the freed one's address.
     #[test]
-    fn test_is_emptying_in_names_the_slots_an_emptying_handed_out() {
+    fn test_is_being_emptied_names_one_chunk_until_it_is_freed() {
         let slabs = Slabs::new(MAX_BYTES);
-        let held = [
-            slabs.store(&pattern(LEN_4352_CLASS, 1), 1).unwrap(),
-            slabs.store(&pattern(LEN_4352_CLASS, 2), 2).unwrap(),
-        ];
-        let other = slabs.store(&pattern(MIN_SLAB_BYTES, 3), 3).unwrap();
         let class = class_of(LEN_4352_CLASS);
+        let held = slabs.store(&pattern(LEN_4352_CLASS, 1), 1).unwrap();
+        let other = slabs.store(&pattern(MIN_SLAB_BYTES, 2), 2).unwrap();
         let emptied = slabs.empty_sparsest(class);
-        assert_eq!(emptied.len(), held.len());
-        for Emptied { at, .. } in &emptied {
-            assert!(slabs.is_emptying_in(class, *at));
-        }
-        let other_at = other.as_ptr().addr();
-        assert!(!slabs.is_emptying_in(class_of(MIN_SLAB_BYTES), other_at));
+        let [Emptied { chunk: first, .. }] = <[Emptied<u8>; 1]>::try_from(emptied).unwrap();
+        assert!(slabs.is_being_emptied(class, first));
+        assert!(
+            !slabs.is_being_emptied(class_of(MIN_SLAB_BYTES), first),
+            "another class"
+        );
         drop(held);
-        for Emptied { at, .. } in &emptied {
-            assert!(!slabs.is_emptying_in(class, *at), "the chunk is freed");
-        }
+        assert!(!slabs.is_being_emptied(class, first), "the chunk is freed");
+        let again = slabs.store(&pattern(LEN_4352_CLASS, 3), 3).unwrap();
+        let emptied = slabs.empty_sparsest(class);
+        let [Emptied { chunk: second, .. }] = <[Emptied<u8>; 1]>::try_from(emptied).unwrap();
+        assert_ne!(second, first, "a new chunk takes a new token");
+        assert!(slabs.is_being_emptied(class, second));
+        assert!(
+            !slabs.is_being_emptied(class, first),
+            "whatever its address"
+        );
+        drop((again, other));
     }
 
     /// The handle's length is the slot's owner and a reference count,
@@ -821,7 +868,7 @@ mod tests {
         let emptied = slabs.empty_sparsest(class_of(MIN_SLAB_BYTES));
 
         assert_eq!(emptied.len(), held.len());
-        for Emptied { record, at } in &emptied {
+        for Emptied { record, at, .. } in &emptied {
             for (index, bytes) in held.iter().enumerate() {
                 assert_eq!(is_slot(bytes, *at), index == *record, "{index} {record}");
             }

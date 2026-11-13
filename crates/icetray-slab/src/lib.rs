@@ -13,4 +13,4 @@ pub use class::{
     CHUNK_TARGET_BYTES, MAX_SLOTS_PER_CHUNK, MIN_SLAB_BYTES, MIN_SLOTS_PER_CHUNK, in_slabs,
     jemalloc_class, slab_class, slots_per_chunk,
 };
-pub use slabs::{ClassId, Emptied, SLOT_HANDLE_BYTES, Slabs, is_slot};
+pub use slabs::{ChunkToken, ClassId, Emptied, SLOT_HANDLE_BYTES, Slabs, is_slot};

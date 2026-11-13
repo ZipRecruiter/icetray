@@ -88,7 +88,7 @@ fn run(slabs: &Slabs<Key>, class: ClassId, thread: usize) -> usize {
             window.pop_front();
         }
         if round % EMPTY_EVERY == 0 {
-            for Emptied { record, at } in slabs.empty_sparsest(class) {
+            for Emptied { record, at, .. } in slabs.empty_sparsest(class) {
                 if record.thread != thread {
                     continue;
                 }
