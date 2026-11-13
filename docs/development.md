@@ -13,6 +13,10 @@ dev/ci-checks.sh
 clippy --workspace --all-targets --locked -- -D warnings`. CI runs that
 script and `cargo test --workspace --locked`.
 
+`dev/miri.sh` runs the tests of `icetray-slab`, whose `unsafe` manages
+memory, under Miri, on a nightly the script pins and installs beside the
+stable one. CI runs it too, in a job of its own.
+
 ## The development environment
 
 `.flox/env/manifest.toml` declares an optional [flox](https://flox.dev)

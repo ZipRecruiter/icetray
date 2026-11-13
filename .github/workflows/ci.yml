@@ -67,3 +67,15 @@ jobs:
           findmnt --target "$RUNNER_TEMP"
       - name: cargo test
         run: cargo test --workspace --locked
+
+  miri:
+    name: miri
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      # No toolchain step and no cache: dev/miri.sh installs its pinned
+      # nightly with Miri and names it on every command, so nothing here
+      # runs rust-toolchain.toml's stable pin, and Miri builds its own
+      # sysroot on each run.
+      - name: miri
+        run: dev/miri.sh

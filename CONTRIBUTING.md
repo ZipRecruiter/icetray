@@ -18,6 +18,15 @@ tool can check it.
   disable` or `RUSTUP_AUTO_INSTALL=0` turns it off. Without auto-install,
   run `rustup toolchain install` in the repository yourself. Bumping the
   pin is its own commit.
+- `dev/miri.sh` pins the one other toolchain, a nightly, and uses it for
+  Miri alone (RFD 029 (Unsafe code)): every crate whose `unsafe` manages
+  memory runs its tests under Miri there, in CI's `miri` job and before
+  you push a change to such a crate. The script installs the nightly
+  with its `miri` and `rust-src` components when they are missing, beside
+  the stable pin and leaving rustup's default toolchain as it was, and
+  names it on each command; nothing else builds with it. The pin is the
+  newest nightly that ships Miri for both `aarch64-apple-darwin` and
+  `x86_64-unknown-linux-gnu`, and bumping it is its own commit.
 - `.flox/env/manifest.toml` declares the development environment: `flox
   activate` puts rustup and the container runtime on PATH. It is a
   convenience, not a requirement. Nothing in CI, the hooks, or the `dev/`
