@@ -581,8 +581,9 @@ impl PageCache {
     /// split evenly over `memory_shards()`. Only chunks being emptied whose
     /// pages readers, or the disk level's write queue, still hold take
     /// more: each counts whole among the slabs' bytes until the last of
-    /// them drops its page, and together they can pass the reserve, and
-    /// the cache its budget, by as much as they hold. While they pass the
+    /// them drops its page, beside the reserve, which the free slots keep
+    /// whole (`slab_policy::fit`), so the cache passes its budget by those
+    /// chunks. While they pass the
     /// reserve memory empties no chunk, so free slots in other chunks are
     /// not reclaimed either, and grow with evictions, until the readers or
     /// the write queue let go. A budget under the slab floor of about
@@ -1360,7 +1361,7 @@ impl PageCache {
         }
     }
 
-    /// Brings the slabs' uncharged bytes back within the reserve
+    /// Brings the slabs' free slots back within the reserve
     /// (`slab_policy::fit`), each page holding a slot of a chunk emptied
     /// leaving memory as foyer evicts one (`evict_slot`), then checks again
     /// some of the slots emptyings handed out (`recheck`). A slot a store

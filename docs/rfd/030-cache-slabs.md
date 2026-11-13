@@ -55,15 +55,17 @@ out as a reference to its slot rather than a copy.
   with the budget. A free slot within the reserve costs nothing beyond
   it, and the reserve costs that share of the entries.
 - **Chunks go back.** The slab frees a chunk whose slots are all free.
-  When the free slots pass what the reserve leaves beside the chunks
-  being emptied, the cache evicts the entries of the chunk with the fewest
-  held slots in the class whose free slots hold the most, and frees the
-  chunk, until they are back within it, so it gives back memory that a
-  shift in lengths left stranded. What the reserve leaves is set as each
-  such emptying begins: a chunk it marks takes its free slots out of the
-  free slots and waits whole for any slot still held, and counting that
-  wait at once would have one emptying mark chunk after chunk whenever
-  the disk level's write queue holds the pages it evicts. The page cache
+  When the free slots of chunks not being emptied pass the reserve, the
+  cache evicts the entries of the chunk with the fewest held slots in the
+  class whose free slots hold the most, and frees the chunk, until they
+  are back within it, so it gives back memory that a shift in lengths
+  left stranded. The chunks being emptied are not measured against the
+  reserve: a chunk an emptying marks takes its free slots out of the free
+  slots at once and waits whole for any slot still held, so a target that
+  counted the waiting would have each emptying mark more chunks than the
+  last while readers or the disk level's write queue hold their pages.
+  The free slots keep the whole reserve, and a chunk waiting costs its
+  bytes beside it (Held slots). The page cache
   evicts such a page as its memory level evicts any, to the disk level
   when there is one, so a later read of it costs a local read and no GET.
   Each slot records which entry holds it, so the cache can find the
@@ -74,9 +76,10 @@ out as a reference to its slot rather than a copy.
   done with it, and the disk level's write queue until it has written an
   evicted page. A chunk being emptied takes no new values, and the slab
   frees it when its last held slot drops; a gauge reports the bytes in
-  chunks waiting. Until then such a chunk counts whole against the
-  reserve, and while readers hold slots of enough of them, the cache's
-  memory passes the reserve, and the budget, by those chunks. While the
+  chunks waiting. Until then such a chunk counts whole among the slabs'
+  bytes, beside the reserve the free slots keep, so while readers hold
+  slots of such chunks the cache's memory passes the budget by those
+  chunks. While the
   chunks waiting pass the reserve the cache empties no chunk, so free
   slots in other chunks are not reclaimed either, and grow with
   evictions, until readers, or the write queue, let go. An entry an
@@ -91,8 +94,7 @@ out as a reference to its slot rather than a copy.
   each resize, looks again in about a chunk's worth of the kept slots and
   takes out any page memory holds in one. Such a page holds its chunk
   until those fits reach its slot, counted among the chunks waiting until
-  then: the other way the cache's memory passes the reserve and the
-  budget.
+  then: the other way the cache's memory passes the budget.
 - **Locking.** A slab takes its lock to claim and to free a slot, and a
   store copies its bytes into the slot outside the lock, since nothing
   refers to a slot until its store returns. A hit takes no slab lock.

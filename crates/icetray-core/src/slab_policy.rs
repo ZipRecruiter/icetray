@@ -115,41 +115,39 @@ pub(crate) fn budget_holding(entries: u64, floor: u64) -> u64 {
     }
 }
 
-/// Brings the free slots of `slabs` back within what `reserve` leaves
-/// beside the chunks being emptied as the call begins: while the free
-/// slots of chunks not being emptied pass that room, and the chunks being
-/// emptied now do not pass the reserve, empties the sparsest chunk of the
-/// class whose free slots hold the most, calling `leave` with the class
-/// and the record and address of each slot held in it, once per chunk,
-/// for the cache to take out the entries that still hold those slots. A
-/// chunk that no reader holds is freed then; one a reader, or the disk
-/// level's write queue, holds waits for it to drop its slot, counted among
-/// the chunks being emptied, and nothing waits for it here.
+/// Brings the free slots of `slabs`, those of chunks not being emptied,
+/// back within `reserve`: while they pass it, and the chunks being emptied
+/// do not, empties the sparsest chunk of the class whose free slots hold
+/// the most, calling `leave` with the class and the record and address of
+/// each slot held in it, once per chunk, for the cache to take out the
+/// entries that still hold those slots. A chunk that no reader holds is
+/// freed then; one a reader, or the disk level's write queue, holds waits
+/// for it to drop its slot, counted among the chunks being emptied, and
+/// nothing waits for it here.
 ///
-/// The room is set once, from the chunks waiting at the start: each chunk
-/// marked here takes its free slots out of the free slots and adds its
-/// held ones to the chunks waiting, so measuring against the uncharged
-/// bytes, which count a waiting chunk whole, would have a mark raise what
-/// it is meant to lower, and one call would mark chunk after chunk until
-/// the waiting passed the reserve. The chunks a call marks count against
-/// the room from the next call on, which then holds the free slots to
-/// less while they wait. While the chunks waiting pass the reserve no
-/// call empties anything, so free slots elsewhere go unreclaimed until
-/// readers let go. Each round takes one chunk out of those a store may
-/// fill, so the rounds end. Under a reserve of zero, a budget under the
-/// slab floor, it empties every chunk with a free slot while none waits.
+/// The free slots alone are measured, not the uncharged bytes: a chunk
+/// marked here takes its free slots out of them but counts whole among
+/// the chunks waiting while anything holds a slot of it, so a mark can
+/// raise the uncharged bytes, and a target that counted the waiting
+/// chunks would have each fit mark more chunks than the last until the
+/// waiting passed the reserve. So a chunk waiting costs the cache its
+/// bytes beside the reserve, and the free slots keep the whole reserve.
+/// While the chunks waiting pass the reserve no fit empties anything, so
+/// free slots go unreclaimed until readers let go. Each round takes one
+/// chunk out of those a store may fill, so the rounds end. Under a reserve
+/// of zero, a budget under the slab floor, it empties every chunk with a
+/// free slot while none waits.
 pub(crate) fn fit<R: Clone + Send + Sync + 'static>(
     slabs: &Slabs<R>,
     reserve: u64,
     mut leave: impl FnMut(ClassId, Vec<Emptied<R>>),
 ) {
-    let room = reserve.saturating_sub(slabs.waiting_bytes());
     let free = || {
         slabs
             .uncharged_bytes()
             .saturating_sub(slabs.waiting_bytes())
     };
-    while free() > room && slabs.waiting_bytes() <= reserve {
+    while free() > reserve && slabs.waiting_bytes() <= reserve {
         let Some(class) = slabs.class_over(0) else {
             break;
         };
@@ -241,12 +239,12 @@ mod tests {
 
     /// Chunks a fit marks while readers hold some of their slots wait for
     /// the readers and count whole among the uncharged bytes, so each mark
-    /// raises them; the fit still marks only the chunks whose free slots
-    /// bring the free slots back within the room the reserve leaves beside
-    /// the chunks waiting as it begins, and the next fit counts the chunk
-    /// the last one marked against that room.
+    /// raises them. Fit after fit, as a cache runs one after each insert or
+    /// fetch, with the readers kept, the fits together mark only the chunks
+    /// whose free slots bring the free slots back within the reserve: the
+    /// chunks waiting take nothing from what the free slots may hold.
     #[test]
-    fn test_one_fit_marks_what_the_free_slots_call_for_while_chunks_wait() {
+    fn test_fits_mark_only_what_the_free_slots_call_for_while_chunks_wait() {
         let slabs = Slabs::new(MAX_BYTES);
         let (chunks, held) = (64, 3);
         let readers = chunks_readers_hold(&slabs, chunks, held);
@@ -256,8 +254,11 @@ mod tests {
         let free = approx::count(chunks) * free_a_chunk;
         assert_eq!(slabs.uncharged_bytes(), free);
         let reserve = free - 1;
+        let fits = 20;
         let mut marked = 0;
-        fit(&slabs, reserve, |_, _| marked += 1);
+        for _ in 0..fits {
+            fit(&slabs, reserve, |_, _| marked += 1);
+        }
         assert_eq!(
             marked, 1,
             "one chunk's free slots bring them back within the reserve"
@@ -268,15 +269,9 @@ mod tests {
             "the chunk waits for its readers"
         );
         assert!(slabs.uncharged_bytes() > reserve, "and counts whole");
-
-        let room = reserve - chunk;
-        let free = free - free_a_chunk;
-        let mut marked = 0;
-        fit(&slabs, reserve, |_, _| marked += 1);
-        assert_eq!(marked, (free - room).div_ceil(free_a_chunk));
-        assert!(slabs.waiting_bytes() <= reserve);
         drop(readers);
         assert_eq!(slabs.waiting_bytes(), 0);
+        assert!(slabs.uncharged_bytes() <= reserve);
     }
 
     #[test]

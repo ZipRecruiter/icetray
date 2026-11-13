@@ -494,12 +494,11 @@ impl RowCache {
     /// reserved out of the rest (`GhostReserve`), and the entries hold what
     /// remains. Only chunks being emptied whose slots readers still hold
     /// take more: each counts whole among the slabs' bytes until its last
-    /// reader drops its value, and together they can pass the reserve, and
-    /// the cache its budget, by as much as the readers hold. While they pass
-    /// the reserve the cache empties no chunk, so free slots in other chunks
-    /// are not reclaimed either, and grow with evictions, until readers let
-    /// go. Its
-    /// hit, miss, stale, and slab wait counters are registered at zero in
+    /// reader drops its value, beside the reserve, which the free slots keep
+    /// whole (`slab_policy::fit`), so the cache passes its budget by those
+    /// chunks. While they pass the reserve the cache empties no chunk, so
+    /// free slots in other chunks are not reclaimed either, and grow with
+    /// evictions, until readers let go. Its hit, miss, stale, and slab wait counters are registered at zero in
     /// the recorder current now. It splits into shards chosen for
     /// `capacity_bytes`, each holding its share of the entries' part, so
     /// an entry is cached only when it fits its shard's share: a budget
@@ -595,7 +594,7 @@ impl RowCache {
         self.fit();
     }
 
-    /// Brings the slabs' uncharged bytes back within the reserve
+    /// Brings the slabs' free slots back within the reserve
     /// (`slab_policy::fit`), dropping the entries that hold the slots of
     /// each chunk emptied. A slot an insert has filled and not yet cached
     /// is dropped by that insert (`admit`).
