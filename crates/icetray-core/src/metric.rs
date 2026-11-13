@@ -24,6 +24,11 @@ pub const PAGE_CACHE_HITS_TOTAL: &str = "icetray_page_cache_hits_total";
 /// Page fetches the page cache ran, after coalescing: a span fetch counts
 /// once however many pages it holds.
 pub const PAGE_CACHE_FETCHES_TOTAL: &str = "icetray_page_cache_fetches_total";
+/// Microseconds that stores into the page cache's slabs, frees of their
+/// slots, and the emptying of their chunks waited for a slab class's lock
+/// (RFD 030).
+pub const PAGE_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL: &str =
+    "icetray_page_cache_slab_wait_microseconds_total";
 /// Value reads, and presence-only lookups of present keys, that icetray
 /// served from the row cache without resolving the key or reading a page
 /// (RFD 026), a cached null included.
@@ -122,8 +127,16 @@ pub const ALLOCATOR_RESIDENT_BYTES: &str = "icetray_allocator_resident_bytes";
 /// Bytes of address space jemalloc keeps mapped for reuse after returning
 /// its pages: virtual, not resident.
 pub const ALLOCATOR_RETAINED_BYTES: &str = "icetray_allocator_retained_bytes";
-/// Bytes the page cache holds in memory.
+/// Bytes the page cache's memory level holds against its budget (RFD 027,
+/// RFD 030): each page at its allocation size, a page in a slab at its
+/// slot's, plus the per-entry overhead, and the slabs' bytes no page is
+/// charged for, free slots and chunks being emptied, which a sixteenth of
+/// the budget is held in reserve for.
 pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
+/// Bytes of the page cache's slab chunks being emptied, each waiting for a
+/// reader, or the disk level's write queue, to drop the last page it holds
+/// from the chunk (RFD 030).
+pub const PAGE_CACHE_WAITING_BYTES: &str = "icetray_page_cache_waiting_bytes";
 /// Bytes the row cache holds against its budget (RFD 026, RFD 030): each
 /// entry's key and value at their allocation size, a value in a slab at
 /// its slot's, plus the per-entry overhead, and the slabs' bytes no entry
@@ -233,7 +246,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 61] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 63] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -273,6 +286,11 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 61] = [
         PAGE_CACHE_FETCHES_TOTAL,
         Kind::Counter,
         "Page fetches the page cache ran, after coalescing.",
+    ),
+    (
+        PAGE_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL,
+        Kind::Counter,
+        "Microseconds that stores into the page cache's slabs, frees of their slots, and emptying of their chunks waited for a slab class's lock.",
     ),
     (
         ROW_CACHE_HITS_TOTAL,
@@ -407,7 +425,12 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 61] = [
     (
         PAGE_CACHE_BYTES,
         Kind::Gauge,
-        "Bytes the page cache holds in memory against its budget.",
+        "Bytes the page cache holds in memory against its budget, its slabs' free slots and chunks being emptied included.",
+    ),
+    (
+        PAGE_CACHE_WAITING_BYTES,
+        Kind::Gauge,
+        "Bytes of the page cache's slab chunks being emptied that wait for a reader, or the disk level's write, to drop its last page.",
     ),
     (
         ROW_CACHE_BYTES,

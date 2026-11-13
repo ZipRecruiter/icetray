@@ -4,6 +4,10 @@
 //! With a local directory (RFD 017) the cache has a disk level: a page
 //! evicted from memory is written there, served back with a local read and
 //! no GET, and recovered when the next process opens the same directory.
+//! Memory holds a page of `MIN_SLAB_BYTES` to `MAX_SLAB_PAGE_BYTES` in a
+//! slot of its slabs (RFD 030), which a hit hands out in place, and any
+//! other page in an allocation of its own, and charges each page what it
+//! costs there.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -21,6 +25,7 @@ use foyer::{
     BlockEngineConfig, Cache, CacheBuilder, Code, DeviceBuilder as _, ErrorKind, FsDeviceBuilder,
     HybridCache, HybridCacheBuilder, HybridCachePolicy, RecoverMode, S3FifoConfig, Source,
 };
+use icetray_slab::{Slabs, in_slabs, is_slot};
 use metrics::Counter;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
@@ -33,18 +38,46 @@ use crate::local::DiskLevel;
 use crate::memory::MemoryLimit;
 use crate::metric;
 use crate::shard::{self, Sharded, Tally};
+use crate::slab_policy::{self, Home};
 use crate::storage::IoStats;
+use crate::time;
 
 /// The name foyer files its own log lines under. Its metrics stay on its
 /// no-op registry; the crate exports the page cache's counters itself.
 const CACHE_NAME: &str = "icetray_pages";
 
-/// Bytes charged against the memory budget per entry on top of the page
-/// bytes: foyer's record (hash, weight, reference count, list links), the
-/// key's `Arc<str>` pointer and offset, and the `Bytes` handle come to about
-/// this on a 64-bit target. The file id's own bytes are shared by every
-/// page of the file through the `Arc` and are not charged per entry.
+/// Bytes charged against the memory budget per entry on top of what the
+/// page's bytes take (`charged`): foyer's record (hash, weight, reference
+/// count, list links), the key's `Arc<str>` pointer and offset, and the
+/// `Bytes` handle come to about this on a 64-bit target. The file id's own
+/// bytes are shared by every page of the file through the `Arc` and are not
+/// charged per entry.
 const ENTRY_OVERHEAD_BYTES: usize = 64;
+
+/// The longest page the memory level keeps in a slot of its slabs: twice a
+/// contract value page (`contract::VALUE_PAGE_BYTES`), since a byte-bounded
+/// page closes after the value that crosses `VALUE_PAGE_BYTES`, so a page
+/// of values no longer than that is at most twice it. A longer page stays
+/// in an allocation of its own.
+const MAX_SLAB_PAGE_BYTES: u64 = 2 * VALUE_PAGE_BYTES;
+
+/// `MAX_SLAB_PAGE_BYTES` as the slabs take it.
+fn slab_max_bytes() -> usize {
+    approx::length(MAX_SLAB_PAGE_BYTES)
+}
+
+/// What a page of `len` bytes held in `home` costs the memory budget:
+/// what its home charges (`Home::charged`) and the entry overhead.
+fn charged(len: usize, home: Home) -> u64 {
+    home.charged(len) + approx::count(ENTRY_OVERHEAD_BYTES)
+}
+
+/// The part of a memory budget of `budget` bytes the memory level's
+/// entries take: the budget less the slabs' reserve
+/// (`slab_policy::reserve`).
+fn entries_bytes(budget: u64) -> u64 {
+    budget - slab_policy::reserve(budget, slab_max_bytes())
+}
 
 /// The shards of the memory level: `shard::count()`, the runtime's worker
 /// threads rounded up to a power of two. foyer splits the memory budget
@@ -68,16 +101,21 @@ fn eviction() -> S3FifoConfig {
 }
 
 /// The smallest memory budget a page cache of `shards` shards is given:
-/// one contract value page (`contract::VALUE_PAGE_BYTES`) weighed with its
-/// entry overhead, for each shard. Below it a shard's share cannot hold one
-/// such page, and foyer keeps the shard's latest page alone whatever its
-/// share, so the cache would hold a page per shard however small the budget
-/// and the configured bytes would bound nothing. `Config::parse` refuses
-/// less than one shard's minimum, which no machine goes below, and
-/// `open_with` refuses less than the minimum of the shards the cache will
-/// have on the runtime it opens on (`check_capacity`).
+/// one contract value page (`contract::VALUE_PAGE_BYTES`) as memory charges
+/// it (`charged`), in a slot or not, for each shard, held by the entries'
+/// part of the budget (`slab_policy::budget_holding`): a part under the
+/// slab floor holds no reserve and keeps every page in an allocation of
+/// its own, so it needs no room for chunks. Below it a shard's share cannot
+/// hold one such page, and foyer keeps the shard's latest page alone
+/// whatever its share, so the cache would hold a page per shard however
+/// small the budget and the configured bytes would bound nothing.
+/// `Config::parse` refuses less than one shard's minimum, which no machine
+/// goes below, and `open_with` refuses less than the minimum of the shards
+/// the cache will have on the runtime it opens on (`check_capacity`).
 pub(crate) fn min_memory_bytes(shards: usize) -> u64 {
-    approx::count(shards) * (VALUE_PAGE_BYTES + approx::count(ENTRY_OVERHEAD_BYTES))
+    let len = approx::length(VALUE_PAGE_BYTES);
+    let page = charged(len, Home::Slot).max(charged(len, Home::Own));
+    slab_policy::budget_holding(approx::count(shards) * page, slab_max_bytes())
 }
 
 /// `ConfigViolation::PageCacheTooSmall` for a memory budget of `bytes`
@@ -235,14 +273,40 @@ impl Code for PageKey {
 }
 
 /// A page's bytes as the object store returned them, compressed as the file
-/// holds them. Encoded for the disk level as the raw bytes and nothing
-/// else: foyer hands the decoder exactly the bytes it wrote.
+/// holds them, and where they live. foyer weighs a page once, as it enters
+/// memory (`weigh`), by its home. Encoded for the disk level as the raw
+/// bytes and nothing else: foyer hands the decoder exactly the bytes it
+/// wrote, and a decoded page is in an allocation of its own.
 #[derive(Clone, Debug)]
-struct PageValue(Bytes);
+struct PageValue {
+    bytes: Bytes,
+    home: Home,
+}
+
+impl PageValue {
+    /// `page` copied out of whatever buffer holds it, so the entry keeps
+    /// nothing else alive: into a slot of `slabs`, when given, recording
+    /// `key`, if its length is in their range, else into an allocation of
+    /// its own.
+    fn copied(slabs: Option<&Slabs<PageKey>>, key: &PageKey, page: &[u8]) -> Self {
+        match slabs.and_then(|slabs| slabs.store(page, key.clone())) {
+            Some(bytes) => Self {
+                bytes,
+                home: Home::Slot,
+            },
+            None => Self {
+                bytes: Bytes::copy_from_slice(page),
+                home: Home::Own,
+            },
+        }
+    }
+}
 
 impl Code for PageValue {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
-        writer.write_all(&self.0).map_err(foyer::Error::io_error)
+        writer
+            .write_all(&self.bytes)
+            .map_err(foyer::Error::io_error)
     }
 
     fn decode(reader: &mut impl Read) -> foyer::Result<Self> {
@@ -250,11 +314,16 @@ impl Code for PageValue {
         reader
             .read_to_end(&mut bytes)
             .map_err(foyer::Error::io_error)?;
-        Ok(Self(Bytes::from(bytes)))
+        // Shrunk to the page's length, so the allocation is the size class
+        // `weigh` charges.
+        Ok(Self {
+            bytes: Bytes::from(bytes.into_boxed_slice()),
+            home: Home::Own,
+        })
     }
 
     fn estimated_size(&self) -> usize {
-        self.0.len()
+        self.bytes.len()
     }
 }
 
@@ -319,6 +388,7 @@ fn origin_of(source: Source) -> PageOrigin {
 #[derive(Clone, Debug)]
 pub struct PageCache {
     level: Arc<Level>,
+    slabs: Arc<PageSlabs>,
     hits: Arc<Tally>,
     fetches: Arc<Fetches>,
     /// The pages span reads are fetching now, which another span read
@@ -327,6 +397,64 @@ pub struct PageCache {
     spans: Arc<SpanFlights>,
     /// How long a fetch this handle runs may take; `None` is no bound.
     fetch_deadline: Option<Duration>,
+}
+
+/// The memory level's slabs, the budget the level shares with their
+/// reserve, and the counter their lock waits are published to.
+struct PageSlabs {
+    /// The pages of `MIN_SLAB_BYTES` to `MAX_SLAB_PAGE_BYTES` memory holds,
+    /// each slot recording the key of the entry that holds it.
+    slabs: Slabs<PageKey>,
+    /// The budget `PageCache::new` or the last `PageCache::resize_memory`
+    /// gave the memory level, of which its entries take `entries_bytes`.
+    budget: AtomicU64,
+    /// `PAGE_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL`, which
+    /// `PageCache::publish_usage` sets from the slabs' own count.
+    slab_wait: Counter,
+    /// How many times `PageCache::resize_memory` has resized the memory
+    /// level: what the capacity test counts, since foyer reports the
+    /// capacity a level was built with.
+    #[cfg(test)]
+    resizes: AtomicU64,
+}
+
+impl PageSlabs {
+    fn new(budget: u64) -> Self {
+        Self {
+            slabs: Slabs::new(slab_max_bytes()),
+            budget: AtomicU64::new(budget),
+            slab_wait: metrics::counter!(metric::PAGE_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL),
+            #[cfg(test)]
+            resizes: AtomicU64::new(0),
+        }
+    }
+
+    /// The budget as last given (`budget`).
+    fn budget(&self) -> u64 {
+        self.budget.load(Ordering::Relaxed)
+    }
+
+    /// The bytes of the budget held in reserve for the slabs
+    /// (`slab_policy::reserve`).
+    fn reserve(&self) -> u64 {
+        slab_policy::reserve(self.budget(), slab_max_bytes())
+    }
+
+    /// The slabs a page cached now is stored into: none under the slab
+    /// floor (`slab_policy::uses_slabs`).
+    fn taking(&self) -> Option<&Slabs<PageKey>> {
+        slab_policy::uses_slabs(self.budget(), slab_max_bytes()).then_some(&self.slabs)
+    }
+}
+
+impl fmt::Debug for PageSlabs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PageSlabs")
+            .field("budget", &self.budget())
+            .field("chunk_bytes", &self.slabs.chunk_bytes())
+            .field("uncharged_bytes", &self.slabs.uncharged_bytes())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The pages span reads of one cache are fetching (`PageCache::get_span`),
@@ -405,10 +533,20 @@ type SpanOutcome = std::result::Result<Bytes, FetchFailed>;
 type InFlight = HashMap<PageKey, watch::Receiver<Option<SpanOutcome>>>;
 
 impl PageCache {
-    /// Opens a cache holding at most `capacity_bytes` of pages in memory,
-    /// each weighed as its bytes plus a fixed per-entry overhead, split
-    /// evenly over `memory_shards()`; `open_with` checks the budget against
-    /// `min_memory_bytes` of that count first (`check_capacity`), and a
+    /// Opens a cache holding at most `capacity_bytes` of pages in memory:
+    /// the slabs' reserve is held back from it (`slab_policy::reserve`),
+    /// for their free slots and the chunks being emptied, and the entries
+    /// take the rest, each page weighed as memory charges it (`charged`),
+    /// split evenly over `memory_shards()`. Only chunks being emptied whose
+    /// pages readers, or the disk level's write queue, still hold take
+    /// more: each counts whole among the slabs' bytes until the last of
+    /// them drops its page, and together they can pass the reserve, and
+    /// the cache its budget, by as much as they hold. A budget under the
+    /// slab floor of 8 MiB (`slab_policy::floor_bytes`) keeps every page in
+    /// an allocation of its own and holds back no reserve. Its hit, fetch,
+    /// and slab wait counters are registered at zero in the recorder
+    /// current now. `open_with` checks the budget against
+    /// `min_memory_bytes` of the shards first (`check_capacity`), and a
     /// smaller budget given here directly is taken as it is. `disk` is
     /// the local level of RFD 017: a page evicted from memory is written
     /// there, served back with a local read and no GET, and recovered when
@@ -419,11 +557,12 @@ impl PageCache {
     /// `CacheError::DescriptorLimit`, any other failure
     /// `CacheError::Backend`.
     pub async fn new(capacity_bytes: u64, disk: Option<DiskLevel>) -> Result<Self> {
-        let capacity_bytes = approx::length(capacity_bytes);
+        let slabs = PageSlabs::new(capacity_bytes);
+        let entries = approx::length(entries_bytes(capacity_bytes));
         let level = match disk {
-            None => memory_level(capacity_bytes),
+            None => memory_level(entries),
             Some(disk) => Level::Hybrid {
-                cache: open_hybrid(capacity_bytes, &disk)
+                cache: open_hybrid(entries, &disk)
                     .await
                     .map_err(|error| open_error(error, &disk))?,
                 stats: Arc::clone(disk.stats()),
@@ -431,6 +570,7 @@ impl PageCache {
         };
         Ok(Self {
             level: Arc::new(level),
+            slabs: Arc::new(slabs),
             hits: Arc::new(Tally::new(metrics::counter!(metric::PAGE_CACHE_HITS_TOTAL))),
             fetches: Arc::new(Fetches::new()),
             spans: Arc::new(SpanFlights::new()),
@@ -469,7 +609,9 @@ impl PageCache {
     /// concurrent lookups would confuse. A page in memory is served on the
     /// caller's task with nothing taken of `issue`; any other waits here
     /// for `issue`'s permit (`Issue`) before the cache is asked for it, so
-    /// a caller dropped while it waits leaves nothing queued in the cache.
+    /// a caller dropped while it waits leaves nothing queued in the cache,
+    /// and is served the page once memory holds it where it belongs
+    /// (`settle`).
     pub(crate) async fn get_or_fetch<F, Fut>(
         &self,
         key: (Arc<str>, u64),
@@ -500,18 +642,19 @@ impl PageCache {
                 cache
                     .get_or_fetch(&key, || run.fetch(fetch()))
                     .await
-                    .map(|entry| (entry.source(), entry.value().0.clone())),
+                    .map(|entry| (entry.source(), entry.value().clone())),
                 None,
             ),
             Level::Hybrid { cache, stats } => (
                 cache
                     .get_or_fetch(&key, || run.fetch(fetch()))
                     .await
-                    .map(|entry| (entry.source(), entry.value().0.clone())),
+                    .map(|entry| (entry.source(), entry.value().clone())),
                 Some(stats.as_ref()),
             ),
         };
-        let (source, page) = served.map_err(cache_error)?;
+        let (source, value) = served.map_err(cache_error)?;
+        let page = self.settle(&key, source, value);
         self.record(source, stats, &page);
         Ok((page, origin_of(source)))
     }
@@ -626,10 +769,10 @@ impl PageCache {
     /// One run of `get_span`'s pages, at `run` of `pages` of `file`: waits
     /// for `issue`'s permit holding no claim, claims what of the run is
     /// still neither in memory nor in flight (`claim_run`), and fetches it
-    /// with `fetch` under the permit, inserting each page and handing the
-    /// outcome to every read waiting on one. The positions and bytes of the
-    /// pages it fetched, none when other reads took the whole run while it
-    /// waited.
+    /// with `fetch` under the permit, caching each page (`cache_page`) and
+    /// handing the bytes memory holds for it, or the failure, to every read
+    /// waiting on one. The positions and bytes of the pages it fetched, none
+    /// when other reads took the whole run while it waited.
     async fn fetch_run<F, Fut>(
         &self,
         file: &Arc<str>,
@@ -651,15 +794,19 @@ impl PageCache {
         let fetched = fetch(span.clone());
         let run_of = self.run_for(PageKey(Arc::clone(file), span.start), permit, issue);
         let outcome = match run_of.run(fetched, std::convert::identity).await {
-            Ok(bytes) => split_span(file, &pages[run.clone()], &bytes),
+            Ok(bytes) => split_span(file, &pages[run.clone()], &bytes).map(|split| {
+                pages[run.clone()]
+                    .iter()
+                    .zip(split)
+                    .map(|(page, bytes)| {
+                        self.cache_page(&PageKey(Arc::clone(file), page.start), bytes)
+                    })
+                    .collect()
+            }),
             Err(failed) => Err(failed),
         };
-        if let Ok(split) = &outcome {
-            for (page, bytes) in pages[run.clone()].iter().zip(split) {
-                self.insert(PageKey(Arc::clone(file), page.start), bytes.clone());
-            }
-        }
         claim.publish(&outcome);
+        self.fit();
         outcome
             .map(|split| run.zip(split).collect())
             .map_err(fetch_failed)
@@ -755,12 +902,12 @@ impl PageCache {
     /// Serves from the disk level every page of `pages` of `file` that
     /// `wanted` marks and the level holds, unmarking it: the pages' reads
     /// run together, each through foyer's hybrid read, so it lands in
-    /// memory as a lookup's disk hit does, and concurrent reads of one page
-    /// share one local read. Each page is counted as `record` counts a
-    /// lookup served from the level, a hit and a local read of its length;
-    /// a page that reached memory before its read is a hit alone. A page
-    /// the level lacks, or fails to read, stays marked for the fetch, as
-    /// `get_or_fetch` moves on to the fetch (RFD 017: the directory is
+    /// memory as a lookup's disk hit does (`settle`), and concurrent reads
+    /// of one page share one local read. Each page is counted as `record`
+    /// counts a lookup served from the level, a hit and a local read of its
+    /// length; a page that reached memory before its read is a hit alone. A
+    /// page the level lacks, or fails to read, stays marked for the fetch,
+    /// as `get_or_fetch` moves on to the fetch (RFD 017: the directory is
     /// disposable). A memory-only level has nothing to read.
     /// foyer's read of a page a `get_or_fetch` lookup is fetching waits on
     /// that lookup's flight, and a lookup of a page this read is asking the
@@ -783,21 +930,25 @@ impl PageCache {
         let mut joined_fetch = false;
         let reads = (0..pages.len()).filter(|at| wanted[*at]).map(|at| {
             let key = PageKey(Arc::clone(file), pages[at].start);
-            async move { (at, cache.get(&key).await) }
+            async move {
+                let read = cache.get(&key).await;
+                (at, key, read)
+            }
         });
-        for (at, read) in futures::future::join_all(reads).await {
+        for (at, key, read) in futures::future::join_all(reads).await {
             // intentional: a page the level fails to read is fetched
             // instead, since the directory is disposable (RFD 017).
             let Ok(Some(entry)) = read else {
                 continue;
             };
-            let page = entry.value().0.clone();
-            match entry.source() {
+            let source = entry.source();
+            let page = self.settle(&key, source, entry.value().clone());
+            match source {
                 Source::Outer => {
                     self.spans.joined.fetch_add(1, Ordering::Relaxed);
                     joined_fetch = true;
                 }
-                source @ (Source::Memory | Source::Disk) => {
+                Source::Memory | Source::Disk => {
                     self.record(source, Some(stats), &page);
                 }
             }
@@ -884,20 +1035,28 @@ impl PageCache {
     }
 
     /// Sets `page_cache_bytes` to the bytes the memory budget holds now
-    /// (`usage`); a scrape calls this, so the gauge reads evictions as well
-    /// as inserts.
+    /// (`usage`), `page_cache_waiting_bytes` to the bytes of the slabs'
+    /// chunks being emptied, and `page_cache_slab_wait_microseconds_total`
+    /// to the microseconds the slabs waited on their locks; a scrape calls
+    /// this, so the gauges read evictions as well as inserts.
     pub fn publish_usage(&self) {
+        let slabs = &self.slabs.slabs;
+        self.slabs
+            .slab_wait
+            .absolute(time::micros(Duration::from_nanos(slabs.lock_wait_nanos())));
         metrics::gauge!(metric::PAGE_CACHE_BYTES).set(approx::gauge(self.usage()));
+        metrics::gauge!(metric::PAGE_CACHE_WAITING_BYTES).set(approx::gauge(slabs.waiting_bytes()));
     }
 
-    /// Bytes charged against the memory budget: each page in memory at its
-    /// length plus the per-entry overhead. The disk level is not counted.
+    /// Bytes charged against the memory budget: each page in memory as
+    /// `charged` charges it, and the slabs' bytes no page is charged for
+    /// (`Slabs::uncharged_bytes`). The disk level is not counted.
     #[must_use]
     pub fn usage(&self) -> u64 {
         approx::count(match self.level.as_ref() {
             Level::Memory(cache) => cache.usage(),
             Level::Hybrid { cache, .. } => cache.memory().usage(),
-        })
+        }) + self.slabs.slabs.uncharged_bytes()
     }
 
     /// Pages held in memory now. The disk level is not counted.
@@ -909,21 +1068,35 @@ impl PageCache {
         })
     }
 
-    /// Sets the memory level's budget to `bytes`, split evenly over its
-    /// shards as `new` splits it, evicting in each shard until what it
-    /// holds fits: a memory-only cache drops what it evicts, and a cache
-    /// with a disk level writes it there. The disk level is unchanged. The
-    /// call blocks until every shard has evicted. `Opened::check_split`
+    /// Sets the memory level's budget to `bytes` and its entries' part to
+    /// what the slabs' reserve leaves of it (`entries_bytes`), split evenly
+    /// over its shards as `new` splits it, evicting in each shard until what
+    /// it holds fits, then empties chunks as the new reserve calls for
+    /// (`fit`): a memory-only cache drops what it evicts, and a cache with
+    /// a disk level writes it there. A budget it already has changes
+    /// nothing, since foyer starts a thread per shard to resize. The disk
+    /// level is unchanged. The call blocks until every shard has evicted.
+    /// A page already in a slot stays there until it leaves memory or its
+    /// chunk is emptied: a budget under the slab floor holds no reserve, so
+    /// every chunk with a free slot is emptied then. `Opened::check_split`
     /// checks the budget `Opened::fit_caches` gives it against
     /// `min_memory_bytes` first; a smaller one given here directly is taken
     /// as it is. A failure of the level is `CacheError::Backend`.
     pub(crate) fn resize_memory(&self, bytes: u64) -> Result<()> {
-        let bytes = approx::length(bytes);
-        match self.level.as_ref() {
-            Level::Memory(cache) => cache.resize(bytes),
-            Level::Hybrid { cache, .. } => cache.memory().resize(bytes),
+        if bytes == self.slabs.budget() {
+            return Ok(());
         }
-        .map_err(backend)
+        let entries = approx::length(entries_bytes(bytes));
+        match self.level.as_ref() {
+            Level::Memory(cache) => cache.resize(entries),
+            Level::Hybrid { cache, .. } => cache.memory().resize(entries),
+        }
+        .map_err(backend)?;
+        #[cfg(test)]
+        self.slabs.resizes.fetch_add(1, Ordering::Relaxed);
+        self.slabs.budget.store(bytes, Ordering::Relaxed);
+        self.fit();
+        Ok(())
     }
 
     /// Evicts every page memory holds, as eviction does: a memory-only
@@ -1001,26 +1174,133 @@ impl PageCache {
     }
 
     /// The page at `key` when memory holds it, counted by foyer as a hit
-    /// of its eviction policy as `get_or_fetch` would count it.
+    /// of its eviction policy as `get_or_fetch` would count it. A page in a
+    /// slot is handed out in place.
     fn in_memory(&self, key: &PageKey) -> Option<Bytes> {
         match self.level.as_ref() {
-            Level::Memory(cache) => cache.get(key).map(|entry| entry.value().0.clone()),
+            Level::Memory(cache) => cache.get(key).map(|entry| entry.value().bytes.clone()),
+            Level::Hybrid { cache, .. } => cache
+                .memory()
+                .get(key)
+                .map(|entry| entry.value().bytes.clone()),
+        }
+    }
+
+    /// `page` cached at `key` as a fetch's page is, copied into a slot of
+    /// the slabs while the budget keeps pages there and its length is in
+    /// their range, else into an allocation of its own (`PageValue::copied`,
+    /// `admit`), and the bytes memory holds for it.
+    fn cache_page(&self, key: &PageKey, page: &[u8]) -> Bytes {
+        let value = PageValue::copied(self.slabs.taking(), key, page);
+        let bytes = value.bytes.clone();
+        self.admit(key, value);
+        bytes
+    }
+
+    /// Holds `value` at `key` in memory. An emptying can mark the chunk of
+    /// the page's slot between the store that filled it and the insert, and
+    /// then find no entry by the slot's record, so the insert comes first
+    /// and the ask after (`Slabs::is_emptying`): an emptying that marked the
+    /// chunk before the ask is seen by it, and the page leaves memory
+    /// (`evict_slot`), and one that marks it after finds the entry by its
+    /// record.
+    fn admit(&self, key: &PageKey, value: PageValue) {
+        let slot = match value.home {
+            Home::Slot => Some(value.bytes.clone()),
+            Home::Own => None,
+        };
+        match self.level.as_ref() {
+            Level::Memory(cache) => {
+                cache.insert(key.clone(), value);
+            }
             Level::Hybrid { cache, .. } => {
-                cache.memory().get(key).map(|entry| entry.value().0.clone())
+                cache.insert(key.clone(), value);
+            }
+        }
+        if let Some(bytes) = slot
+            && self.slabs.slabs.is_emptying(&bytes)
+        {
+            self.evict_slot(key, bytes.as_ptr().addr());
+        }
+    }
+
+    /// The bytes a caller is served for the page at `key` that foyer
+    /// returned from `source` as `value`, once memory holds the page where
+    /// it belongs, and the cache fitted within its budget (`fit`). foyer
+    /// places each page it returns in memory itself, a fetch's, a decoded
+    /// one, or one its disk level's write queue hands back. A page decoded
+    /// from the disk level is in an allocation of its own, charged so; while
+    /// the slabs take its length it moves into a slot (`cache_page`),
+    /// replacing foyer's entry, so memory charges it its slot and a hit
+    /// reads it in place. A page whose slot lies in a chunk being emptied,
+    /// a fetch's that the emptying marked after the store and before foyer
+    /// inserted it, or one the write queue handed back while its chunk
+    /// waits, moves into another slot the same way, so no entry holds a
+    /// chunk being emptied.
+    fn settle(&self, key: &PageKey, source: Source, value: PageValue) -> Bytes {
+        let moves = match value.home {
+            Home::Slot => self.slabs.slabs.is_emptying(&value.bytes),
+            Home::Own => {
+                let decoded = match source {
+                    Source::Disk => true,
+                    Source::Memory | Source::Outer => false,
+                };
+                decoded
+                    && self.slabs.taking().is_some()
+                    && in_slabs(value.bytes.len(), slab_max_bytes())
+            }
+        };
+        let page = if moves {
+            self.cache_page(key, &value.bytes)
+        } else {
+            value.bytes
+        };
+        self.fit();
+        page
+    }
+
+    /// Takes the page at `key` out of memory as foyer evicts one, if memory
+    /// still holds it in the slot at `at` (`is_slot`): with a disk level,
+    /// its entry goes on the level's write queue as foyer's eviction sends
+    /// it (`Store::enqueue`) before it leaves memory, so a read in between
+    /// finds it in one level or the other and fetches nothing. foyer's only
+    /// removal that reaches the disk level, `flush_if`, waits on the level's
+    /// writes and visits every entry of every shard. A freed chunk's address
+    /// can be reused, so once the slot's chunk is freed this can take out a
+    /// newer page at the same address, or one cached between the check and
+    /// the removal: a read from the disk level or a fetch, never a wrong
+    /// page.
+    fn evict_slot(&self, key: &PageKey, at: usize) {
+        match self.level.as_ref() {
+            Level::Memory(cache) => {
+                if cache
+                    .get(key)
+                    .is_some_and(|entry| is_slot(&entry.value().bytes, at))
+                {
+                    cache.remove(key);
+                }
+            }
+            Level::Hybrid { cache, .. } => {
+                let memory = cache.memory();
+                if let Some(entry) = memory.get(key)
+                    && is_slot(&entry.value().bytes, at)
+                {
+                    cache.storage().enqueue(entry.piece(), false);
+                    memory.remove(key);
+                }
             }
         }
     }
 
-    /// Holds `page` at `key` in memory, as a fetch's page is held.
-    fn insert(&self, key: PageKey, page: Bytes) {
-        match self.level.as_ref() {
-            Level::Memory(cache) => {
-                cache.insert(key, PageValue(page));
-            }
-            Level::Hybrid { cache, .. } => {
-                cache.insert(key, PageValue(page));
-            }
-        }
+    /// Brings the slabs' uncharged bytes back within the reserve
+    /// (`slab_policy::fit`), each page holding a slot of a chunk emptied
+    /// leaving memory as foyer evicts one (`evict_slot`). A slot a store
+    /// has filled and foyer not yet cached is moved by the call that
+    /// stored it (`admit`, `settle`).
+    fn fit(&self) {
+        slab_policy::fit(&self.slabs.slabs, self.slabs.reserve(), |key, at| {
+            self.evict_slot(&key, at);
+        });
     }
 
     /// One page served without a fetch.
@@ -1028,8 +1308,9 @@ impl PageCache {
         self.hits.increment();
     }
 
-    /// What a fetch for `page` runs with through this handle: its permit
-    /// `permit`, taken of `issue`, and `issue`'s counter.
+    /// What a fetch for `page` runs with through this handle: the slabs a
+    /// page cached now is stored into, its permit `permit`, taken of
+    /// `issue`, and `issue`'s counter.
     fn run_for(
         &self,
         page: PageKey,
@@ -1038,6 +1319,7 @@ impl PageCache {
     ) -> Run {
         Run {
             page,
+            slabs: self.slabs.taking().cloned(),
             fetches: Arc::clone(&self.fetches),
             deadline: self.fetch_deadline,
             permit,
@@ -1108,21 +1390,21 @@ impl Drop for Claim<'_> {
 }
 
 /// `bytes`, the answer of a span fetch of `pages` of `file`, split into
-/// one copy per page, each in an allocation of its own so an entry keeps
-/// only its page alive; bytes shorter than the span are a parquet
-/// end-of-file failure of the fetch.
-fn split_span(
+/// one slice per page, which caching copies out (`PageCache::cache_page`)
+/// so an entry keeps only its page alive; bytes shorter than the span are
+/// a parquet end-of-file failure of the fetch.
+fn split_span<'a>(
     file: &Arc<str>,
     pages: &[Range<u64>],
-    bytes: &Bytes,
-) -> std::result::Result<Vec<Bytes>, FetchFailed> {
+    bytes: &'a Bytes,
+) -> std::result::Result<Vec<&'a [u8]>, FetchFailed> {
     let base = pages[0].start;
     pages
         .iter()
         .map(|page| {
             let start = approx::length(page.start - base);
             let end = approx::length(page.end - base);
-            bytes.get(start..end).map(Bytes::copy_from_slice).ok_or_else(|| {
+            bytes.get(start..end).ok_or_else(|| {
                 FetchFailed::Failed(Arc::new(Error::Parquet(
                     parquet::errors::ParquetError::EOF(format!(
                         "a span fetch of {file} from offset {base} returned {} bytes, short of page {}..{}",
@@ -1241,9 +1523,11 @@ fn descriptors_exhausted(error: &foyer::Error) -> Option<io::Error> {
     None
 }
 
-/// What an entry costs the memory budget.
+/// What an entry costs the memory budget, as its home charges it
+/// (`charged`). foyer weighs an entry once, as it enters memory, and keeps
+/// the weight with it.
 fn weigh(_: &PageKey, value: &PageValue) -> usize {
-    value.0.len() + ENTRY_OVERHEAD_BYTES
+    approx::length(charged(value.bytes.len(), value.home))
 }
 
 /// What a GET of a lookup or a Scan answers to beside the fetch deadline
@@ -1303,10 +1587,12 @@ impl Issue<'_> {
 }
 
 /// What one caller's fetch runs with, should foyer run it: the page it is
-/// for, the counter it counts in, the deadline of the handle it came
-/// through, the permit its issue took, and the counter its GET counts in.
+/// for, the slabs its page is stored into, if any, the counter it counts
+/// in, the deadline of the handle it came through, the permit its issue
+/// took, and the counter its GET counts in.
 struct Run {
     page: PageKey,
+    slabs: Option<Slabs<PageKey>>,
     fetches: Arc<Fetches>,
     deadline: Option<Duration>,
     permit: Option<OwnedSemaphorePermit>,
@@ -1325,17 +1611,21 @@ impl Run {
     /// three times per page fetched, and an `async fn` around `run` would
     /// hold a further copy of `fut` in its own state.
     fn fetch<Fut>(
-        self,
+        mut self,
         fut: Fut,
     ) -> impl Future<Output = std::result::Result<PageValue, FetchFailed>>
     where
         Fut: Future<Output = Result<Bytes>>,
     {
-        // Copied into an allocation of its own: the store can hand back a
-        // slice of a larger buffer, such as the HTTP connection's read
-        // buffer, which the entry would keep alive while `weigh` charges
-        // only the slice.
-        self.run(fut, |page| PageValue(Bytes::copy_from_slice(&page)))
+        // Copied out, into a slot or an allocation of its own
+        // (`PageValue::copied`): the store can hand back a slice of a
+        // larger buffer, such as the HTTP connection's read buffer, which
+        // the entry would keep alive while `weigh` charges only the slice.
+        let slabs = self.slabs.take();
+        let key = self.page.clone();
+        self.run(fut, move |page| {
+            PageValue::copied(slabs.as_ref(), &key, &page)
+        })
     }
 
     /// `fetch`'s run, the bytes as `fut` returned them passed through
@@ -1351,6 +1641,7 @@ impl Run {
     {
         let Self {
             page,
+            slabs: _,
             fetches,
             deadline,
             permit: _permit,
@@ -1408,13 +1699,16 @@ mod tests {
     use futures::future::{join, join_all};
     use tokio::sync::Notify;
 
+    use icetray_slab::{jemalloc_class, slab_class};
+
     use super::*;
     use crate::approx::count;
-    use crate::approx::units::MIB;
+    use crate::approx::units::{KIB, MIB};
     use crate::config::LocalConfig;
     use crate::generation::testing::TABLE;
     use crate::local::LocalDir;
     use crate::metric::testing::{Series, recorded, recorded_on, recorded_with};
+    use crate::slab_policy::SHARED_HEADER_BYTES;
 
     /// A memory budget with room for every page a test inserts.
     const ROOMY_BYTES: u64 = MIB;
@@ -1487,6 +1781,7 @@ mod tests {
     fn deadline_run() -> Run {
         Run {
             page: PageKey(Arc::from(FILE_ID), FIRST_OFFSET),
+            slabs: None,
             fetches: Arc::new(Fetches::new()),
             deadline: Some(FETCH_DEADLINE),
             permit: None,
@@ -1709,12 +2004,14 @@ mod tests {
         let block = vec![0; approx::length(PAGE_CACHE_DISK_BLOCK_BYTES)];
         let cases: [&[u8]; 3] = [PAGE, b"", &block];
         for page in cases {
-            let value = PageValue(Bytes::copy_from_slice(page));
+            let value = PageValue::copied(None, &PageKey(Arc::from(FILE_ID), 0), page);
             let mut encoded = Vec::new();
             value.encode(&mut encoded).unwrap();
             assert_eq!(encoded, page);
             assert_eq!(encoded.len(), value.estimated_size());
-            assert_eq!(PageValue::decode(&mut encoded.as_slice()).unwrap().0, page);
+            let decoded = PageValue::decode(&mut encoded.as_slice()).unwrap();
+            assert_eq!(decoded.bytes, page);
+            assert_eq!(decoded.home, Home::Own);
         }
     }
 
@@ -1754,14 +2051,13 @@ mod tests {
             for name in [
                 metric::PAGE_CACHE_HITS_TOTAL,
                 metric::PAGE_CACHE_FETCHES_TOTAL,
+                metric::PAGE_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL,
             ] {
                 assert_eq!(registered.counter(name, &[]), 0, "{name}");
             }
-            assert_eq!(
-                registered.named(metric::PAGE_CACHE_BYTES),
-                0,
-                "set by a scrape"
-            );
+            for name in [metric::PAGE_CACHE_BYTES, metric::PAGE_CACHE_WAITING_BYTES] {
+                assert_eq!(registered.named(name), 0, "{name} is set by a scrape");
+            }
             let runs = Arc::new(AtomicU64::new(0));
             cache
                 .get_or_fetch(key(FIRST_OFFSET), Issue::default(), || {
@@ -1774,9 +2070,16 @@ mod tests {
                 1
             );
             cache.publish_usage();
-            let bytes = Series::of(&snapshotter).gauge(metric::PAGE_CACHE_BYTES, &[]);
+            let published = Series::of(&snapshotter);
+            let bytes = published.gauge(metric::PAGE_CACHE_BYTES, &[]);
             assert_eq!(bytes.to_bits(), approx::gauge(cache.usage()).to_bits());
             assert!(cache.usage() > 0, "the fetched page is held");
+            let waiting = published.gauge(metric::PAGE_CACHE_WAITING_BYTES, &[]);
+            assert_eq!(
+                waiting.to_bits(),
+                0.0_f64.to_bits(),
+                "no chunk is being emptied"
+            );
         });
     }
 
@@ -2236,7 +2539,9 @@ mod tests {
         for name in [
             metric::PAGE_CACHE_HITS_TOTAL,
             metric::PAGE_CACHE_FETCHES_TOTAL,
+            metric::PAGE_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL,
             metric::PAGE_CACHE_BYTES,
+            metric::PAGE_CACHE_WAITING_BYTES,
         ] {
             assert_eq!(series.named(name), 1, "one {name} series");
         }
@@ -2403,7 +2708,7 @@ mod tests {
             eviction().small_queue_capacity_ratio > approx::ratio(1, count(SHARD_PAGES)),
             "the small queue holds more than one page"
         );
-        let weight = weigh(&first, &PageValue(Bytes::from_static(PAGE)));
+        let weight = weigh(&first, &PageValue::copied(None, &first, PAGE));
         let cache = PageCache::new(count(memory_shards() * SHARD_PAGES * weight), None)
             .await
             .unwrap();
@@ -2648,8 +2953,347 @@ mod tests {
         assert_eq!(cache.fetches(), 2);
     }
 
+    /// A memory budget at which the memory level keeps pages in slabs:
+    /// twice its slab floor of 8 MiB.
+    const SLAB_BYTES: u64 = 16 * MIB;
+    /// A page length a slab class holds, whose chunk holds 15 slots of
+    /// 4,352 bytes.
+    const SLAB_PAGE_LEN: usize = 4242;
+
+    /// A page of `len` bytes of `seed`.
+    fn page_of(len: usize, seed: u8) -> Bytes {
+        Bytes::from(vec![seed; len])
+    }
+
+    /// Fetches `page` into `cache` at `offset` of `FILE_ID`, counting the
+    /// run in `runs`, and returns what the cache served.
+    async fn fetch_into(
+        cache: &PageCache,
+        offset: u64,
+        page: &Bytes,
+        runs: &Arc<AtomicU64>,
+    ) -> Bytes {
+        let (page, runs) = (page.clone(), Arc::clone(runs));
+        let (served, _) = cache
+            .get_or_fetch(key(offset), Issue::default(), move || async move {
+                runs.fetch_add(1, Ordering::Relaxed);
+                Ok(page)
+            })
+            .await
+            .unwrap();
+        served
+    }
+
+    /// What the memory level's entries are charged, without the slabs'
+    /// bytes no page is charged for.
+    fn entries_usage(cache: &PageCache) -> u64 {
+        count(match cache.level.as_ref() {
+            Level::Memory(memory) => memory.usage(),
+            Level::Hybrid { cache, .. } => cache.memory().usage(),
+        })
+    }
+
+    /// The capacity the memory level was built with.
+    fn built_capacity(cache: &PageCache) -> u64 {
+        count(match cache.level.as_ref() {
+            Level::Memory(memory) => memory.capacity(),
+            Level::Hybrid { cache, .. } => cache.memory().capacity(),
+        })
+    }
+
+    /// A page just over 64 KiB, as a byte-bounded page of 4 KiB values
+    /// closes, is charged its slot's class and the handle that reads the
+    /// slot, beside the entry overhead: more than its length, which it was
+    /// charged before slabs, and less than jemalloc's class.
     #[tokio::test]
-    async fn test_usage_grows_by_page_bytes_plus_overhead() {
+    async fn test_a_page_just_over_64_kib_is_charged_its_slot() {
+        let len = 65_637;
+        let charge =
+            count(slab_class(len) + icetray_slab::SLOT_HANDLE_BYTES + ENTRY_OVERHEAD_BYTES);
+        assert_eq!(charged(len, Home::Slot), charge);
+        assert!(
+            charge > count(len + ENTRY_OVERHEAD_BYTES),
+            "charged what it costs"
+        );
+        assert!(
+            charge < charged(len, Home::Own),
+            "the slot saves on jemalloc's class"
+        );
+        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let runs = Arc::new(AtomicU64::new(0));
+        let served = fetch_into(&cache, FIRST_OFFSET, &page_of(len, 7), &runs).await;
+        assert_eq!(served, page_of(len, 7));
+        let slabs = &cache.slabs.slabs;
+        assert_eq!(slabs.held_slots(), 1);
+        assert_eq!(entries_usage(&cache), charge);
+        assert_eq!(cache.usage(), charge + slabs.uncharged_bytes());
+    }
+
+    /// A page under a kibibyte and one over the longest the slabs hold
+    /// stay in allocations of their own, charged jemalloc's class, the
+    /// shared header a read allocates, and the entry overhead, and take no
+    /// chunk.
+    #[tokio::test]
+    async fn test_a_page_outside_the_classes_is_charged_its_jemalloc_class() {
+        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let runs = Arc::new(AtomicU64::new(0));
+        let lens = [PAGE.len(), 1023, slab_max_bytes() + 1];
+        for (offset, len) in (0..).zip(lens) {
+            fetch_into(&cache, offset, &page_of(len, 1), &runs).await;
+        }
+        assert_eq!(cache.slabs.slabs.chunk_bytes(), 0);
+        let own: u64 = lens
+            .iter()
+            .map(|&len| count(jemalloc_class(len) + ENTRY_OVERHEAD_BYTES) + SHARED_HEADER_BYTES)
+            .sum();
+        assert_eq!(cache.usage(), own);
+    }
+
+    /// Emptying a chunk takes its pages out of memory as foyer evicts
+    /// them, so with a disk level the page is read back from it with no
+    /// fetch, and memory holds it in a slot again.
+    #[tokio::test]
+    async fn test_an_emptied_page_is_served_from_the_disk_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let (level, stats) = disk_level(dir.path());
+        let cache = PageCache::new(SLAB_BYTES, Some(level)).await.unwrap();
+        let runs = Arc::new(AtomicU64::new(0));
+        let page = page_of(SLAB_PAGE_LEN, 3);
+        fetch_into(&cache, FIRST_OFFSET, &page, &runs).await;
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let slabs = &cache.slabs.slabs;
+        assert_eq!(slabs.held_slots(), 1);
+        slab_policy::fit(slabs, 0, |key, at| cache.evict_slot(&key, at));
+        assert_eq!(
+            cache.held_page(&id, FIRST_OFFSET),
+            None,
+            "the page left memory"
+        );
+        cache.disk_writes_done().await;
+
+        let (served, origin) = cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
+        assert_eq!(served, page);
+        assert_eq!(origin, PageOrigin::Cached);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.fetches(), 1);
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(stats.local_reads(), 1);
+        let held = cache
+            .held_page(&id, FIRST_OFFSET)
+            .expect("memory holds it again");
+        assert_eq!(
+            held.as_ptr(),
+            served.as_ptr(),
+            "in the slot it was served from"
+        );
+        assert!(slabs.held_slots() >= 1);
+        assert_eq!(
+            entries_usage(&cache),
+            charged(SLAB_PAGE_LEN, Home::Slot),
+            "charged its slot"
+        );
+        cache.close().await.unwrap();
+    }
+
+    /// Each hit on a page in a slot hands out the slot: the bytes read in
+    /// place, at one address, with no copy, whether a lookup or a span
+    /// read asks.
+    #[tokio::test]
+    async fn test_a_memory_hit_hands_out_the_slot() {
+        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let runs = Arc::new(AtomicU64::new(0));
+        let page = page_of(SLAB_PAGE_LEN, 9);
+        fetch_into(&cache, FIRST_OFFSET, &page, &runs).await;
+        let (first, _) = cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
+        let (second, _) = cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let span = FIRST_OFFSET..FIRST_OFFSET + count(SLAB_PAGE_LEN);
+        let spanned = cache
+            .held_span(&id, &[span])
+            .expect("memory holds the page");
+        assert_eq!(first, page);
+        assert_eq!(first.as_ptr(), second.as_ptr());
+        assert_eq!(first.as_ptr(), spanned[0].as_ptr());
+        assert_ne!(first.as_ptr(), page.as_ptr());
+        assert_eq!(
+            cache.slabs.slabs.held_slots(),
+            1,
+            "every hit holds one slot"
+        );
+    }
+
+    /// Under the slab floor of 8 MiB pages stay in allocations of their
+    /// own and no reserve is held; a resize across the floor decides where
+    /// pages cached from then on live, and a resize under it empties the
+    /// chunks with free slots, which no reserve holds any more.
+    #[tokio::test]
+    async fn test_a_page_part_under_the_slab_floor_keeps_pages_on_jemalloc() {
+        let floor = slab_policy::floor_bytes(slab_max_bytes());
+        assert_eq!(floor, 8 * MIB);
+        let cache = PageCache::new(floor - 1, None).await.unwrap();
+        assert_eq!(built_capacity(&cache), floor - 1, "no reserve");
+        let runs = Arc::new(AtomicU64::new(0));
+        let page = page_of(SLAB_PAGE_LEN, 5);
+        fetch_into(&cache, FIRST_OFFSET, &page, &runs).await;
+        let slabs = &cache.slabs.slabs;
+        assert_eq!(slabs.chunk_bytes(), 0, "under the floor");
+        let own = charged(SLAB_PAGE_LEN, Home::Own);
+        assert_eq!(cache.usage(), own);
+
+        cache.resize_memory(floor).unwrap();
+        fetch_into(&cache, SECOND_OFFSET, &page, &runs).await;
+        assert_eq!(slabs.held_slots(), 1, "at the floor");
+        assert_eq!(
+            entries_usage(&cache),
+            own + charged(SLAB_PAGE_LEN, Home::Slot)
+        );
+
+        cache.resize_memory(floor - 1).unwrap();
+        let id: Arc<str> = Arc::from(FILE_ID);
+        assert_eq!(slabs.chunk_bytes(), 0, "the chunk is emptied");
+        assert_eq!(cache.held_page(&id, SECOND_OFFSET), None, "with its page");
+        fetch_into(&cache, 2 * SECOND_OFFSET, &page, &runs).await;
+        assert_eq!(slabs.chunk_bytes(), 0, "the new page is its own");
+        assert_eq!(cache.usage(), 2 * own);
+    }
+
+    /// A page whose slot's chunk is marked for emptying between the store
+    /// that fills the slot and the insert that caches it, so the emptying
+    /// finds no entry by the slot's record, does not stay in the chunk:
+    /// one this cache inserts leaves memory (`admit`), and one foyer
+    /// inserted after a fetch moves into a slot of another chunk as the
+    /// caller is served (`settle`). Either way the chunk is freed.
+    #[tokio::test]
+    async fn test_a_page_cached_while_its_chunk_is_emptied_leaves_the_chunk() {
+        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let Level::Memory(memory) = cache.level.as_ref() else {
+            panic!("a cache without a disk level is memory only");
+        };
+        let slabs = &cache.slabs.slabs;
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let page = page_of(SLAB_PAGE_LEN, 6);
+        for (offset, through_foyer) in [(FIRST_OFFSET, false), (SECOND_OFFSET, true)] {
+            let key = PageKey(Arc::clone(&id), offset);
+            let value = PageValue::copied(cache.slabs.taking(), &key, &page);
+            assert_eq!(value.home, Home::Slot);
+            let stored = value.bytes.as_ptr();
+            slab_policy::fit(slabs, 0, |key, at| cache.evict_slot(&key, at));
+            assert!(slabs.waiting_bytes() > 0, "the chunk is being emptied");
+            if through_foyer {
+                memory.insert(key.clone(), value.clone());
+                let served = cache.settle(&key, Source::Outer, value);
+                assert_eq!(served, page);
+                assert_ne!(served.as_ptr(), stored, "moved out of the chunk");
+                let held = cache.held_page(&id, offset).expect("memory holds the page");
+                assert_eq!(held.as_ptr(), served.as_ptr());
+                assert!(!slabs.is_emptying(&held));
+            } else {
+                cache.admit(&key, value);
+                assert_eq!(cache.held_page(&id, offset), None, "the page left memory");
+            }
+            assert_eq!(slabs.waiting_bytes(), 0, "the chunk is freed");
+        }
+    }
+
+    /// Memory filled to its budget with pages of one class, every other
+    /// one read again, then filled again with pages of another, which
+    /// evicts the first class's pages read once before those read again,
+    /// so free slots lie in every chunk of the first class until the cache
+    /// empties chunks: after every fetch the pages and the slabs' uncharged
+    /// bytes together hold the budget (`usage`), and the uncharged bytes
+    /// are back within the reserve, since no reader holds a slot.
+    #[tokio::test]
+    async fn test_the_reserve_bounds_free_slots() {
+        let reserve = SLAB_BYTES / slab_policy::SLAB_RESERVE_DIVISOR;
+        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let runs = Arc::new(AtomicU64::new(0));
+        let (first, second) = (page_of(SLAB_PAGE_LEN, 1), page_of(2048, 2));
+        let fill = 2 * SLAB_BYTES / charged(first.len(), Home::Slot);
+        let refill = 2 * SLAB_BYTES / charged(second.len(), Home::Slot);
+        let mut most_uncharged = 0;
+        for (n, page) in (0..fill)
+            .map(|n| (n, &first))
+            .chain((fill..fill + refill).map(|n| (n, &second)))
+        {
+            fetch_into(&cache, n, page, &runs).await;
+            if n >= fill || n % 2 == 0 {
+                fetch_into(&cache, n, page, &runs).await;
+            }
+            let uncharged = cache.slabs.slabs.uncharged_bytes();
+            most_uncharged = most_uncharged.max(uncharged);
+            assert!(
+                cache.usage() <= SLAB_BYTES,
+                "{} over {SLAB_BYTES} after page {n}",
+                cache.usage()
+            );
+            assert!(
+                uncharged <= reserve,
+                "{uncharged} over {reserve} after page {n}"
+            );
+        }
+        assert!(
+            most_uncharged > reserve / 2,
+            "free slots reached the reserve: {most_uncharged}"
+        );
+    }
+
+    /// The memory level's entries take the budget less the slabs' reserve,
+    /// set when the cache is built and when the budget changes: pages of
+    /// many classes churning through memory, evicting pages and emptying
+    /// chunks, resize nothing, and neither does a resize to the budget the
+    /// cache has; a resize to another one does, and memory then holds no
+    /// more than its part beside the new reserve.
+    #[tokio::test]
+    async fn test_the_memory_level_capacity_changes_only_with_the_budget() {
+        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let reserve = SLAB_BYTES / slab_policy::SLAB_RESERVE_DIVISOR;
+        assert_eq!(built_capacity(&cache), SLAB_BYTES - reserve);
+        let resizes = || cache.slabs.resizes.load(Ordering::Relaxed);
+        let runs = Arc::new(AtomicU64::new(0));
+        let lens = [1500, SLAB_PAGE_LEN, 2048, 40_000, 65_637];
+        let churn = 4 * SLAB_BYTES / (16 * KIB);
+        for n in 0..churn {
+            let len = lens[approx::length(n) % lens.len()];
+            fetch_into(&cache, n, &page_of(len, 2), &runs).await;
+            assert!(
+                cache.usage() <= SLAB_BYTES,
+                "{} over {SLAB_BYTES} after page {n}",
+                cache.usage()
+            );
+        }
+        assert!(
+            cache.slabs.slabs.chunk_bytes() > 0,
+            "the churn went through the slabs"
+        );
+        assert!(entries_usage(&cache) <= SLAB_BYTES - reserve);
+        assert_eq!(resizes(), 0, "the churn resized nothing");
+        cache.resize_memory(SLAB_BYTES).unwrap();
+        assert_eq!(resizes(), 0, "the same budget");
+        let half = SLAB_BYTES / 2;
+        cache.resize_memory(half).unwrap();
+        assert_eq!(resizes(), 1, "another budget");
+        for n in churn..2 * churn {
+            let len = lens[approx::length(n) % lens.len()];
+            fetch_into(&cache, n, &page_of(len, 4), &runs).await;
+        }
+        let half_reserve = half / slab_policy::SLAB_RESERVE_DIVISOR;
+        assert!(entries_usage(&cache) <= half - half_reserve);
+        assert!(cache.usage() <= half, "{} over {half}", cache.usage());
+    }
+
+    /// A page under a kibibyte is charged its allocation's jemalloc size
+    /// class, the shared header a read allocates, and the entry overhead.
+    #[tokio::test]
+    async fn test_usage_grows_by_each_pages_charge() {
         let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         assert_eq!((cache.usage(), cache.pages()), (0, 0));
         let runs = Arc::new(AtomicU64::new(0));
@@ -2659,17 +3303,17 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(cache.usage(), count(PAGE.len() + ENTRY_OVERHEAD_BYTES));
+        let own = |page: &[u8]| {
+            count(jemalloc_class(page.len()) + ENTRY_OVERHEAD_BYTES) + SHARED_HEADER_BYTES
+        };
+        assert_eq!(cache.usage(), own(PAGE));
         cache
             .get_or_fetch(key(SECOND_OFFSET), Issue::default(), || {
                 answering(OTHER_PAGE, &runs)
             })
             .await
             .unwrap();
-        assert_eq!(
-            cache.usage(),
-            count(PAGE.len() + OTHER_PAGE.len() + 2 * ENTRY_OVERHEAD_BYTES)
-        );
+        assert_eq!(cache.usage(), own(PAGE) + own(OTHER_PAGE));
         assert_eq!(cache.pages(), 2);
     }
 
@@ -3030,7 +3674,7 @@ mod tests {
         let bytes = pages_of(&file, page);
         let (answer, ()) = tokio::join!(reading, async {
             joined(&cache, 1).await;
-            cache.insert(PageKey(Arc::clone(&id), page[0].start), bytes[0].clone());
+            cache.cache_page(&PageKey(Arc::clone(&id), page[0].start), &bytes[0]);
             claim.publish(&Ok(bytes.clone()));
             drop(claim);
         });

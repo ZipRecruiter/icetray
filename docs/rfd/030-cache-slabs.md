@@ -34,10 +34,11 @@ out as a reference to its slot rather than a copy.
   adds 32 classes, so a value or page under 1 KiB stays in an allocation
   of its own, as does one above the largest class; both are charged
   jemalloc's size class. A cache keeps values in slabs only while its
-  budget is at least 16 times its largest chunk, 4 MiB for the row cache,
-  so its reserve holds a chunk of any class; under that, values stay on
-  jemalloc and no reserve is held, so a chunk a larger budget left with a
-  free slot is emptied.
+  budget is at least 16 times its largest chunk, 4 MiB for the row cache
+  and 8 MiB for the page cache, whose largest page in slabs is twice a
+  value page, so its reserve holds a chunk of any class; under that,
+  values stay on jemalloc and no reserve is held, so a chunk a larger
+  budget left with a free slot is emptied.
 - **Chunks.** A slab holds one class's slots in chunks, each allocated
   whole and holding a small fixed number of slots: a few for the largest
   classes, a few dozen for the smallest.
@@ -57,20 +58,26 @@ out as a reference to its slot rather than a copy.
   the free slots are what push them over, the cache evicts the entries of
   the chunk with the fewest held slots in the class whose free slots hold
   the most, and frees the chunk, until they are back within it, so it
-  gives back memory that a shift in lengths left stranded. Each slot
-  records which entry holds it, so the cache can find the entries to
-  evict.
+  gives back memory that a shift in lengths left stranded. The page cache
+  evicts such a page as its memory level evicts any, to the disk level
+  when there is one, so a later read of it costs a local read and no GET.
+  Each slot records which entry holds it, so the cache can find the
+  entries to evict.
 - **Held slots.** A slot stays held as long as anything holds its
   `Bytes`: a response until gRPC has encoded it, which for a Get or
-  MultiGet holds the values it returns, and any reader of a page until it
-  is done with it. A chunk being emptied takes no new values, and the slab
+  MultiGet holds the values it returns, any reader of a page until it is
+  done with it, and the disk level's write queue until it has written an
+  evicted page. A chunk being emptied takes no new values, and the slab
   frees it when its last held slot drops; a gauge reports the bytes in
   chunks waiting. Until then such a chunk counts whole against the
   reserve, and while readers hold slots of enough of them, the cache's
   memory passes the reserve, and the budget, by those chunks, the one way
   it does. An entry an insert caches while its slot's chunk is being
-  marked is dropped by that insert, so no entry holds a chunk being
-  emptied for longer than the insert takes.
+  marked is dropped by that insert, and a page foyer caches after a fetch
+  while its slot's chunk is being marked, or takes back from the disk
+  level's write queue while its chunk waits, is moved to a slot of
+  another chunk, so no entry holds a chunk being emptied for longer than
+  the insert takes.
 - **Locking.** A slab takes its lock to claim and to free a slot, and a
   store copies its bytes into the slot outside the lock, since nothing
   refers to a slot until its store returns. A hit takes no slab lock.
@@ -147,8 +154,9 @@ A class's free slots lie in whichever chunks the cache evicted from, so
 many chunks of a class can be partly filled at once, and a cache whose
 lengths spread over many classes holds a chunk being filled in each. That
 cost is largest where a budget is smallest, the page cache's share among
-them. RFD 028's smallest budget, one value page per shard, does not
-guarantee room for those chunks, so it is revised with the slabs.
+them. RFD 028's smallest budget, one value page per shard, stands: a
+page part under the slab floor keeps its pages on jemalloc and holds no
+reserve, so the smallest budget needs no room for chunks.
 Emptying a chunk evicts entries the cache's eviction policy did not
 choose, hot ones included, and a class whose free slots hover at the
 threshold would empty chunks repeatedly.
@@ -161,6 +169,6 @@ under RFD 029's conditions, including the nightly toolchain its Miri tests
 need.
 
 RFDs 026 (what an entry weighs) and 027 (pages live in slabs) are revised
-with this decision to say what the slabs will change. RFD 028's smallest
-budget and the operating guide's cache bytes series change with the
-slabs, and the guide gains the gauge.
+with this decision to say what the slabs will change. The operating
+guide's cache bytes series change with the slabs, and the guide gains
+each cache's waiting gauge and slab wait counter.

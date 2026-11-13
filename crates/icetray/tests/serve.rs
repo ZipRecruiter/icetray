@@ -1453,7 +1453,9 @@ async fn test_alerting_series_are_exposed_from_the_start() -> TestResult {
     for name in [
         metric::PAGE_CACHE_FETCHES_TOTAL,
         metric::PAGE_CACHE_HITS_TOTAL,
+        metric::PAGE_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL,
         metric::PAGE_CACHE_BYTES,
+        metric::PAGE_CACHE_WAITING_BYTES,
     ] {
         gauge(&scrape, name);
         let labeled = format!("{name}{{");

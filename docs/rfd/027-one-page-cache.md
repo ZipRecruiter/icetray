@@ -1,7 +1,7 @@
 # One page cache
 
-> Updated 2026-11-11: the memory level will hold pages in slabs and
-> charge each page what it costs. See RFD 030 (Cache slabs).
+> Updated 2026-11-12: the memory level holds pages in slabs and charges
+> each page what it costs. See RFD 030 (Cache slabs).
 
 ## Problem
 
@@ -48,12 +48,14 @@ only the runs of pages neither holds.
   lives in the memory level alone, as a key-value table's do today.
 - **Counted.** The page cache's series lose their `cache` label, one page
   cache remaining.
-- **Memory.** The memory level will hold pages in the slabs of RFD 030
-  (Cache slabs) and charge each page what it costs, its slot or, outside
-  the slab classes, jemalloc's size class, so its part of the budget
-  bounds what it holds. Until the slabs land, it charges a page its
-  length and an overhead, less than jemalloc's size class for a page
-  just over a power of two.
+- **Memory.** While its part of the budget is at least 8 MiB, the memory
+  level holds a page of 1 KiB to twice a value page in a slot of the
+  slabs of RFD 030 (Cache slabs), which a hit hands out in place, and a
+  page read back from the disk level moves into one. It charges each page
+  what it costs, its slot or, outside the slab classes and under a
+  smaller part, jemalloc's size class, so its part of the budget bounds
+  what it holds. A page whose chunk the cache empties leaves memory as an
+  evicted page does, for the disk level when there is one.
 
 ## Alternatives Considered
 

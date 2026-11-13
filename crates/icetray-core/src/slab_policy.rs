@@ -89,6 +89,20 @@ pub(crate) fn reserve(budget: u64, max_bytes: usize) -> u64 {
     }
 }
 
+/// A budget from which on the part beside the reserve of slabs holding up
+/// to `max_bytes` holds at least `entries` bytes: `entries` itself, unless
+/// the floor's part is under it, since a budget at the floor holds back a
+/// reserve that one just under it does not; then the budget whose part
+/// beside its sixteenth holds `entries`.
+pub(crate) fn budget_holding(entries: u64, max_bytes: usize) -> u64 {
+    let floor = floor_bytes(max_bytes);
+    if entries <= floor - floor / SLAB_RESERVE_DIVISOR {
+        entries
+    } else {
+        (entries * SLAB_RESERVE_DIVISOR).div_ceil(SLAB_RESERVE_DIVISOR - 1)
+    }
+}
+
 /// Brings the uncharged bytes of `slabs` back within `reserve`: while they
 /// pass it, and the chunks being emptied alone do not, so the free slots
 /// are what pushes them over, empties the sparsest chunk of the class whose
@@ -135,6 +149,26 @@ mod tests {
         assert_eq!(reserve(floor, MAX_BYTES), floor / SLAB_RESERVE_DIVISOR);
         assert!(!uses_slabs(floor - 1, MAX_BYTES));
         assert!(uses_slabs(floor, MAX_BYTES));
+    }
+
+    /// From the budget `budget_holding` names on, every budget's part
+    /// beside its reserve holds the entries asked for, under the floor and
+    /// across it alike, and a part the floor's holds needs no more budget.
+    #[test]
+    fn test_budget_holding_holds_the_entries_from_there_on() {
+        let floor = floor_bytes(MAX_BYTES);
+        let beside = |budget: u64| budget - reserve(budget, MAX_BYTES);
+        for entries in [1, floor / 2, beside(floor), floor - 1, floor, 3 * floor] {
+            let budget = budget_holding(entries, MAX_BYTES);
+            assert!(budget >= entries, "{entries}");
+            for at in [budget, budget + 1, floor - 1, floor, floor + 1, 4 * floor] {
+                if at >= budget {
+                    assert!(beside(at) >= entries, "{entries} at {at}");
+                }
+            }
+        }
+        assert_eq!(budget_holding(beside(floor), MAX_BYTES), beside(floor));
+        assert!(budget_holding(floor - 1, MAX_BYTES) > floor);
     }
 
     #[test]

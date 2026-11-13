@@ -137,15 +137,17 @@ that each hold their share of its part, so a part below one 64 KiB value
 per shard caches only smaller values.
 
 The page cache has one shard per tokio worker thread, rounded up to a
-power of two, and each shard must hold one 64 KiB value page plus its
-64-byte entry: 65,600 bytes. icetray refuses a page cache part of a set
-`cache_bytes` under one shard's minimum when it parses the file, and one
-under the total for the machine's shards (1,049,600 bytes for the 16
-shards of an 11-core machine) when it opens the cache, with exit 1,
-before any table loads. A `cache_bytes` derived from the memory limit is
-checked when the cache opens, and the refusal names the limit and where
-it was read. A file that still sets the removed `page_cache_bytes` or
-`scan_page_cache_bytes` is refused, naming `cache_bytes`, as
+power of two, and each shard must hold one 64 KiB value page as memory
+charges it, with its 64-byte entry and the 48-byte handle a page in a
+slab slot is read through: 65,648 bytes. icetray refuses a page cache
+part of a set `cache_bytes` under one shard's minimum when it parses the
+file, and one under the total for the machine's shards (1,050,368 bytes
+for the 16 shards of an 11-core machine) when it opens the cache, with
+exit 1, before any table loads. A `cache_bytes` derived from the memory
+limit is checked when the cache opens, and the refusal names the limit
+and where it was read. A file that still sets the removed
+`page_cache_bytes` or `scan_page_cache_bytes` is refused, naming
+`cache_bytes`, as
 `server.scan_page_cache_bytes is no longer a setting; use server.cache_bytes`.
 The worker count is the number of cores the process sees, unless
 `TOKIO_WORKER_THREADS` sets it.
