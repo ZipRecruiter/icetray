@@ -4,9 +4,10 @@
 > checks each hit against the generation, so it reads no key page for a
 > hit, and it caches presence-only lookups too.
 
-> Updated 2026-11-11: values of 1 KiB or more will live in slabs of
-> icetray's own size classes, and a hit will hand out a reference to the
-> value's slot. See RFD 030 (Cache slabs).
+> Updated 2026-11-12: values of 1 KiB or more live in slabs of icetray's
+> own size classes, a hit hands out a reference to the value's slot, and
+> the slabs' free slots count against the budget. See RFD 030 (Cache
+> slabs).
 
 ## Problem
 
@@ -55,10 +56,12 @@ and will check each hit against the generation's files and deletes.
   only the index and the pages show that a Scan's range is complete.
 - **What an entry weighs.** icetray charges an entry its key's and
   value's bytes at what their allocations cost, plus its overhead, so
-  the budget bounds the cache's memory (RFD 028 (Cache budget)). Until
-  the slabs of RFD 030 (Cache slabs) land, that is jemalloc's size
-  class; once they do, a value of 1 KiB or more is charged its slab's
-  size class. icetray does not cache a value above a bound.
+  the budget bounds the cache's memory (RFD 028 (Cache budget)). A value
+  of 1 KiB or more lives in a slot of the cache's slabs and is charged
+  its slab's size class (RFD 030 (Cache slabs)); a shorter value, and
+  the key, are charged jemalloc's size class. The slabs' free slots,
+  which no entry is charged for, count against the budget too. icetray
+  does not cache a value above a bound.
 - **The library.** quick_cache, the fastest in a bake-off against foyer
   and segcache over rows of 100 bytes to 8 KiB, and the only one whose
   throughput grew under hot keys.
@@ -100,7 +103,8 @@ key. Allowing two, as equality deletes would, means changing the check
 too.
 
 icetray reports the row cache's hits, cache misses, stale entries, and
-bytes.
+bytes, and its slabs' chunks waiting to be freed and the time their
+locks were waited for.
 The counting tests of RFD 014 (Test layering) check that a hit reads no
 page, and that icetray never serves a deleted or rewritten row, keeps a
 reused file's entries, and never serves a replaced table's entries to

@@ -7,9 +7,15 @@ use std::time::{Duration, SystemTime};
 
 /// A duration as a float of seconds, the unit a Prometheus histogram takes
 /// and the unit its bucket bounds are declared in. The one place a
-/// `Duration` becomes a bare number for a metric.
+/// `Duration` becomes a float for a metric.
 pub(crate) fn seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
+}
+
+/// A count of nanoseconds as whole seconds, for a counter of seconds: a
+/// counter takes an integer, so the fraction of a second is dropped.
+pub(crate) fn whole_seconds_of_nanos(nanos: u64) -> u64 {
+    Duration::from_nanos(nanos).as_secs()
 }
 
 /// An elapsed time as whole microseconds, for a one-shot subcommand's

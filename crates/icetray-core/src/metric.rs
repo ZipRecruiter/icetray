@@ -38,6 +38,10 @@ pub const ROW_CACHE_MISSES_TOTAL: &str = "icetray_row_cache_misses_total";
 /// because the lookup's generation no longer holds the entry's file or has
 /// deleted its row (RFD 026); each is counted as a cache miss too.
 pub const ROW_CACHE_STALE_TOTAL: &str = "icetray_row_cache_stale_total";
+/// Seconds that stores into the row cache's slabs, frees of their slots,
+/// and the emptying of their chunks waited for a slab class's lock (RFD
+/// 030), in whole seconds.
+pub const ROW_CACHE_SLAB_WAIT_SECONDS_TOTAL: &str = "icetray_row_cache_slab_wait_seconds_total";
 /// Lookups answered, by `table` and `result`.
 pub const LOOKUPS_TOTAL: &str = "icetray_lookups_total";
 /// Value-page GETs lookups and Scans issued to object storage, by `table`
@@ -119,9 +123,14 @@ pub const ALLOCATOR_RESIDENT_BYTES: &str = "icetray_allocator_resident_bytes";
 pub const ALLOCATOR_RETAINED_BYTES: &str = "icetray_allocator_retained_bytes";
 /// Bytes the page cache holds in memory.
 pub const PAGE_CACHE_BYTES: &str = "icetray_page_cache_bytes";
-/// Bytes the row cache holds against its budget (RFD 026): each entry's
-/// value at its allocation size plus the per-entry overhead.
+/// Bytes the row cache holds against its budget (RFD 026, RFD 030): each
+/// entry's key and value at their allocation size, a value in a slab at
+/// its slot's, plus the per-entry overhead, and the slabs' bytes no entry
+/// is charged for: free slots, and chunks being emptied.
 pub const ROW_CACHE_BYTES: &str = "icetray_row_cache_bytes";
+/// Bytes of the row cache's slab chunks being emptied, each waiting for a
+/// reader to drop the last value it holds from the chunk (RFD 030).
+pub const ROW_CACHE_WAITING_BYTES: &str = "icetray_row_cache_waiting_bytes";
 /// Bytes by which the cache budget, with the resident indexes of the
 /// tables served, overruns the memory limit (RFD 028): zero when they fit
 /// or when no limit can be read.
@@ -222,7 +231,7 @@ pub enum Kind {
 
 /// Every metric a process can emit, with its kind and the one sentence its
 /// `# HELP` line carries; the unit is in the name or the sentence.
-pub const DESCRIPTIONS: [(&str, Kind, &str); 59] = [
+pub const DESCRIPTIONS: [(&str, Kind, &str); 61] = [
     (
         REQUESTS_TOTAL,
         Kind::Counter,
@@ -277,6 +286,11 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 59] = [
         ROW_CACHE_STALE_TOTAL,
         Kind::Counter,
         "Row-cache entries found whose file or row the lookup's generation no longer serves.",
+    ),
+    (
+        ROW_CACHE_SLAB_WAIT_SECONDS_TOTAL,
+        Kind::Counter,
+        "Whole seconds that stores into the row cache's slabs, frees of their slots, and emptying of their chunks waited for a slab class's lock.",
     ),
     (
         LOOKUPS_TOTAL,
@@ -396,7 +410,12 @@ pub const DESCRIPTIONS: [(&str, Kind, &str); 59] = [
     (
         ROW_CACHE_BYTES,
         Kind::Gauge,
-        "Bytes the row cache holds against its budget.",
+        "Bytes the row cache holds against its budget, its slabs' free slots and chunks being emptied included.",
+    ),
+    (
+        ROW_CACHE_WAITING_BYTES,
+        Kind::Gauge,
+        "Bytes of the row cache's slab chunks being emptied that wait for a reader to drop its last value.",
     ),
     (
         CACHE_BUDGET_SHORTFALL_BYTES,
