@@ -184,6 +184,17 @@ impl<R: Clone + Send + Sync + 'static> Slabs<R> {
         self.pool.is_emptying(class, bytes.as_ptr().addr())
     }
 
+    /// Whether the slot at `at` of class `class`, as `empty_sparsest`
+    /// handed them out, lies in a chunk being emptied: true until that
+    /// chunk is freed, so a cache that keeps the slots an emptying handed
+    /// out knows when to let one go. A chunk freed and another of the class
+    /// allocated at its address and marked makes it true again, for as long
+    /// as that chunk is being emptied. It takes the class's lock as
+    /// `is_emptying` does.
+    pub fn is_emptying_in(&self, class: ClassId, at: usize) -> bool {
+        self.pool.is_emptying(class.index(), at)
+    }
+
     /// Nanoseconds that stores, frees, and emptying spent waiting for a
     /// class's lock, counted only from a `try_lock` that found it held.
     /// Emptying includes `is_emptying`, which takes the lock only while a
@@ -558,6 +569,30 @@ mod tests {
         assert!(!slabs.is_emptying(&later));
         let reused = slabs.store(&pattern(LEN_4352_CLASS, 6), 6).unwrap();
         assert!(!slabs.is_emptying(&reused), "after the chunk is freed");
+    }
+
+    /// `is_emptying_in` answers yes for every slot an emptying handed out
+    /// until its chunk is freed, and no for the slots of another class.
+    #[test]
+    fn test_is_emptying_in_names_the_slots_an_emptying_handed_out() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let held = [
+            slabs.store(&pattern(LEN_4352_CLASS, 1), 1).unwrap(),
+            slabs.store(&pattern(LEN_4352_CLASS, 2), 2).unwrap(),
+        ];
+        let other = slabs.store(&pattern(MIN_SLAB_BYTES, 3), 3).unwrap();
+        let class = class_of(LEN_4352_CLASS);
+        let emptied = slabs.empty_sparsest(class);
+        assert_eq!(emptied.len(), held.len());
+        for Emptied { at, .. } in &emptied {
+            assert!(slabs.is_emptying_in(class, *at));
+        }
+        let other_at = other.as_ptr().addr();
+        assert!(!slabs.is_emptying_in(class_of(MIN_SLAB_BYTES), other_at));
+        drop(held);
+        for Emptied { at, .. } in &emptied {
+            assert!(!slabs.is_emptying_in(class, *at), "the chunk is freed");
+        }
     }
 
     /// The handle's length is the slot's owner and a reference count,
