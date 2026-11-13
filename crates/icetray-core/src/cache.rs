@@ -582,8 +582,10 @@ impl PageCache {
     /// pages readers, or the disk level's write queue, still hold take
     /// more: each counts whole among the slabs' bytes until the last of
     /// them drops its page, and together they can pass the reserve, and
-    /// the cache its budget, by as much as they hold. A budget under the
-    /// slab floor of about
+    /// the cache its budget, by as much as they hold. While they pass the
+    /// reserve memory empties no chunk, so free slots in other chunks are
+    /// not reclaimed either, and grow with evictions, until the readers or
+    /// the write queue let go. A budget under the slab floor of about
     /// 455 MiB (`slab_floor_bytes`), whose reserve holds one chunk of every
     /// slab class, keeps every page in an allocation of its own and holds
     /// back no reserve. Its hit, fetch,

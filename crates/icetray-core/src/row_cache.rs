@@ -495,7 +495,10 @@ impl RowCache {
     /// remains. Only chunks being emptied whose slots readers still hold
     /// take more: each counts whole among the slabs' bytes until its last
     /// reader drops its value, and together they can pass the reserve, and
-    /// the cache its budget, by as much as the readers hold. Its
+    /// the cache its budget, by as much as the readers hold. While they pass
+    /// the reserve the cache empties no chunk, so free slots in other chunks
+    /// are not reclaimed either, and grow with evictions, until readers let
+    /// go. Its
     /// hit, miss, stale, and slab wait counters are registered at zero in
     /// the recorder current now. It splits into shards chosen for
     /// `capacity_bytes`, each holding its share of the entries' part, so

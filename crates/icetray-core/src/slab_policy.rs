@@ -115,23 +115,41 @@ pub(crate) fn budget_holding(entries: u64, floor: u64) -> u64 {
     }
 }
 
-/// Brings the uncharged bytes of `slabs` back within `reserve`: while they
-/// pass it, and the chunks being emptied alone do not, so the free slots
-/// are what pushes them over, empties the sparsest chunk of the class whose
-/// free slots hold the most, calling `leave` with the class and the record
-/// and address of each slot held in it, once per chunk, for the cache to
-/// take out the entries that still hold those slots. A chunk that no reader holds is freed then; one a
-/// reader holds waits for the reader to drop its slot, counted among the
-/// chunks being emptied, and nothing waits for it here. Each round takes
-/// one chunk out of those a store may fill, so the rounds end. Under a
-/// reserve of zero, a budget under the slab floor, it empties every chunk
-/// with a free slot while none waits.
+/// Brings the free slots of `slabs` back within what `reserve` leaves
+/// beside the chunks being emptied as the call begins: while the free
+/// slots of chunks not being emptied pass that room, and the chunks being
+/// emptied now do not pass the reserve, empties the sparsest chunk of the
+/// class whose free slots hold the most, calling `leave` with the class
+/// and the record and address of each slot held in it, once per chunk,
+/// for the cache to take out the entries that still hold those slots. A
+/// chunk that no reader holds is freed then; one a reader, or the disk
+/// level's write queue, holds waits for it to drop its slot, counted among
+/// the chunks being emptied, and nothing waits for it here.
+///
+/// The room is set once, from the chunks waiting at the start: each chunk
+/// marked here takes its free slots out of the free slots and adds its
+/// held ones to the chunks waiting, so measuring against the uncharged
+/// bytes, which count a waiting chunk whole, would have a mark raise what
+/// it is meant to lower, and one call would mark chunk after chunk until
+/// the waiting passed the reserve. The chunks a call marks count against
+/// the room from the next call on, which then holds the free slots to
+/// less while they wait. While the chunks waiting pass the reserve no
+/// call empties anything, so free slots elsewhere go unreclaimed until
+/// readers let go. Each round takes one chunk out of those a store may
+/// fill, so the rounds end. Under a reserve of zero, a budget under the
+/// slab floor, it empties every chunk with a free slot while none waits.
 pub(crate) fn fit<R: Clone + Send + Sync + 'static>(
     slabs: &Slabs<R>,
     reserve: u64,
     mut leave: impl FnMut(ClassId, Vec<Emptied<R>>),
 ) {
-    while slabs.uncharged_bytes() > reserve && slabs.waiting_bytes() <= reserve {
+    let room = reserve.saturating_sub(slabs.waiting_bytes());
+    let free = || {
+        slabs
+            .uncharged_bytes()
+            .saturating_sub(slabs.waiting_bytes())
+    };
+    while free() > room && slabs.waiting_bytes() <= reserve {
         let Some(class) = slabs.class_over(0) else {
             break;
         };
@@ -151,6 +169,8 @@ mod tests {
 
     /// The longest value the tests' slabs hold, the row cache's.
     const MAX_BYTES: usize = 64 * 1024;
+    /// A value length whose class, of 4,352 bytes, holds 15 slots a chunk.
+    const LEN: usize = 4242;
 
     /// The floor is the divisor times one chunk of every class in range:
     /// what slabs holding one value of each class allocate. Pinned for the
@@ -198,6 +218,65 @@ mod tests {
         }
         assert_eq!(budget_holding(beside(floor), floor), beside(floor));
         assert!(budget_holding(floor - 1, floor) > floor);
+    }
+
+    /// Chunks of one class, `held` slots of each held by a reader that
+    /// does not let go, the rest free: the readers' values.
+    fn chunks_readers_hold(slabs: &Slabs<u64>, chunks: usize, held: usize) -> Vec<Bytes> {
+        let slots = slots_per_chunk(slab_class(LEN));
+        let mut stored: Vec<Bytes> = (0..chunks * slots)
+            .map(|n| slabs.store(&vec![2; LEN], approx::count(n)).unwrap())
+            .collect();
+        assert_eq!(
+            slabs.chunk_bytes(),
+            approx::count(chunks * slots * slab_class(LEN))
+        );
+        let mut n = 0;
+        stored.retain(|_| {
+            n += 1;
+            (n - 1) % slots < held
+        });
+        stored
+    }
+
+    /// Chunks a fit marks while readers hold some of their slots wait for
+    /// the readers and count whole among the uncharged bytes, so each mark
+    /// raises them; the fit still marks only the chunks whose free slots
+    /// bring the free slots back within the room the reserve leaves beside
+    /// the chunks waiting as it begins, and the next fit counts the chunk
+    /// the last one marked against that room.
+    #[test]
+    fn test_one_fit_marks_what_the_free_slots_call_for_while_chunks_wait() {
+        let slabs = Slabs::new(MAX_BYTES);
+        let (chunks, held) = (64, 3);
+        let readers = chunks_readers_hold(&slabs, chunks, held);
+        let class = slab_class(LEN);
+        let chunk = approx::count(slots_per_chunk(class) * class);
+        let free_a_chunk = approx::count((slots_per_chunk(class) - held) * class);
+        let free = approx::count(chunks) * free_a_chunk;
+        assert_eq!(slabs.uncharged_bytes(), free);
+        let reserve = free - 1;
+        let mut marked = 0;
+        fit(&slabs, reserve, |_, _| marked += 1);
+        assert_eq!(
+            marked, 1,
+            "one chunk's free slots bring them back within the reserve"
+        );
+        assert_eq!(
+            slabs.waiting_bytes(),
+            chunk,
+            "the chunk waits for its readers"
+        );
+        assert!(slabs.uncharged_bytes() > reserve, "and counts whole");
+
+        let room = reserve - chunk;
+        let free = free - free_a_chunk;
+        let mut marked = 0;
+        fit(&slabs, reserve, |_, _| marked += 1);
+        assert_eq!(marked, (free - room).div_ceil(free_a_chunk));
+        assert!(slabs.waiting_bytes() <= reserve);
+        drop(readers);
+        assert_eq!(slabs.waiting_bytes(), 0);
     }
 
     #[test]
