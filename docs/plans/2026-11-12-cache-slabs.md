@@ -61,11 +61,13 @@ work: RFDs 026, 027, 028, `docs/operating.md`.
     `CLASSES_PER_DOUBLING_BITS: u32 = 5` (32 classes);
     `CHUNK_TARGET_BYTES: usize = 64 * 1024`;
     `MIN_SLOTS_PER_CHUNK: usize = 4`; `MAX_SLOTS_PER_CHUNK: usize = 32`.
-  - `icetray-core`: `SLAB_FREE_SHARE_DIVISOR: u64 = 32` (a class's
-    reusable free slots past a thirty-second of the budget empty its
-    sparsest chunk); `SLAB_CAPACITY_GRANULE_DIVISOR: u64 = 256` (a
-    cache re-sets its capacity once its uncharged slab bytes move by a
-    256th of its budget); `MAX_SLAB_PAGE_BYTES: usize = 2 * VALUE_PAGE_BYTES`
+  - `icetray-core`: `SLAB_RESERVE_DIVISOR: u64 = 16` (a cache's entries
+    get its budget less a sixteenth, set only when the budget changes,
+    and the slabs' uncharged bytes past that reserve empty the sparsest
+    chunk of the class with the most free slots; the maintainer chose
+    this on 2026-11-12, since quick_cache shrinks its ghost list on every
+    capacity change); a cache uses slabs only while its budget is at
+    least `SLAB_RESERVE_DIVISOR` times its largest chunk; `MAX_SLAB_PAGE_BYTES: usize = 2 * VALUE_PAGE_BYTES`
     (the largest page the page cache keeps in slabs: a byte-bounded page
     closes after the value that crosses 64 KiB, and a value is at most
     64 KiB).
@@ -335,9 +337,9 @@ frees the chunk when no slot is held (invariant 2).
 ### Task 6: The page cache on slabs
 
 **Files:**
-- Modify: `crates/icetray-core/src/cache.rs`, `crates/icetray-core/src/budget.rs`,
-  `crates/icetray-core/src/metric.rs`, `docs/operating.md`,
-  `docs/rfd/027-one-page-cache.md`, `docs/rfd/028-cache-budget.md`
+- Modify: `crates/icetray-core/src/cache.rs`, `crates/icetray-core/src/metric.rs`,
+  `docs/operating.md`, `docs/rfd/027-one-page-cache.md`,
+  `docs/rfd/030-cache-slabs.md`
 
 **Interfaces:**
 - Consumes: Tasks 2 and 3, Task 5's accounting pattern.
@@ -347,18 +349,21 @@ frees the chunk when no slot is held (invariant 2).
   charged what it costs: its slot plus the header, or `jemalloc_class`
   of its own allocation plus `ENTRY_OVERHEAD_BYTES` (a page foyer
   decodes from the disk level into memory included).
-- The memory level's capacity is the page part less `uncharged_bytes()`,
-  re-set by the granule rule, through `cache.memory().resize`.
+- The memory level's capacity is the page part less its reserve, set
+  only when the budget changes, through `cache.memory().resize`; past the
+  reserve, the cache empties chunks as Task 5's row cache does, and below
+  the slab floor (16 times the largest page chunk, 8 MiB) pages stay on
+  jemalloc. Charges use `icetray_slab`'s exported owner-handle size.
 - Emptying a chunk removes its pages from the memory level the way foyer
   evicts them, so under Hybrid they reach the disk level. Read foyer
   0.22.6's source for the call that does this; if none does, write the
   page to the disk level before removing it from memory.
-- RFD 028's floor: the page part holds one value page per shard plus one
-  chunk of the largest page class, `slots_per_chunk(slab_class(MAX_SLAB_PAGE_BYTES))
-  * slab_class(MAX_SLAB_PAGE_BYTES)`. `budget::check_capacity` refuses
-  less, naming the limit as today.
+- RFD 028's floor stands: a page part under the slab floor keeps pages
+  on jemalloc, so the floor needs no chunk term. RFD 030's Consequences
+  sentence that RFD 028's smallest budget is revised becomes that.
 - Metrics: `icetray_page_cache_waiting_bytes`,
-  `icetray_page_cache_slab_wait_seconds_total`, published with
+  `icetray_page_cache_slab_wait_microseconds_total` (waits by stores,
+  frees, and emptying), published with
   `publish_usage`.
 
 - [ ] **Step 1: Write the failing tests** in `cache.rs`:
@@ -370,13 +375,14 @@ frees the chunk when no slot is held (invariant 2).
     force a chunk's emptying, read the page: no fetch, served by the
     disk level.
   - `test_a_memory_hit_hands_out_the_slot`.
-  - In `budget.rs`, `test_a_page_part_under_the_slab_floor_is_refused`.
+  - `test_a_page_part_under_the_slab_floor_keeps_pages_on_jemalloc`.
+  - `test_the_memory_level_capacity_changes_only_with_the_budget`.
   - Update the `usage` tests to the new charges.
 - [ ] **Step 2:** Run them; they fail. Implement; they pass with
   `cargo test -p icetray-core` and `cargo test -p icetray-testkit`.
 - [ ] **Step 3:** RFD 027's note and Memory bullet in the present tense;
-  RFD 028's floor sentence; RFD 030's Consequences sentence that the
-  floor is revised becomes done; `docs/operating.md` rows.
+  RFD 030's Consequences sentence on RFD 028's floor as above;
+  `docs/operating.md` rows.
 - [ ] **Step 4: Commit** `feat(icetray-core): the page cache's memory
   level holds pages in slabs and charges each page what it costs`.
 
