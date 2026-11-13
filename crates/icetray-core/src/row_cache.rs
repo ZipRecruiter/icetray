@@ -590,7 +590,7 @@ impl RowCache {
     /// is dropped by that insert (`admit`).
     fn fit(&self) {
         let built = self.0.built.load();
-        slab_policy::fit(&self.0.slabs, built.reserve(), |record, at| {
+        slab_policy::fit(&self.0.slabs, built.reserve(), |record, at, _| {
             // Only the entry still holding the slot is dropped. A freed
             // chunk's address can be reused, so once the slot's chunk is
             // freed this can drop a newer entry at the same address: a

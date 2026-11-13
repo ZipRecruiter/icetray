@@ -5,7 +5,7 @@
 //! charged for, and how a cache empties chunks to stay within it.
 
 use icetray_slab::{
-    Emptied, SLOT_HANDLE_BYTES, Slabs, jemalloc_class, slab_class, slots_per_chunk,
+    ClassId, Emptied, SLOT_HANDLE_BYTES, Slabs, jemalloc_class, slab_class, slots_per_chunk,
 };
 
 use crate::approx;
@@ -106,9 +106,9 @@ pub(crate) fn budget_holding(entries: u64, max_bytes: usize) -> u64 {
 /// Brings the uncharged bytes of `slabs` back within `reserve`: while they
 /// pass it, and the chunks being emptied alone do not, so the free slots
 /// are what pushes them over, empties the sparsest chunk of the class whose
-/// free slots hold the most, calling `leave` with the record and address of
-/// each slot held in it, for the cache to take out the entry that still
-/// holds that slot. A chunk that no reader holds is freed then; one a
+/// free slots hold the most, calling `leave` with the record, address, and
+/// class of each slot held in it, for the cache to take out the entry that
+/// still holds that slot. A chunk that no reader holds is freed then; one a
 /// reader holds waits for the reader to drop its slot, counted among the
 /// chunks being emptied, and nothing waits for it here. Each round takes
 /// one chunk out of those a store may fill, so the rounds end. Under a
@@ -117,7 +117,7 @@ pub(crate) fn budget_holding(entries: u64, max_bytes: usize) -> u64 {
 pub(crate) fn fit<R: Clone + Send + Sync + 'static>(
     slabs: &Slabs<R>,
     reserve: u64,
-    mut leave: impl FnMut(R, usize),
+    mut leave: impl FnMut(R, usize, ClassId),
 ) {
     while slabs.uncharged_bytes() > reserve && slabs.waiting_bytes() <= reserve {
         let Some(class) = slabs.class_over(0) else {
@@ -128,7 +128,7 @@ pub(crate) fn fit<R: Clone + Send + Sync + 'static>(
             break;
         }
         for Emptied { record, at } in emptied {
-            leave(record, at);
+            leave(record, at, class);
         }
     }
 }

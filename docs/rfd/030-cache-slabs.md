@@ -73,11 +73,16 @@ out as a reference to its slot rather than a copy.
   reserve, and while readers hold slots of enough of them, the cache's
   memory passes the reserve, and the budget, by those chunks, the one way
   it does. An entry an insert caches while its slot's chunk is being
-  marked is dropped by that insert, and a page foyer caches after a fetch
-  while its slot's chunk is being marked, or takes back from the disk
-  level's write queue while its chunk waits, is moved to a slot of
-  another chunk, so no entry holds a chunk being emptied for longer than
-  the insert takes.
+  marked is dropped by that insert. A page foyer itself caches in such a
+  chunk, a fetch's it inserts after the mark or one it takes back from
+  the disk level's write queue while the chunk waits, is moved to a slot
+  of another chunk by the read that asked for it. Should that read be
+  gone, the page cache keeps every slot an emptying handed out until its
+  chunk is freed, and each of its later fits, which follow every page it
+  caches and every resize, checks a chunk's worth of them again and takes
+  out any page memory holds in one. Such a page holds its chunk only
+  until those fits reach its slot, counted among the chunks waiting until
+  then.
 - **Locking.** A slab takes its lock to claim and to free a slot, and a
   store copies its bytes into the slot outside the lock, since nothing
   refers to a slot until its store returns. A hit takes no slab lock.

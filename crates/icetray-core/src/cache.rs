@@ -9,23 +9,24 @@
 //! other page in an allocation of its own, and charges each page what it
 //! costs there.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
 use foyer::{
     BlockEngineConfig, Cache, CacheBuilder, Code, DeviceBuilder as _, ErrorKind, FsDeviceBuilder,
-    HybridCache, HybridCacheBuilder, HybridCachePolicy, RecoverMode, S3FifoConfig, Source,
+    HybridCache, HybridCacheBuilder, HybridCachePolicy, HybridCacheProperties, RecoverMode,
+    S3FifoConfig, Source,
 };
-use icetray_slab::{Slabs, in_slabs, is_slot};
+use icetray_slab::{ClassId, MAX_SLOTS_PER_CHUNK, Slabs, in_slabs, is_slot};
 use metrics::Counter;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
@@ -60,6 +61,22 @@ const ENTRY_OVERHEAD_BYTES: usize = 64;
 /// of values no longer than that is at most twice it. A longer page stays
 /// in an allocation of its own.
 const MAX_SLAB_PAGE_BYTES: u64 = 2 * VALUE_PAGE_BYTES;
+
+/// The slots of chunks being emptied one fit checks again
+/// (`PageCache::recheck`): the most a chunk holds, so a list of `n` such
+/// slots is gone through within `n` divided by this many fits, rounded up,
+/// at the cost of a memory lookup and a slab-lock check each, small beside
+/// the page cached or the resize a fit follows.
+const RECHECKS_PER_FIT: usize = MAX_SLOTS_PER_CHUNK;
+
+/// A slot an emptying handed out, kept until its chunk is freed
+/// (`PageCache::recheck`): the key of the page that held it, its address,
+/// and its class.
+struct Emptying {
+    key: PageKey,
+    at: usize,
+    class: ClassId,
+}
 
 /// `MAX_SLAB_PAGE_BYTES` as the slabs take it.
 fn slab_max_bytes() -> usize {
@@ -411,6 +428,13 @@ struct PageSlabs {
     /// `PAGE_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL`, which
     /// `PageCache::publish_usage` sets from the slabs' own count.
     slab_wait: Counter,
+    /// Every slot an emptying handed out whose chunk is still being
+    /// emptied, in the order the next fits check them again
+    /// (`PageCache::recheck`). A slot leaves once its chunk is freed, so the
+    /// list holds at most the slots held in chunks being emptied, which
+    /// `slab_policy::fit` marks only while those chunks are within the
+    /// reserve, plus the chunk it marks last.
+    emptied: Mutex<VecDeque<Emptying>>,
     /// How many times `PageCache::resize_memory` has resized the memory
     /// level: what the capacity test counts, since foyer reports the
     /// capacity a level was built with.
@@ -424,6 +448,7 @@ impl PageSlabs {
             slabs: Slabs::new(slab_max_bytes()),
             budget: AtomicU64::new(budget),
             slab_wait: metrics::counter!(metric::PAGE_CACHE_SLAB_WAIT_MICROSECONDS_TOTAL),
+            emptied: Mutex::new(VecDeque::new()),
             #[cfg(test)]
             resizes: AtomicU64::new(0),
         }
@@ -642,19 +667,22 @@ impl PageCache {
                 cache
                     .get_or_fetch(&key, || run.fetch(fetch()))
                     .await
-                    .map(|entry| (entry.source(), entry.value().clone())),
+                    .map(|entry| (entry.source(), entry.value().clone(), None)),
                 None,
             ),
             Level::Hybrid { cache, stats } => (
                 cache
                     .get_or_fetch(&key, || run.fetch(fetch()))
                     .await
-                    .map(|entry| (entry.source(), entry.value().clone())),
+                    .map(|entry| {
+                        let properties = Some(entry.properties().clone());
+                        (entry.source(), entry.value().clone(), properties)
+                    }),
                 Some(stats.as_ref()),
             ),
         };
-        let (source, value) = served.map_err(cache_error)?;
-        let page = self.settle(&key, source, value);
+        let (source, value, properties) = served.map_err(cache_error)?;
+        let page = self.settle(&key, source, value, properties);
         self.record(source, stats, &page);
         Ok((page, origin_of(source)))
     }
@@ -799,7 +827,7 @@ impl PageCache {
                     .iter()
                     .zip(split)
                     .map(|(page, bytes)| {
-                        self.cache_page(&PageKey(Arc::clone(file), page.start), bytes)
+                        self.cache_page(&PageKey(Arc::clone(file), page.start), bytes, None)
                     })
                     .collect()
             }),
@@ -942,7 +970,8 @@ impl PageCache {
                 continue;
             };
             let source = entry.source();
-            let page = self.settle(&key, source, entry.value().clone());
+            let properties = Some(entry.properties().clone());
+            let page = self.settle(&key, source, entry.value().clone(), properties);
             match source {
                 Source::Outer => {
                     self.spans.joined.fetch_add(1, Ordering::Relaxed);
@@ -1189,22 +1218,33 @@ impl PageCache {
     /// `page` cached at `key` as a fetch's page is, copied into a slot of
     /// the slabs while the budget keeps pages there and its length is in
     /// their range, else into an allocation of its own (`PageValue::copied`,
-    /// `admit`), and the bytes memory holds for it.
-    fn cache_page(&self, key: &PageKey, page: &[u8]) -> Bytes {
+    /// `admit`), with `properties` (`admit`), and the bytes memory holds for
+    /// it.
+    fn cache_page(
+        &self,
+        key: &PageKey,
+        page: &[u8],
+        properties: Option<HybridCacheProperties>,
+    ) -> Bytes {
         let value = PageValue::copied(self.slabs.taking(), key, page);
         let bytes = value.bytes.clone();
-        self.admit(key, value);
+        self.admit(key, value, properties);
         bytes
     }
 
-    /// Holds `value` at `key` in memory. An emptying can mark the chunk of
+    /// Holds `value` at `key` in memory, under a disk level with
+    /// `properties`: those foyer gave the entry this one replaces, or the
+    /// default for a page this cache caches first. A page foyer read back
+    /// from the disk level carries its age there, and foyer's eviction
+    /// skips writing a page the level still holds by that age, so the
+    /// replacement keeps it. An emptying can mark the chunk of
     /// the page's slot between the store that filled it and the insert, and
     /// then find no entry by the slot's record, so the insert comes first
     /// and the ask after (`Slabs::is_emptying`): an emptying that marked the
     /// chunk before the ask is seen by it, and the page leaves memory
     /// (`evict_slot`), and one that marks it after finds the entry by its
     /// record.
-    fn admit(&self, key: &PageKey, value: PageValue) {
+    fn admit(&self, key: &PageKey, value: PageValue, properties: Option<HybridCacheProperties>) {
         let slot = match value.home {
             Home::Slot => Some(value.bytes.clone()),
             Home::Own => None,
@@ -1214,7 +1254,7 @@ impl PageCache {
                 cache.insert(key.clone(), value);
             }
             Level::Hybrid { cache, .. } => {
-                cache.insert(key.clone(), value);
+                cache.insert_with_properties(key.clone(), value, properties.unwrap_or_default());
             }
         }
         if let Some(bytes) = slot
@@ -1225,8 +1265,9 @@ impl PageCache {
     }
 
     /// The bytes a caller is served for the page at `key` that foyer
-    /// returned from `source` as `value`, once memory holds the page where
-    /// it belongs, and the cache fitted within its budget (`fit`). foyer
+    /// returned from `source` as `value`, with `properties` under a disk
+    /// level, once memory holds the page where it belongs, and the cache
+    /// fitted within its budget (`fit`). foyer
     /// places each page it returns in memory itself, a fetch's, a decoded
     /// one, or one its disk level's write queue hands back. A page decoded
     /// from the disk level is in an allocation of its own, charged so; while
@@ -1235,9 +1276,16 @@ impl PageCache {
     /// reads it in place. A page whose slot lies in a chunk being emptied,
     /// a fetch's that the emptying marked after the store and before foyer
     /// inserted it, or one the write queue handed back while its chunk
-    /// waits, moves into another slot the same way, so no entry holds a
-    /// chunk being emptied.
-    fn settle(&self, key: &PageKey, source: Source, value: PageValue) -> Bytes {
+    /// waits, moves into another slot the same way. Either keeps foyer's
+    /// properties (`admit`). A page foyer placed so with no caller left to
+    /// settle it is taken out by a later fit (`recheck`).
+    fn settle(
+        &self,
+        key: &PageKey,
+        source: Source,
+        value: PageValue,
+        properties: Option<HybridCacheProperties>,
+    ) -> Bytes {
         let moves = match value.home {
             Home::Slot => self.slabs.slabs.is_emptying(&value.bytes),
             Home::Own => {
@@ -1251,7 +1299,7 @@ impl PageCache {
             }
         };
         let page = if moves {
-            self.cache_page(key, &value.bytes)
+            self.cache_page(key, &value.bytes, properties)
         } else {
             value.bytes
         };
@@ -1294,13 +1342,66 @@ impl PageCache {
 
     /// Brings the slabs' uncharged bytes back within the reserve
     /// (`slab_policy::fit`), each page holding a slot of a chunk emptied
-    /// leaving memory as foyer evicts one (`evict_slot`). A slot a store
+    /// leaving memory as foyer evicts one (`evict_slot`), then checks again
+    /// some of the slots emptyings handed out (`recheck`). A slot a store
     /// has filled and foyer not yet cached is moved by the call that
-    /// stored it (`admit`, `settle`).
+    /// stored it (`admit`, `settle`), or, with that call gone, taken out by
+    /// `recheck`.
     fn fit(&self) {
-        slab_policy::fit(&self.slabs.slabs, self.slabs.reserve(), |key, at| {
+        self.fit_within(self.slabs.reserve());
+    }
+
+    /// `fit` against a reserve of `reserve` bytes: what a test forces a
+    /// chunk's emptying with, at zero.
+    fn fit_within(&self, reserve: u64) {
+        let mut emptied = Vec::new();
+        slab_policy::fit(&self.slabs.slabs, reserve, |key, at, class| {
             self.evict_slot(&key, at);
+            emptied.push(Emptying { key, at, class });
         });
+        self.recheck(emptied);
+    }
+
+    /// Adds `emptied`, the slots an emptying just handed out, to those kept
+    /// (`PageSlabs::emptied`) and checks the `RECHECKS_PER_FIT` kept longest
+    /// again, putting the ones still kept at the end: a slot whose
+    /// chunk has been freed is let go (`Slabs::is_emptying_in`), and one
+    /// memory holds a page in again is taken out as an emptying takes one
+    /// (`evict_slot`). foyer puts a page back in memory in such a slot on
+    /// its own, a fetch's it inserts after the emptying marked the chunk or
+    /// one its disk level's write queue hands back, and the read that
+    /// would move it (`settle`) can be gone by then, so without this the
+    /// page would keep its chunk from going back until foyer evicted it.
+    /// The list's lock is not held while a slot is checked.
+    fn recheck(&self, emptied: Vec<Emptying>) {
+        let due: Vec<Emptying> = {
+            let mut kept = self
+                .slabs
+                .emptied
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            kept.extend(emptied);
+            let due = kept.len().min(RECHECKS_PER_FIT);
+            kept.drain(..due).collect()
+        };
+        if due.is_empty() {
+            return;
+        }
+        let still: Vec<Emptying> = due
+            .into_iter()
+            .filter(|slot| {
+                let emptying = self.slabs.slabs.is_emptying_in(slot.class, slot.at);
+                if emptying {
+                    self.evict_slot(&slot.key, slot.at);
+                }
+                emptying
+            })
+            .collect();
+        self.slabs
+            .emptied
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(still);
     }
 
     /// One page served without a fetch.
@@ -3063,7 +3164,7 @@ mod tests {
         let id: Arc<str> = Arc::from(FILE_ID);
         let slabs = &cache.slabs.slabs;
         assert_eq!(slabs.held_slots(), 1);
-        slab_policy::fit(slabs, 0, |key, at| cache.evict_slot(&key, at));
+        cache.fit_within(0);
         assert_eq!(
             cache.held_page(&id, FIRST_OFFSET),
             None,
@@ -3186,18 +3287,18 @@ mod tests {
             let value = PageValue::copied(cache.slabs.taking(), &key, &page);
             assert_eq!(value.home, Home::Slot);
             let stored = value.bytes.as_ptr();
-            slab_policy::fit(slabs, 0, |key, at| cache.evict_slot(&key, at));
+            cache.fit_within(0);
             assert!(slabs.waiting_bytes() > 0, "the chunk is being emptied");
             if through_foyer {
                 memory.insert(key.clone(), value.clone());
-                let served = cache.settle(&key, Source::Outer, value);
+                let served = cache.settle(&key, Source::Outer, value, None);
                 assert_eq!(served, page);
                 assert_ne!(served.as_ptr(), stored, "moved out of the chunk");
                 let held = cache.held_page(&id, offset).expect("memory holds the page");
                 assert_eq!(held.as_ptr(), served.as_ptr());
                 assert!(!slabs.is_emptying(&held));
             } else {
-                cache.admit(&key, value);
+                cache.admit(&key, value, None);
                 assert_eq!(cache.held_page(&id, offset), None, "the page left memory");
             }
             assert_eq!(slabs.waiting_bytes(), 0, "the chunk is freed");
@@ -3244,6 +3345,97 @@ mod tests {
             most_uncharged > reserve / 2,
             "free slots reached the reserve: {most_uncharged}"
         );
+    }
+
+    /// A page foyer puts back in memory in a chunk being emptied with no
+    /// caller left to settle it, a fetch's page inserted after its chunk
+    /// was marked or one the disk level's write queue hands back, leaves
+    /// memory at the next fit, so the chunk does not stay pinned.
+    #[tokio::test]
+    async fn test_a_page_put_back_in_a_chunk_being_emptied_leaves_at_the_next_fit() {
+        let id: Arc<str> = Arc::from(FILE_ID);
+        let key = PageKey(Arc::clone(&id), FIRST_OFFSET);
+        let page = page_of(SLAB_PAGE_LEN, 6);
+
+        let cache = PageCache::new(SLAB_BYTES, None).await.unwrap();
+        let Level::Memory(memory) = cache.level.as_ref() else {
+            panic!("a cache without a disk level is memory only");
+        };
+        let slabs = &cache.slabs.slabs;
+        let value = PageValue::copied(cache.slabs.taking(), &key, &page);
+        cache.fit_within(0);
+        assert!(slabs.waiting_bytes() > 0, "the chunk is being emptied");
+        memory.insert(key.clone(), value);
+        assert!(
+            cache.held_page(&id, FIRST_OFFSET).is_some(),
+            "foyer cached it"
+        );
+        cache.fit();
+        assert!(
+            cache.held_page(&id, FIRST_OFFSET).is_none(),
+            "a fetch's page"
+        );
+        assert_eq!(slabs.waiting_bytes(), 0, "the chunk is freed");
+
+        let dir = tempfile::tempdir().unwrap();
+        let (level, _) = disk_level(dir.path());
+        let cache = PageCache::new(SLAB_BYTES, Some(level)).await.unwrap();
+        let runs = Arc::new(AtomicU64::new(0));
+        fetch_into(&cache, FIRST_OFFSET, &page, &runs).await;
+        let memory = hybrid(&cache).memory();
+        let held = memory.get(&key).expect("memory holds the page");
+        cache.fit_within(0);
+        assert!(
+            cache.held_page(&id, FIRST_OFFSET).is_none(),
+            "the page left memory"
+        );
+        // As foyer puts back a page its write queue hands back (`Load::Piece`).
+        memory.insert_piece(held.piece());
+        drop(held);
+        assert!(
+            cache.held_page(&id, FIRST_OFFSET).is_some(),
+            "foyer cached it"
+        );
+        cache.fit();
+        assert!(
+            cache.held_page(&id, FIRST_OFFSET).is_none(),
+            "a write queue's page"
+        );
+        cache.close().await.unwrap();
+    }
+
+    /// A page read back from the disk level keeps the age foyer gave it
+    /// when it moves into a slot, so, the disk level still holding it,
+    /// leaving memory again writes nothing.
+    #[tokio::test]
+    async fn test_a_page_read_back_from_disk_is_not_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (level, _) = disk_level(dir.path());
+        let cache = PageCache::new(SLAB_BYTES, Some(level)).await.unwrap();
+        let runs = Arc::new(AtomicU64::new(0));
+        let page = page_of(SLAB_PAGE_LEN, 8);
+        fetch_into(&cache, FIRST_OFFSET, &page, &runs).await;
+        cache.clear();
+        cache.disk_writes_done().await;
+        let statistics = hybrid(&cache).statistics();
+        let written = statistics.disk_write_bytes();
+        assert!(written > 0, "the page was written");
+
+        let (served, _) = cache
+            .get_or_fetch(key(FIRST_OFFSET), Issue::default(), never)
+            .await
+            .unwrap();
+        assert_eq!(served, page);
+        drop(served);
+        assert_eq!(
+            entries_usage(&cache),
+            charged(SLAB_PAGE_LEN, Home::Slot),
+            "moved into a slot"
+        );
+        cache.clear();
+        cache.disk_writes_done().await;
+        assert_eq!(statistics.disk_write_bytes(), written, "written again");
+        cache.close().await.unwrap();
     }
 
     /// The memory level's entries take the budget less the slabs' reserve,
@@ -3674,7 +3866,7 @@ mod tests {
         let bytes = pages_of(&file, page);
         let (answer, ()) = tokio::join!(reading, async {
             joined(&cache, 1).await;
-            cache.cache_page(&PageKey(Arc::clone(&id), page[0].start), &bytes[0]);
+            cache.cache_page(&PageKey(Arc::clone(&id), page[0].start), &bytes[0], None);
             claim.publish(&Ok(bytes.clone()));
             drop(claim);
         });
