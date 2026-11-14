@@ -34,6 +34,7 @@ mod projection;
 mod row_cache;
 mod scan;
 mod shard;
+mod size_class;
 mod snapshot;
 mod storage;
 mod table;

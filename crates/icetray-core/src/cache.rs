@@ -33,6 +33,7 @@ use crate::local::DiskLevel;
 use crate::memory::MemoryLimit;
 use crate::metric;
 use crate::shard::{self, Sharded, Tally};
+use crate::size_class::{SHARED_HEADER_BYTES, size_class};
 use crate::storage::IoStats;
 
 /// The name foyer files its own log lines under. Its metrics stay on its
@@ -68,8 +69,8 @@ fn eviction() -> S3FifoConfig {
 }
 
 /// The smallest memory budget a page cache of `shards` shards is given:
-/// one contract value page (`contract::VALUE_PAGE_BYTES`) weighed with its
-/// entry overhead, for each shard. Below it a shard's share cannot hold one
+/// one contract value page (`contract::VALUE_PAGE_BYTES`) as `charged`
+/// charges it, for each shard. Below it a shard's share cannot hold one
 /// such page, and foyer keeps the shard's latest page alone whatever its
 /// share, so the cache would hold a page per shard however small the budget
 /// and the configured bytes would bound nothing. `Config::parse` refuses
@@ -77,7 +78,7 @@ fn eviction() -> S3FifoConfig {
 /// `open_with` refuses less than the minimum of the shards the cache will
 /// have on the runtime it opens on (`check_capacity`).
 pub(crate) fn min_memory_bytes(shards: usize) -> u64 {
-    approx::count(shards) * (VALUE_PAGE_BYTES + approx::count(ENTRY_OVERHEAD_BYTES))
+    approx::count(shards) * approx::count(charged(approx::length(VALUE_PAGE_BYTES)))
 }
 
 /// `ConfigViolation::PageCacheTooSmall` for a memory budget of `bytes`
@@ -1241,9 +1242,17 @@ fn descriptors_exhausted(error: &foyer::Error) -> Option<io::Error> {
     None
 }
 
-/// What an entry costs the memory budget.
+/// What an entry costs the memory budget (`charged`).
 fn weigh(_: &PageKey, value: &PageValue) -> usize {
-    value.0.len() + ENTRY_OVERHEAD_BYTES
+    charged(value.0.len())
+}
+
+/// What a page of `len` bytes costs the memory budget: its allocation in
+/// jemalloc's size class, since every page in memory owns its buffer, the
+/// shared header its first read allocates, and its entry's overhead
+/// (`ENTRY_OVERHEAD_BYTES`).
+const fn charged(len: usize) -> usize {
+    size_class(len) + SHARED_HEADER_BYTES + ENTRY_OVERHEAD_BYTES
 }
 
 /// What a GET of a lookup or a Scan answers to beside the fetch deadline
@@ -2648,8 +2657,22 @@ mod tests {
         assert_eq!(cache.fetches(), 2);
     }
 
+    /// A page is charged its allocation in jemalloc's size class, the shared
+    /// header its first read allocates, and its entry's overhead, so a page
+    /// one byte over a size class is charged the class above.
+    #[test]
+    fn test_weigh_charges_a_page_its_size_class() {
+        let key = PageKey(Arc::from(FILE_ID), FIRST_OFFSET);
+        let page = |len| weigh(&key, &PageValue(Bytes::from(vec![0; len])));
+        let overhead = SHARED_HEADER_BYTES + ENTRY_OVERHEAD_BYTES;
+        assert_eq!(page(10), 16 + overhead);
+        assert_eq!(page(4096), 4096 + overhead);
+        assert_eq!(page(4097), 5120 + overhead);
+        assert_eq!(page(65_537), 81_920 + overhead);
+    }
+
     #[tokio::test]
-    async fn test_usage_grows_by_page_bytes_plus_overhead() {
+    async fn test_usage_grows_by_each_pages_charge() {
         let cache = PageCache::new(ROOMY_BYTES, None).await.unwrap();
         assert_eq!((cache.usage(), cache.pages()), (0, 0));
         let runs = Arc::new(AtomicU64::new(0));
@@ -2659,7 +2682,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(cache.usage(), count(PAGE.len() + ENTRY_OVERHEAD_BYTES));
+        assert_eq!(cache.usage(), count(charged(PAGE.len())));
         cache
             .get_or_fetch(key(SECOND_OFFSET), Issue::default(), || {
                 answering(OTHER_PAGE, &runs)
@@ -2668,7 +2691,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cache.usage(),
-            count(PAGE.len() + OTHER_PAGE.len() + 2 * ENTRY_OVERHEAD_BYTES)
+            count(charged(PAGE.len()) + charged(OTHER_PAGE.len()))
         );
         assert_eq!(cache.pages(), 2);
     }

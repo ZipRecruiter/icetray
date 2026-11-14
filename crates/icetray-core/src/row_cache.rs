@@ -26,6 +26,7 @@ use crate::index::RowPosition;
 use crate::key::Key;
 use crate::metric;
 use crate::shard::Tally;
+use crate::size_class::{self, size_class};
 
 /// The largest value, in bytes, the cache keeps: one contract value page.
 /// A larger value is read from its pages each time, so one wide row does not
@@ -45,14 +46,9 @@ const QUICK_CACHE_SLOT_BYTES: usize = 64;
 const ROW_SLOT_BYTES: u64 =
     approx::count(QUICK_CACHE_SLOT_BYTES + size_of::<EntryKey>() + size_of::<EntryValue>());
 
-/// Bytes of the shared header the first clone of a cached value's `Bytes`
-/// allocates, which every value entry that is read pays: `bytes`' `Shared`,
-/// a buffer pointer, its capacity, and a reference count.
-const SHARED_HEADER_LEN: usize = 24;
-
-/// What the shared header takes in jemalloc's size class
-/// (`SHARED_HEADER_LEN`).
-const SHARED_HEADER_BYTES: u64 = approx::count(size_class(SHARED_HEADER_LEN));
+/// What the shared header a read of a cached value allocates takes
+/// (`size_class::SHARED_HEADER_BYTES`), as the budget counts.
+const SHARED_HEADER_BYTES: u64 = approx::count(size_class::SHARED_HEADER_BYTES);
 
 /// The weight of an average entry, which `quick_cache` divides the budget by
 /// to choose how many shards to split into: what a value of about a
@@ -124,36 +120,6 @@ impl GhostReserve {
             (u128::from(entries) * u128::from(self.bytes)).div_ceil(u128::from(self.budget));
         u64::try_from(bytes).expect("the reserve is at most the budget beside it")
     }
-}
-
-/// The smallest allocation jemalloc makes and the finest spacing of its
-/// size classes: sizes up to this round to it, and sizes above round to a
-/// multiple of at least this.
-const MIN_SIZE_CLASS_BYTES: usize = 16;
-
-/// jemalloc splits each doubling of the size into `1 << SIZE_CLASS_BITS`
-/// classes, four.
-const SIZE_CLASS_BITS: u32 = 2;
-
-/// The bytes jemalloc allocates for a request of `len` bytes: `len` rounded
-/// up to its size class, a multiple of `MIN_SIZE_CLASS_BYTES` for small
-/// sizes and of a quarter of the size's power of two above them. Nothing is
-/// allocated for no bytes. A `const fn`, so a constant's size class is
-/// derived from its length.
-const fn size_class(len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    if len <= MIN_SIZE_CLASS_BYTES {
-        return MIN_SIZE_CLASS_BYTES;
-    }
-    let spacing = 1_usize << (len - 1).ilog2().saturating_sub(SIZE_CLASS_BITS);
-    let spacing = if spacing < MIN_SIZE_CLASS_BYTES {
-        MIN_SIZE_CLASS_BYTES
-    } else {
-        spacing
-    };
-    len.next_multiple_of(spacing)
 }
 
 /// What an entry is charged against the budget: its key's allocation of
