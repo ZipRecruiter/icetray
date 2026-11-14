@@ -1,5 +1,10 @@
 # Unsafe code
 
+> Updated 2026-11-14: the `unsafe` that predates this RFD is assessed:
+> `local/residency` is named in RFD 017, the benchmark's CPU time moved
+> to rustix, and the rest is recorded here as exempt. The cache slabs
+> that would have managed shared memory were set aside (RFD 030).
+
 ## Problem
 
 icetray has `unsafe` blocks in `icetray-core` and the testkit and no rule
@@ -10,10 +15,10 @@ in tests and benchmarks. A mistake in a system call often
 fails loudly, with an error code or a crash, though a wrong length passed
 to one can corrupt memory as silently as any other mistake. A mistake in
 code that manages memory can corrupt a value another lookup returns and
-fail nowhere. Caches that hand out values without copying them need
-`unsafe` that manages shared memory on the lookup path, which icetray has
-not had before. A reviewer needs a rule saying where `unsafe` may go and
-what has to come with it.
+fail nowhere. Caches that handed out values without copying them would
+need `unsafe` that manages shared memory on the lookup path, which
+icetray has not had. A reviewer needs a rule saying where `unsafe` may
+go and what has to come with it.
 
 ## Decision
 
@@ -53,8 +58,8 @@ the tests that check them, and every `unsafe` block will carry a
 
 Forbidding `unsafe` outright. Rejected because icetray needs system
 calls that the standard library does not cover, and because a cache
-that hands out values without copying them needs a slice of a buffer
-that other threads write elsewhere, which safe Rust cannot express.
+that handed out values without copying them would need a slice of a
+buffer that other threads write elsewhere, which safe Rust cannot express.
 
 `unsafe` allowed anywhere with a `SAFETY` comment. Rejected because a
 comment states an invariant without anyone checking it, and nothing then
@@ -75,19 +80,27 @@ alone.
 
 ## Consequences
 
-The `unsafe` already in icetray predates this decision. Where rustix
-has a safe form of a system call, icetray calls that instead. What
-remains has not been assessed against this decision: `local/residency`'s
-mapping, whose `mmap`, `mincore`, and `munmap` rustix has no safe form
-of; `getdtablesize` in `descriptors` and the physical page count's
-`sysconf` in `memory`, which rustix lacks; the counting allocators in
-`deletes/bound`'s tests and the benchmark, which implement a trait that
-is itself `unsafe`; and in the testkit, the benchmark's `getrusage` and
-`headroom`'s macOS memory queries. A maintainer assesses each module and
-then names it in an RFD, rewrites it without `unsafe`, or records it
-here as exempt. Every block among them carries a `SAFETY` comment.
-`local/residency`'s mapping is memory a system call manages, which Miri
-may not be able to run, so its assessment says what checks it instead.
+The `unsafe` already in icetray predates this decision, and each module
+that holds it has been assessed. Where rustix has a safe form of a
+system call, icetray calls that instead, the benchmark's CPU time among
+them. `local/residency`'s mapping, whose `mmap`, `mincore`, and `munmap`
+rustix has no safe form of, is named in RFD 017 (Residency tiers) with
+its invariants and tests. The rest is exempt, since none of it manages
+memory:
+
+- `descriptors`' `getdtablesize`, which takes no argument and reports
+  macOS's per-process cap on open files, which neither rustix nor the
+  soft limit gives.
+- `memory`'s `sysconf` of the physical page count, a call by a constant
+  name that reads no memory of icetray's.
+- The counting allocators in `deletes/bound`'s tests and in the
+  benchmark, which forward every call unchanged to the allocator beneath
+  and count it, and are `unsafe` only because `GlobalAlloc` is.
+- The testkit's `headroom`, whose macOS memory accounting only
+  `task_info` and `sysctlbyname` give, each writing into a fixed-size
+  buffer whose length goes with the call, in a crate that does not ship.
+
+Every block among them carries a `SAFETY` comment.
 
 Nothing mechanical stops `unsafe` from appearing in a module no RFD
 names; review does. A feature that needs `unsafe` needs an RFD first,

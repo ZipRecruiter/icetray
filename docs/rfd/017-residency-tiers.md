@@ -59,6 +59,10 @@
 > every table, ordered tables' included, and a Scan's span read takes
 > each page it holds as a local read in place of a GET. See RFD 027.
 
+> Updated 2026-11-14: the residency sample's `unsafe` is named here, in
+> `local/residency`, with the invariants it relies on and the tests that
+> check them (RFD 029 (Unsafe code)).
+
 ## Problem
 
 The resident index of RFD 004 (Resident key-chunk index) costs anything
@@ -175,6 +179,28 @@ Nothing in the directory is converted or kept valid across a change of
 format, so a format change raises a version, the minor version for the
 disk level (`CONTRIBUTING.md`, Stability), and costs one cold start, as
 a new replica does.
+
+The residency sample holds the disk tier's only `unsafe`, in
+`local/residency`, under RFD 029 (Unsafe code): it maps a chunk file's
+range with `mmap`, asks `mincore` which of its pages the kernel holds,
+and unmaps it, three system calls rustix has no safe form of. It relies
+on these invariants:
+
+- A mapping is made only from a successful `mmap`, with the address and
+  length that call used, and is unmapped once, when it drops.
+- The mapping is `PROT_NONE`: nothing reads or writes through its
+  address, which goes only to `mincore` and `munmap`.
+- The mapping starts on a page boundary, and the buffer `mincore` writes
+  holds one byte for each page the mapping touches, a partial last page
+  included.
+- The mapping drops before the sample returns on every path, an error
+  from `mincore` included, and the file stays open while it is mapped.
+
+The residency tests check the page counts of a whole file and of ranges
+that start or end inside a page, which a buffer of the wrong length
+would miscount; a reviewer checks the rest against the code. The module
+hands out no pointer, frees no buffer of its own, and declares nothing
+`Send` or `Sync`, so RFD 029 asks no Miri tests of it.
 
 ## Alternatives Considered
 
