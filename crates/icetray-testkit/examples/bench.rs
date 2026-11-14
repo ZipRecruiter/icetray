@@ -5452,40 +5452,11 @@ fn thread_cpu() -> Duration {
     ))
 }
 
-/// The process's user and system CPU time so far, and its peak resident
-/// set over its whole life as the kernel reports it (bytes on macOS,
-/// kibibytes on Linux, recorded as reported with the platform beside it).
-#[derive(Clone, Copy, Debug, Default)]
-struct Usage {
-    user: Duration,
-    system: Duration,
-    max_rss: u64,
-}
-
-impl Usage {
-    fn now() -> Self {
-        // SAFETY: `getrusage` writes one `rusage` into the zeroed struct it
-        // is handed and reads nothing else.
-        let usage = unsafe {
-            let mut usage: libc::rusage = std::mem::zeroed();
-            if libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) != 0 {
-                return Self::default();
-            }
-            usage
-        };
-        Self {
-            user: cpu_time(usage.ru_utime),
-            system: cpu_time(usage.ru_stime),
-            max_rss: u64::try_from(usage.ru_maxrss).unwrap_or(0),
-        }
-    }
-}
-
-/// A `timeval` from `getrusage` as a `Duration`, at the kernel's boundary,
-/// where the time arrives as bare seconds and microseconds.
-fn cpu_time(value: libc::timeval) -> Duration {
-    Duration::from_secs(u64::try_from(value.tv_sec).unwrap_or(0))
-        + Duration::from_micros(u64::try_from(value.tv_usec).unwrap_or(0))
+/// The process's user and system CPU time so far, every thread's.
+fn process_cpu() -> Duration {
+    clock_time(rustix::time::clock_gettime(
+        rustix::time::ClockId::ProcessCPUTime,
+    ))
 }
 
 /// A `timespec` from `clock_gettime` as a `Duration`, at the kernel's
@@ -5540,7 +5511,6 @@ struct Loaded {
     allocations: Allocations,
     rss_before: u64,
     rss_peak: u64,
-    max_rss: u64,
     gets: u64,
     /// The bytes those GETs requested.
     get_bytes: u64,
@@ -5588,7 +5558,6 @@ impl Loaded {
             "rss_before_bytes": self.rss_before,
             "rss_peak_bytes": self.rss_peak,
             "rss_peak_delta_bytes": self.rss_peak.saturating_sub(self.rss_before),
-            "getrusage_max_rss": self.max_rss,
             "gets": self.gets,
             "get_bytes": self.get_bytes,
             "local_reads": self.local_reads,
@@ -5624,13 +5593,13 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
     }
     HeldBytes::take();
     let before = Counters::read(served);
-    let usage = Usage::now();
+    let cpu_before = process_cpu();
     let sampler = RssSampler::start();
     let started = Instant::now();
     work.await?;
     let wall = started.elapsed();
     let seen = sampler.stop();
-    let after = Usage::now();
+    let cpu_after = process_cpu();
     let counters = Counters::read(served).since(before);
     let get_rounds = served.rounds.as_ref().map(|store| store.rounds());
     let held_bytes = HeldBytes::take();
@@ -5656,14 +5625,13 @@ async fn timed<F: Future<Output = BenchResult<()>>>(
         tier,
         round,
         wall,
-        cpu: (after.user + after.system)
-            .saturating_sub(usage.user + usage.system)
+        cpu: cpu_after
+            .saturating_sub(cpu_before)
             .saturating_sub(seen.cpu),
         sampler_cpu: seen.cpu,
         allocations: counters.allocations,
         rss_before,
         rss_peak: seen.peak,
-        max_rss: after.max_rss,
         gets: counters.gets,
         get_bytes: counters.get_bytes,
         local_reads: counters.local_reads,
