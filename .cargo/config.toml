@@ -1,0 +1,8 @@
+[env]
+# jemalloc's options compiled into every build in this workspace, read
+# before `main` runs. cache_oblivious:false drops the page of padding
+# jemalloc adds to every large allocation (from 16 KiB with 4 KiB pages,
+# from 64 KiB with 16 KiB pages), which a cached page or value that large
+# would carry beyond the size class the caches charge for it
+# (`size_class`). `_RJEM_MALLOC_CONF` overrides it at run time.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "cache_oblivious:false"
