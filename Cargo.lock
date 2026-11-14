@@ -2602,7 +2602,7 @@ dependencies = [
 
 [[package]]
 name = "icetray"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -2638,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "icetray-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -2682,7 +2682,7 @@ dependencies = [
 
 [[package]]
 name = "icetray-proto"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "icetray-testkit"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "async-trait",
