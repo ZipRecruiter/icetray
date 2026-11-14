@@ -286,6 +286,24 @@ mod tests {
         assert_eq!(residency.resident, FILE_PAGES - 1);
     }
 
+    /// A range that ends inside a page counts that page: `mincore` writes
+    /// a byte for every page the mapping touches, a partial last page
+    /// included, so the sample sizes its answer to the pages rounded up.
+    #[test]
+    fn test_resident_counts_the_page_a_range_ends_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, path, len) = written(dir.path());
+        let inside_the_last_page = len - 1;
+        let residency = resident(&file, &path, 0..inside_the_last_page).unwrap();
+        assert_eq!(
+            residency,
+            ResidentPages {
+                pages: FILE_PAGES,
+                resident: FILE_PAGES
+            }
+        );
+    }
+
     #[test]
     fn test_resident_of_an_empty_range_counts_no_page() {
         let dir = tempfile::tempdir().unwrap();
