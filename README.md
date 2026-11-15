@@ -107,9 +107,9 @@ row into columns.
 A `binary` column that holds serialized protobuf messages can be declared
 `format = "protobuf"`. A lookup can then project its value to a list of
 top-level field numbers, so the caller receives and decodes only those
-fields. Projection runs after the page cache, so it reduces the bytes on
-the wire and the caller's decode time, and costs the same GETs as reading
-the whole value, as in this `Get` request:
+fields. Projection runs after the row cache and the page cache, so it
+reduces the bytes on the wire and the caller's decode time, and costs the
+same GETs as reading the whole value, as in this `Get` request:
 
 ```json
 {
@@ -234,9 +234,10 @@ flowchart TB
 | Object storage, a cold hit | about 80 ms at the median and 170 ms at the 99th percentile in-region, for a file not read lately | not cached |
 
 A table's median latency depends on its cache hit rate, and its tail on
-its cold hits. A replica restarted on the same local volume keeps the
-disk level's pages, and its memory caches start empty and fill from its
-traffic.
+its cold hits. A replica restarted on the same local volume by a release
+of the same minor version keeps the disk level's pages, and one restarted
+by a new minor version starts the disk level empty. Its memory caches
+start empty either way and fill from its traffic.
 
 `disk` residency adds a local key-page read to every lookup the row cache
 does not serve, and `bloom` adds a key-page GET to a cold one.
@@ -351,8 +352,9 @@ Ctrl-C drains in-flight requests and stops the server.
 - **Observability.** It logs JSON to stdout and serves Prometheus metrics,
   `/ready`, and gRPC health.
 - **Sizing.** Size a replica's memory limit from the doctor's predicted
-  resident bytes, and put the local directory for `disk` residency on
-  instance-store NVMe.
+  resident bytes and the cache budget, which is half the limit unless
+  `server.cache_bytes` sets it, and put the local directory for `disk`
+  residency on instance-store NVMe.
 - **Stability.** Before 1.0.0, any release may change configuration keys,
   metric and log field names, the doctor's output contract, protobuf
   fields and their numbers, or on-disk formats
