@@ -51,7 +51,8 @@ reserve. It needed `unsafe` that manages shared memory, Miri on a pinned
 nightly, emptying that evicts entries the eviction policy did not choose
 and that races inserts, a floor below which a cache keeps no slabs, and
 accounting tied to jemalloc's page size and padding. A gain of that size
-does not pay for that much code and operation. An earlier measurement of
+does not pay for that much code and operation. The implementation is
+kept at the tag `shelved/cache-slabs`. An earlier measurement of
 slots of exactly an embedding's length showed that a hit must hand out a
 reference rather than copy the value, and that one lock per class held
 up at 11 tasks

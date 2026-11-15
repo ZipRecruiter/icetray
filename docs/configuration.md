@@ -145,8 +145,9 @@ file, and one under the total for the machine's shards (1,050,112 bytes
 for the 16 shards of an 11-core machine) when it opens the cache, with
 exit 1, before any table loads. A `cache_bytes` derived from the memory
 limit is checked when the cache opens, and the refusal names the limit
-and where it was read. A file that still sets the removed `page_cache_bytes` or
-`scan_page_cache_bytes` is refused, naming `cache_bytes`, as
+and where it was read. A file that still sets the removed
+`page_cache_bytes` or `scan_page_cache_bytes` is refused, naming
+`cache_bytes`, as
 `server.scan_page_cache_bytes is no longer a setting; use server.cache_bytes`.
 The worker count is the number of cores the process sees, unless
 `TOKIO_WORKER_THREADS` sets it.

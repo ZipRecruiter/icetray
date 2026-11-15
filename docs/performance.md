@@ -459,6 +459,87 @@ does not count those per process, it stops once the swapped-out amount
 grows by more than 64 MiB within a run. Either way it writes the rows it
 has with the reason under `stopped` and exits with an error.
 
+### Realistic workloads, measured
+
+One campaign on an Apple M3 Pro laptop with 11 cores and 36 GiB of memory
+ran each workload under `full`, over 60-second windows, with one task and
+with eleven, and with the row cache on and off. The embedding and per-user
+workloads ran on a `scattered` table of 128 files, 4.8 million rows of
+4 KiB values and 19 GiB on disk, at a quarter of their keys
+(`--trace-sample 0.25`, and `--workload-keys` at a quarter of the busiest
+hour's), so that the caches and the quarter of the table those keys read
+fit in memory together; each budget below is the full-size budget the run
+stands for. At full size the runs stopped at budgets of 2 to 4 GiB: the
+table in the kernel's page cache and icetray's caches outgrew memory, and
+macOS compressed the caches. The documents ran unsampled on a table of
+2.5 GiB. The figures show what the row cache changes on these workloads on
+this machine; they are not a guarantee for another.
+
+With the row cache on, each figure is the share of lookups the row cache
+served; with it off, the share of page fetches the page cache served.
+
+| Workload | Row cache | 1 GiB | 2 GiB | 4 GiB | 8 GiB |
+|---|---|---|---|---|---|
+| Embedding batches | on | 47% | 64% | 81% | 93% |
+| | off | 20% | 27% | 39% | 57% |
+| Per-user Gets | on | 20% | 23% | 28% | 36% |
+| | off | 19% | 23% | 30% | 45% |
+| Documents | on | 34% | 46% | 56% | 64% |
+| | off | 56% | 87% | 100% | 100% |
+
+Keys looked up per second, one task and eleven:
+
+| Workload | 2 GiB, on | 2 GiB, off | 4 GiB, on | 4 GiB, off |
+|---|---|---|---|---|
+| Embedding batches | 98,000 / 115,000 | 45,000 / 47,000 | 199,000 / 252,000 | 54,000 / 57,000 |
+| Per-user Gets | 15,400 / 57,900 | 14,200 / 56,000 | 16,500 / 65,800 | 14,400 / 62,800 |
+| Documents | 45,600 / 87,400 | 36,400 / 115,000 | 56,200 / 114,000 | 40,000 / 127,000 |
+
+The per-user Gets at 8 GiB with the row cache off measured one task and
+stopped before eleven, so that cell is one task's. The embedding
+batches' keys are hot or cold together, so the row cache served about
+twice the page cache's share up to 4 GiB and 1.6 times at 8 GiB, and 1.5
+to 5.4 times the keys per second on one task; at 8 GiB it served 93
+percent of lookups and 391,000 keys a second on one task, 606,000 on
+eleven. The `zipf` workload deals the same batch sizes over independent
+draws: at exponent 0.5, near the skew measured for these workloads, the
+row cache served 23 and 50 percent at 2 and 8 GiB, and the page cache
+alone 12 and 39 percent. Within-batch correlation, not skew, is what the
+row cache serves on this workload.
+
+The per-user Gets read one key each, about evenly across keys. The page
+cache alone served about as many of them as the row cache up to 2 GiB,
+and more from 4 GiB, 45 against 36 percent at 8 GiB, although a page
+costs its budget about 5,100 bytes a 4 KiB value, its 80 KiB size class
+over sixteen values, where a row-cache entry costs 4,312: about two
+thirds of the table's rows are read within the hour, so a cached page's
+neighbors are read too. Keys per second differed by 15 percent or less
+either way, the row cache ahead from 2 GiB, so a table read like this
+gives up little with `row_cache = false`.
+
+The page cache holds pages compressed, and these JSON documents compress
+4.4 times, so 4 GiB of page cache held the whole table and served 99.9
+percent of page fetches, while the row cache holds each document
+decompressed, at 12,504 bytes an entry. With eleven tasks the page cache
+alone served more keys per second through 4 GiB, and the row cache more at
+8 GiB, 159,000 against 130,000; with one task the row cache served more at
+every budget, up to 70,000 against 40,000 at 8 GiB, since a row-cache hit
+decompresses no page.
+
+Each fitted workload's row-cache hit rate came within 2.1 points of its
+trace's at every budget measured, and its page-cache hit rate within
+about a point, except the per-user Gets', 13 against 23 percent at 2 GiB
+and 39 against 45 at 8 GiB. A quarter sample keeps a quarter of each
+batch's keys, while a fitted draw at a quarter of the keys keeps whole
+batches, so compare the two in keys per second rather than requests.
+
+By the end of each window, jemalloc had allocated 0.91 to 1.07 bytes per
+byte of budget with the row cache on, and 0.93 to 1.04 with the page
+cache alone, on the documents wherever their budget was smaller than the
+table and on the `scattered` table, whose pages fall just past 64 KiB and
+are charged their 80 KiB allocation. The resident set grew by up to 1.13
+bytes per byte of budget during a run's first fill.
+
 ## The page cache
 
 icetray caches value pages compressed, keyed by file and offset. Iceberg
