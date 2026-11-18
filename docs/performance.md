@@ -1,15 +1,17 @@
 # Performance and tuning
 
 An icetray lookup does three kinds of work, and their costs differ by
-orders of magnitude. A GET to object storage takes tens of milliseconds,
-and longer for a file no lookup has read for hours. A read from the local
-directory is a memory copy when the operating system's page cache holds
-the file, and a device read when it does not. A lookup's CPU work,
-decoding one key page and decompressing one value page per column it
+orders of magnitude. A GET to object storage takes about 30 ms at the
+median for a file read moments before, and about 100 ms for one no lookup
+has read for hours, with a tail past 300 ms ([the
+measurements](analysis/2026-09-29-cold-range-get-latency.md)). A read from
+the local directory is a memory copy when the operating system's page
+cache holds the file, and a device read when it does not. A lookup's CPU
+work, decoding one key page and decompressing one value page per column it
 reads, takes microseconds to tens of microseconds, and a row-cache hit,
-which does neither, under a microsecond. Most tuning changes how
-many lookups wait on a GET, and how much memory or local disk icetray
-spends serving the rest.
+which does neither, under a microsecond. Most tuning changes how many
+lookups wait on a GET, and how much memory or local disk icetray spends
+serving the rest.
 
 Three outcomes recur below. A **cold hit** is a lookup that finds its key
 and fetches a value page from object storage. A **warm hit** is one that
@@ -121,7 +123,7 @@ index held, after the key-page round under `bloom`, and made the GETs in
 the table above. A `MultiScan` of 10 keys took about 18 µs a key warm and
 50 µs a key cold, where its keys' GETs overlap under
 `server.batch_fan_out`. Against S3, each cold figure is a GET's latency,
-tens of milliseconds
+about 100 ms for a file not read lately
 ([the measurements](analysis/2026-10-14-order-fences.md)).
 
 A load of an ordered table reads each file's order column once per row
@@ -374,7 +376,8 @@ of the same distribution, and then measures fresh draws. With
 `--row-cache on` the budget is split by the default `row_cache_share`;
 with `--row-cache off` the page cache holds all of it. The table is on
 the local filesystem, so each value-page GET it counts is a file read;
-against object storage each would be a GET of tens of milliseconds.
+against object storage each would be a GET of about 100 ms for a file
+not read lately.
 
 ```sh
 cargo run --release -p icetray-testkit --example bench -- \
@@ -475,6 +478,17 @@ macOS compressed the caches. The documents ran unsampled on a table of
 2.5 GiB. The figures show what the row cache changes on these workloads on
 this machine; they are not a guarantee for another.
 
+The benchmark program calls icetray's lookup in its own process, so its
+keys per second leave out gRPC and the network. Every 100,000 keys a
+second of 4 KiB values is about 3.3 Gbit/s of values, so the embedding
+batches' 606,000 keys a second at 8 GiB, about 20 Gbit/s, are twice what
+a server with a 10 Gbit/s network can send: a replica serving values this
+large reaches its network's limit before its caches'. The `scattered`
+table's values are exactly 4 KiB, which a jemalloc size class holds with
+no rounding, so its hit rates are the best case for their length. A
+value a few bytes longer takes the 5,120-byte class, and a budget holds
+about a fifth fewer of them ([RFD 030](rfd/030-cache-slabs.md)).
+
 With the row cache on, each figure is the share of lookups the row cache
 served; with it off, the share of page fetches the page cache served.
 
@@ -560,12 +574,13 @@ uncached page share one GET.
   block holds one open file descriptor
   ([File descriptors](operating.md#file-descriptors)).
 
-A cold hit costs a GET of tens of milliseconds, and a warm hit from
-memory costs microseconds, so the cache's hit rate determines most of a table's
-average lookup latency. icetray caches the whole value page a hit reads,
-so the page size determines how much of the budget one hot key occupies. The
-optimal layout bounds value pages by bytes for large values for that
-reason ([Page and file sizes](#page-and-file-sizes)).
+A cold hit costs a GET of about 100 ms for a file not read lately, and a
+warm hit from memory costs microseconds, so the cache's hit rate
+determines most of a table's average lookup latency. icetray caches the
+whole value page a hit reads, so the page size determines how much of the
+budget one hot key occupies. The optimal layout bounds value pages by
+bytes for large values for that reason ([Page and file
+sizes](#page-and-file-sizes)).
 
 `icetray_lookups_total` by `result` gives the split of cold hits, warm
 hits, and misses, and `icetray_page_cache_hits_total` against
